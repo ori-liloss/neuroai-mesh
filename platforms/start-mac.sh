@@ -23,6 +23,7 @@ fi
 
 echo "This Mac joins the Windows page by itself. Leave that page open."
 echo "Do not run mesh.py serve here."
+echo "Ctrl+C stops this worker. The command is: bash platforms/start-mac.sh"
 
 iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
 lan_ip=""

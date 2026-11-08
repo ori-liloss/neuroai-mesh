@@ -104,8 +104,9 @@ def free_mib() -> int:
 
 def worker_cap(requested: int) -> int:
     # Leave 4 GB free. A waiting worker is about 45 MB.
+    # Zero is allowed. Callers start the first worker themselves.
     room = max(0, free_mib() - 4096) // 45
-    return max(1, min(int(requested), int(room), 24))
+    return max(0, min(int(requested), int(room), 24))
 
 
 def enqueue(title: str, prompt: str) -> int:
@@ -429,10 +430,11 @@ def worker_main() -> None:
     print(f"NeuroAI agent {pid} stopped", flush=True)
 
 
-def spawn(requested: int) -> dict:
+def spawn(requested: int, *, exact: bool = False) -> dict:
     if STOP_PATH.exists():
         STOP_PATH.unlink()
-    count = worker_cap(requested)
+    count = int(requested) if exact else worker_cap(requested)
+    count = max(0, min(count, 24))
     LOG_DIR.mkdir(exist_ok=True)
     flags = 0
     if os.name == "nt":
@@ -572,9 +574,15 @@ def job_row(job_id: int) -> dict | None:
 
 def ensure_workers(wanted: int = 4) -> dict:
     alive = len(snapshot()["workers"])
+    wanted = max(1, min(int(wanted), 24))
     if alive >= wanted:
-        return {"started": 0, "already": alive, "slots": SLOTS}
-    started = spawn(wanted - alive)
+        return {"started": 0, "already": alive, "slots": SLOTS, "free_mib": free_mib()}
+    extra = worker_cap(wanted - alive)
+    if alive == 0 and extra == 0:
+        extra = 1
+    if extra <= 0:
+        return {"started": 0, "already": alive, "slots": SLOTS, "free_mib": free_mib()}
+    started = spawn(extra, exact=True)
     started["already"] = alive
     return started
 
@@ -589,28 +597,25 @@ def wait_job(job_id: int, timeout: int = 180) -> str:
     return "The model did not answer in time."
 
 
-def code_screen(snap: dict, typed: str, note: str) -> None:
+def code_screen(snap: dict, typed: str, note: str) -> str:
     orange = "\x1b[38;5;208m"
-    dim = "\x1b[38;5;245m"
     reset = "\x1b[0m"
     workers = snap["workers"]
     counts = snap["counts"]
     generating = sum(1 for item in workers if item["state"] == "generating")
-    width = 76
+    width = 78
     inner = width - 2
 
     def row(text: str) -> str:
         return orange + "│" + reset + fit(text, inner) + orange + "│" + reset
 
-    jobs = list(reversed(snap["jobs"][:4]))
+    jobs = list(reversed(snap["jobs"][:8]))
     lines = [
         orange + "┌" + "─" * inner + "┐" + reset,
         row("  NeuroAI Code"),
         orange + "├" + "─" * inner + "┤" + reset,
-        row("  Welcome back."),
-        row("  NeuroAI 9B  ·  local  ·  127.0.0.1:8080"),
-        row("  Four answers at once. A task can write under workspace/."),
-        row("  " + str(Path.home())),
+        row("  One local model. Four can answer at once when memory allows."),
+        row(f"  free {snap.get('free_mib', 0)} MB   ·   127.0.0.1:8080"),
         orange + "├" + "─" * inner + "┤" + reset,
         row(
             f"  agents {len(workers)}   generating {generating}   "
@@ -622,13 +627,18 @@ def code_screen(snap: dict, typed: str, note: str) -> None:
     for job in jobs:
         lines.append(row(f"  {job['id']:>3}  {str(job['status']):<8} {job['title']}"))
     if note:
-        lines.append(row("  " + note))
+        lines.append(orange + "├" + "─" * inner + "┤" + reset)
+        text = " ".join(note.split())
+        while text:
+            lines.append(row("  " + text[: inner - 4]))
+            text = text[inner - 4 :]
+            if len(lines) > 18:
+                break
     lines.append(orange + "├" + "─" * inner + "┤" + reset)
     lines.append(row("  > " + typed))
-    lines.append(row("  auto mode on  ·  one NeuroAI 9B  ·  exit closes this window only"))
+    lines.append(row("  exit closes this window. the workers keep running."))
     lines.append(orange + "└" + "─" * inner + "┘" + reset)
-    sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
-    sys.stdout.flush()
+    return "\x1b[H\x1b[J" + "\n".join(lines) + "\n"
 
 
 def code_main(initial: str = "") -> None:
@@ -640,15 +650,20 @@ def code_main(initial: str = "") -> None:
         import msvcrt
     else:
         msvcrt = None
+    painted = ""
     try:
         while True:
             snap = snapshot()
             if pending:
                 row = job_row(pending)
                 if row and row["status"] in {"done", "error"}:
-                    note = str(row["result"] or row["error"] or "")[:70]
+                    note = str(row["result"] or row["error"] or "")[:360]
                     pending = None
-            code_screen(snap, typed, note)
+            frame = code_screen(snap, typed, note)
+            if frame != painted:
+                sys.stdout.write(frame)
+                sys.stdout.flush()
+                painted = frame
             if msvcrt is None:
                 text = input("> ").strip()
                 if text in {"exit", "quit"}:
@@ -661,6 +676,10 @@ def code_main(initial: str = "") -> None:
             if not msvcrt.kbhit():
                 continue
             char = msvcrt.getwch()
+            if char in {"\x00", "\xe0"}:
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
             if char in {"\x03"}:
                 break
             if char in {"\r", "\n"}:
@@ -685,7 +704,7 @@ def code_main(initial: str = "") -> None:
 
 def terminal(workers: int = 4) -> None:
     seeded = seed()
-    started = spawn(workers)
+    started = ensure_workers(workers)
     print(f"seeded {seeded}", flush=True)
     try:
         while True:

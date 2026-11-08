@@ -1002,7 +1002,12 @@ def serve(mode: str) -> None:
         print(f"Neuro Mesh worker on port {WORKER_PORT}", flush=True)
         print(f"token id {token_id()}", flush=True)
     token()
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.", flush=True)
+    finally:
+        server.server_close()
 
 
 def main() -> None:
@@ -1024,11 +1029,11 @@ def main() -> None:
         code_main(" ".join(sys.argv[2:]).strip())
         return
     if command == "swarm":
-        from agents import seed, spawn
+        from agents import ensure_workers, seed
 
         requested = int(sys.argv[2]) if len(sys.argv) > 2 else 4
         seeded = seed()
-        result = spawn(requested)
+        result = ensure_workers(requested)
         print(f"seeded {seeded} jobs; started {result['started']} of {result['requested']}", flush=True)
         print("pids " + " ".join(str(pid) for pid in result["pids"]), flush=True)
         return

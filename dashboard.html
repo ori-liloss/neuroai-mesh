@@ -39,16 +39,16 @@
     .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--ice), var(--gold)); }
     .row, .set { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
     .bay { display: grid; grid-template-columns: 230px minmax(0, 1fr) 280px; gap: 16px; align-items: stretch; }
-    .map { position: relative; min-height: 680px; background:
-      radial-gradient(ellipse at 50% 42%, rgba(240, 200, 75, 0.16), transparent 42%),
-      radial-gradient(ellipse at 50% 78%, rgba(143, 208, 255, 0.08), transparent 36%),
+    .map { position: relative; min-height: 540px; background:
+      radial-gradient(ellipse at 50% 58%, rgba(240, 200, 75, 0.14), transparent 46%),
       #05060a;
       border: 1px solid var(--line); border-radius: 18px; overflow: hidden; }
-    .word { position: absolute; top: 36px; left: 0; right: 0; text-align: center; font-family: Georgia, serif; font-size: 46px; letter-spacing: 0.42em; color: #f0c84b; text-indent: 0.42em; animation: glow 3.4s ease-in-out infinite; }
+    .word { position: absolute; top: 28px; left: 0; right: 0; text-align: center; font-family: Georgia, serif; font-size: 42px; letter-spacing: 0.16em; color: #f0c84b; animation: glow 3.4s ease-in-out infinite; }
+    .map-foot { position: absolute; left: 0; right: 0; bottom: 16px; text-align: center; font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; color: #f0c84b; }
     .links { position: absolute; inset: 0; width: 100%; height: 100%; }
     .cable { fill: none; stroke: #f0c84b; stroke-width: 2; stroke-dasharray: 7 9; animation: flow 1.1s linear infinite; }
     .packet { fill: #fff6d0; filter: drop-shadow(0 0 6px #f0c84b); }
-    .rig { position: absolute; width: 240px; transform: translate(-50%, -46%); background: transparent; border: 0; padding: 0; color: #f0c84b; text-align: center; animation: float 4.5s ease-in-out infinite; }
+    .rig { position: absolute; width: 220px; transform: translate(-50%, -42%); background: transparent; border: 0; padding: 0; color: #f0c84b; text-align: center; }
     .rig svg { width: 220px; height: 168px; filter: drop-shadow(0 18px 18px rgba(0, 0, 0, 0.55)); }
     .rig.picked svg { filter: drop-shadow(0 0 14px rgba(240, 200, 75, 0.72)); }
     .rig b, .rig span { display: block; }
@@ -66,7 +66,7 @@
     @keyframes flow { to { stroke-dashoffset: -32; } }
     @keyframes screen { 50% { opacity: 1; } 0%, 100% { opacity: 0.62; } }
     @keyframes blink { 50% { opacity: 0.25; } }
-    @keyframes float { 50% { translate: 0 -6px; } }
+    .floor { fill: rgba(240, 200, 75, 0.08); }
     .live { color: var(--ice); }
     .wait { color: var(--gold); }
     .go, .quiet { border-radius: 999px; padding: 10px 16px; }
@@ -105,6 +105,7 @@
           <div class="map" id="map">
             <div class="word">NEUROAI</div>
             <svg class="links" id="links"></svg>
+            <div class="map-foot" id="map-foot"></div>
           </div>
           <article class="card detail">
             <div class="k" id="pick-k">SELECTED</div>
@@ -222,14 +223,19 @@ function deviceArt(kind) {
   return '<svg viewBox="0 0 160 120" aria-hidden="true"><rect x="8" y="14" width="92" height="60" rx="5" fill="#16130e" stroke="#f0c84b" stroke-width="2"/><rect class="screen" x="14" y="20" width="80" height="42" fill="#10283f"/><path d="M38 76 h32 l8 12 H30 Z" fill="#f0c84b"/><rect x="112" y="18" width="38" height="82" rx="4" fill="#17140f" stroke="#f0c84b" stroke-width="2"/><circle class="led" cx="131" cy="32" r="3" fill="#9dffb0"/><rect x="120" y="44" width="22" height="3" fill="#f0c84b" opacity=".45"/><rect x="120" y="52" width="22" height="3" fill="#f0c84b" opacity=".28"/><rect x="120" y="60" width="22" height="3" fill="#f0c84b" opacity=".2"/></svg>';
 }
 function seats(count, width, height) {
+  const rig = Math.min(210, Math.max(128, Math.floor(width / (count <= 1 ? 2.2 : 3.1))));
   const cx = width / 2;
-  const cy = height * 0.58;
-  if (count <= 1) return [{ x: cx, y: cy }];
-  if (count === 2) return [{ x: width * 0.27, y: cy }, { x: width * 0.73, y: cy }];
+  const cy = height * 0.5;
+  const place = (x, y) => ({ x, y, rig });
+  if (count <= 1) return [place(cx, cy)];
+  if (count === 2) {
+    const spread = Math.max(rig * 0.85, Math.min(width * 0.26, width / 2 - rig * 0.55));
+    return [place(cx - spread, cy), place(cx + spread, cy)];
+  }
   const radius = Math.min(width, height) * 0.3;
   return Array.from({ length: count }, (_, index) => {
     const angle = -Math.PI / 2 + (index * 2 * Math.PI) / count;
-    return { x: cx + Math.cos(angle) * radius, y: cy + Math.sin(angle) * radius * 0.72 };
+    return place(cx + Math.cos(angle) * radius, cy + Math.sin(angle) * radius * 0.72);
   });
 }
 function drawRoster(list) {
@@ -255,15 +261,36 @@ function drawMap(list) {
   map.querySelectorAll(".rig").forEach((node) => node.remove());
   const svg = document.getElementById("links");
   const width = map.clientWidth || 800;
-  const height = map.clientHeight || 680;
+  const height = map.clientHeight || 540;
   svg.setAttribute("viewBox", "0 0 " + width + " " + height);
   svg.replaceChildren();
   const points = seats(list.length, width, height);
+  const ground = document.createElementNS("http://www.w3.org/2000/svg", "ellipse");
+  const groundY = points.reduce((sum, point) => sum + point.y, 0) / points.length + 108;
+  ground.setAttribute("class", "floor");
+  ground.setAttribute("cx", String(width / 2));
+  ground.setAttribute("cy", String(groundY));
+  ground.setAttribute("rx", String(Math.min(280, width * 0.3)));
+  ground.setAttribute("ry", "18");
+  svg.append(ground);
   const pairs = list.length === 2
     ? [[0, 1]]
     : points.map((_, index) => [index, (index + 1) % points.length]).filter(() => points.length > 2);
   pairs.forEach(([from, to], index) => {
-    const path = "M " + points[from].x + " " + (points[from].y - 20) + " L " + points[to].x + " " + (points[to].y - 20);
+    let x1 = points[from].x;
+    let y1 = points[from].y - 36;
+    let x2 = points[to].x;
+    let y2 = points[to].y - 36;
+    if (list.length === 2) {
+      const left = x1 <= x2 ? from : to;
+      const right = left === from ? to : from;
+      const inset = (points[left].rig || 180) * 0.42;
+      x1 = points[left].x + inset;
+      y1 = points[left].y - 36;
+      x2 = points[right].x - inset;
+      y2 = points[right].y - 36;
+    }
+    const path = "M " + x1 + " " + y1 + " L " + x2 + " " + y2;
     const glow = document.createElementNS("http://www.w3.org/2000/svg", "path");
     glow.setAttribute("d", path);
     glow.setAttribute("fill", "none");
@@ -282,6 +309,14 @@ function drawMap(list) {
     motion.setAttribute("path", path);
     packet.append(motion);
     svg.append(glow, cable, packet);
+    [[x1, y1], [x2, y2]].forEach(([cx, cy]) => {
+      const cap = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      cap.setAttribute("cx", String(cx));
+      cap.setAttribute("cy", String(cy));
+      cap.setAttribute("r", "5");
+      cap.setAttribute("fill", "#f0c84b");
+      svg.append(cap);
+    });
   });
   list.forEach((item, index) => {
     const node = document.createElement("button");
@@ -295,6 +330,12 @@ function drawMap(list) {
     const gpu = ((item.status && item.status.gpus) || [])[0] || {};
     meta.textContent = gpu.name || (item.status && item.status.os) || "live";
     node.append(title, meta);
+    node.style.width = points[index].rig + "px";
+    const art = node.querySelector("svg");
+    if (art) {
+      art.style.width = points[index].rig + "px";
+      art.style.height = Math.round(points[index].rig * 0.76) + "px";
+    }
     node.style.left = points[index].x + "px";
     node.style.top = points[index].y + "px";
     node.onclick = () => { picked = index; paint(); };
@@ -314,6 +355,7 @@ function paint() {
   const current = list[picked] || list[0];
   text("pick-name", current ? current.name : "–");
   text("pick-k", list.length + " connected");
+  text("map-foot", list.length < 2 ? "1 computer · the next one appears when it joins" : list.length + " computers · link live");
   const gpu = (((current && current.status && current.status.gpus) || [])[0]) || {};
   const temp = gpu.temperature_c ?? (current && current.status.temperature_c);
   const ram = (current && current.status && current.status.ram) || {};
