@@ -493,12 +493,17 @@ def native_tool(answer: str) -> str:
         key, _, rest = rest.partition(">")
         value, _, rest = rest.partition("</parameter>")
         key = key.strip().lower()
+        picked = value.strip().splitlines()
+        picked = picked[0].strip() if picked else ""
         if key in {"path", "file", "dir", "directory", "command", "cmd", "query", "text"} and not path:
-            path = value.strip().splitlines()[0].strip()
+            path = picked
         elif key in {"content", "contents", "body"}:
             body = value.strip("\n")
     if command == "WRITE":
-        return "WRITE " + (tool_path(path) or "blocked") + "\n" + body + "\nENDWRITE"
+        safe = tool_path(path)
+        if not safe:
+            return ""
+        return "WRITE " + safe + "\n" + body + "\nENDWRITE"
     if not path:
         return ""
     return command + " " + path
@@ -526,7 +531,8 @@ def run_agent(prompt: str) -> str:
             context += "\n\n" + tool_response(last)
         answer = visible_answer(ask_model(context, max_tokens=1000))
         native = native_tool(answer)
-        tool = first_tool(answer) or (native.splitlines()[0] if native else "")
+        # Qwen's <tool_call> is the action. A sentence before it is not a second command.
+        tool = (native.splitlines()[0] if native else "") or first_tool(answer)
         if tool:
             print("tool " + tool.splitlines()[0][:120], flush=True)
         if not tool:
@@ -941,6 +947,7 @@ def drill_round(index: int) -> dict:
         and blocked_run == "blocked"
         and tool_response("only-one").startswith("<tool_response>")
         and "only-one" in tool_response("only-one")
+        and native_tool("<tool_call><function=write_file><parameter=path></parameter><parameter=content>nope</parameter></function></tool_call>") == ""
     )
     row = {"t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), "round": index, "ok": ok}
     log_path = LOG_DIR / "drill.jsonl"
