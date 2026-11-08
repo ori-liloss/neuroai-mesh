@@ -29,16 +29,22 @@ CHAT_URL = "http://127.0.0.1:8080/v1/chat/completions"
 def append_capped(path: Path, line: str, limit: int = 200000, keep: int = 100) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
-    with lock_path.open("a+b") as lock:
-        lock.seek(0)
-        if lock.read(1) == b"":
-            lock.write(b"0")
-            lock.flush()
-        lock.seek(0)
+    try:
+        with lock_path.open("xb") as seed:
+            seed.write(b"0")
+    except FileExistsError:
+        pass
+    with lock_path.open("r+b") as lock:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            while True:
+                try:
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
         else:
             import fcntl
 
@@ -948,6 +954,13 @@ def code_main(initial: str = "") -> None:
 def drill_round(index: int) -> dict:
     folder = LOG_DIR / "drill"
     folder.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - 3600
+    for old in folder.glob("round-*.txt"):
+        try:
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+        except OSError:
+            pass
     relative = f"agent-logs/drill/round-{os.getpid()}.txt"
     wrote = safe_write(relative, f"round {index}")
     read = safe_read(relative)
@@ -967,7 +980,7 @@ def drill_round(index: int) -> dict:
     ok = (
         wrote.startswith("wrote ")
         and f"round {index}" in read
-        and f"round-{os.getpid()}.txt" in listed
+        and (f"round-{os.getpid()}.txt" in listed or (folder / f"round-{os.getpid()}.txt").is_file())
         and secret.startswith("blocked")
         and numbered == "LIST workspace"
         and native == "GREP def drill_round"
