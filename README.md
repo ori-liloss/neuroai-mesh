@@ -74,13 +74,15 @@ Weight split starts only after the chat server stops, because one GPU cannot ser
 
 ## Agents, in CMD only
 
-The website does not start agents. On the Windows PC, in this folder:
+The website does not start agents and does not show this guide. On the Windows PC, in this folder:
 
 ```powershell
-python -u mesh.py agents
+python -u mesh.py code
 ```
 
-That window is the agent console. It shares the one local model. Four workers generate at once. Ctrl+C stops them. A hundred copies of the model do not fit on one 12 GB GPU, so the command does not open a hundred processes. The console shows the model, the four slots, and the job list in that window.
+That window is NeuroAI Code. It uses the one local NeuroAI 9B. Four workers generate at once. A task can ask to read a file in this repo. Closing the window leaves the workers running. `python -u mesh.py agents` is the status board, and Ctrl+C there stops the workers.
+
+A hundred copies of the model do not fit on one 12 GB GPU, so the command does not open a hundred processes. The queue can hold many tasks. Four of them generate at once.
 
 ## Files
 

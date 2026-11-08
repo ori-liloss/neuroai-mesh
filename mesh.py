@@ -115,6 +115,75 @@ def darwin_ram() -> dict:
     return {"total_mib": total, "free_mib": free_pages * page // (1024 * 1024)}
 
 
+_apple_cache: dict = {"at": 0.0, "cards": []}
+
+
+def darwin_temperature() -> int | None:
+    try:
+        out = subprocess.check_output(
+            ["osx-cpu-temp"],
+            text=True,
+            timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    number = ""
+    for char in out:
+        if char.isdigit() or (char == "." and number and "." not in number):
+            number += char
+        elif number:
+            break
+    if not number:
+        return None
+    try:
+        return int(float(number))
+    except ValueError:
+        return None
+
+
+def apple_chip() -> str:
+    try:
+        out = subprocess.check_output(["system_profiler", "SPHardwareDataType"], text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return "Apple GPU"
+    for line in out.splitlines():
+        if "Chip:" in line or "Processor Name:" in line:
+            name = line.split(":", 1)[-1].strip()
+            if name:
+                return name
+    return "Apple GPU"
+
+
+def apple_cards() -> list[dict]:
+    now = time.time()
+    cached = _apple_cache.get("cards") or []
+    if cached and now - float(_apple_cache.get("at") or 0) < 20:
+        return cached
+    ram = darwin_ram()
+    cards = [
+        {
+            "name": apple_chip(),
+            "memory_used_mib": max(0, int(ram.get("total_mib") or 0) - int(ram.get("free_mib") or 0)),
+            "memory_total_mib": int(ram.get("total_mib") or 0),
+            "temperature_c": darwin_temperature(),
+            "unified": True,
+        }
+    ]
+    _apple_cache["at"] = now
+    _apple_cache["cards"] = cards
+    return cards
+
+
+def machine_cards() -> list[dict]:
+    cards = nvidia()
+    if cards:
+        return cards
+    if sys.platform == "darwin":
+        return apple_cards()
+    return []
+
+
 def nvidia() -> list[dict]:
     try:
         out = subprocess.check_output(
@@ -190,7 +259,7 @@ def rpc_binary() -> str | None:
 
 
 def local_status() -> dict:
-    cards = nvidia()
+    cards = machine_cards()
     binary = rpc_binary()
     chat = process_running("llama-server.exe") or process_running("llama-server")
     return {
@@ -759,6 +828,11 @@ def main() -> None:
         requested = int(sys.argv[2]) if len(sys.argv) > 2 else 4
         terminal(requested)
         return
+    if command == "code":
+        from agents import code_main
+
+        code_main(" ".join(sys.argv[2:]).strip())
+        return
     if command == "swarm":
         from agents import seed, spawn
 
@@ -769,7 +843,7 @@ def main() -> None:
         print("pids " + " ".join(str(pid) for pid in result["pids"]), flush=True)
         return
     if command not in {"serve", "work"}:
-        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py agents [COUNT]")
+        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py code [TASK] | mesh.py agents [COUNT]")
     serve(command)
 
 

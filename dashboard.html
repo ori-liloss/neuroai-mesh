@@ -11,9 +11,7 @@
       --muted: #8d9aa4;
       --line: rgba(232, 238, 242, 0.12);
       --panel: #101418;
-      --panel-2: #171d23;
       --cyan: #3ee0c5;
-      --cyan-dim: rgba(62, 224, 197, 0.14);
       --amber: #e2b15a;
       --red: #ff6b6b;
       --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
@@ -27,17 +25,16 @@
       font-family: "Segoe UI", sans-serif;
       font-size: 15px;
     }
-    button, input, textarea { font: inherit; color: inherit; }
+    button, textarea { font: inherit; color: inherit; }
     button { cursor: pointer; }
     button:disabled { opacity: 0.45; cursor: wait; }
     .top {
       display: grid;
-      grid-template-columns: auto minmax(0, 1fr) minmax(190px, 280px);
+      grid-template-columns: auto minmax(0, 1fr) minmax(220px, 320px);
       gap: 18px;
       align-items: center;
       padding: 16px 22px;
       border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, #101418 0%, #070809 100%);
     }
     .brand { letter-spacing: 0.18em; font-size: 13px; font-weight: 700; }
     .sub { margin-top: 4px; color: var(--muted); font-size: 12px; }
@@ -47,92 +44,36 @@
       animation: pulse 2.4s ease-out infinite;
     }
     .mark { display: flex; gap: 12px; align-items: center; }
-    .model, .meter-top { direction: ltr; }
+    .model, .meter-top, .deg, .mem b { direction: ltr; unicode-bidi: isolate; }
     .model { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; justify-content: center; }
     .k { font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; color: var(--muted); }
     .model b { font-weight: 650; }
-    .meter-top, .vitals { display: flex; justify-content: space-between; gap: 12px; font-family: var(--mono); font-size: 12px; }
+    .meter-top { display: flex; justify-content: space-between; gap: 12px; font-family: var(--mono); font-size: 12px; }
     .bar { margin-top: 8px; height: 4px; background: #242b32; }
-    .bar i { display: block; height: 100%; width: 0; background: var(--cyan); transition: width 0.5s ease; }
+    .bar i { display: block; height: 100%; width: 0; background: var(--cyan); }
     .stage { display: grid; grid-template-columns: minmax(0, 1fr); }
-    .cluster { padding: 18px 22px 22px; display: grid; gap: 16px; align-content: start; }
-    .use { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .use article { border: 1px solid var(--line); background: var(--panel); padding: 12px 12px 10px; }
-    .use .n { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; color: var(--cyan); }
-    .use p, .legend { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
-    .use code, .legend code { font-family: var(--mono); font-size: 12px; color: var(--ink); }
-    .legend { margin: 0; }
-    .spine { display: flex; align-items: center; gap: 0; height: 28px; }
-    .dot { width: 10px; height: 10px; border-radius: 99px; background: #3a4450; flex: none; }
-    .dot.on { background: var(--cyan); }
-    .dot.wait { background: var(--amber); }
-    .dot.down { background: var(--red); }
-    .wire { flex: 1; height: 1px; background: repeating-linear-gradient(90deg, #3a4450 0 7px, transparent 7px 12px); }
-    .wire.on { background: var(--cyan); }
+    .cluster { padding: 22px; }
     .rack { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
     .plate {
-      text-align: left;
       background: var(--panel);
       border: 1px solid var(--line);
-      padding: 16px 16px 14px;
-      min-height: 228px;
+      padding: 16px;
+      min-height: 280px;
       display: flex;
       flex-direction: column;
       gap: 8px;
     }
-    .plate.picked { border-color: var(--cyan); background: linear-gradient(180deg, rgba(62, 224, 197, 0.08), var(--panel) 42%); }
-    .plate-top { display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; }
+    .plate-top { display: flex; justify-content: space-between; color: var(--muted); font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; }
     .plate h2 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -0.03em; }
-    .plate .role { margin: 0; color: var(--muted); min-height: 22px; }
-    .spec-lines { margin: 8px 0 0; display: grid; gap: 6px; }
-    .spec-lines div { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); padding-top: 6px; font-size: 13px; }
-    .spec-lines span { color: var(--muted); }
-    .spec-lines b, .fact b { direction: ltr; unicode-bidi: isolate; }
-    .spec-lines b { font-weight: 550; font-family: var(--mono); font-size: 12px; max-width: 68%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .cmd-peek { margin-top: auto; color: var(--cyan); font-family: var(--mono); font-size: 12px; }
-    .sheet {
-      background: var(--panel-2);
-      border: 1px solid var(--line);
-      padding: 18px;
-      display: grid;
-      grid-template-columns: 0.9fr 1.1fr;
-      gap: 22px;
-    }
-    .sheet[hidden] { display: none; }
-    .steps { margin: 8px 0 0; padding: 0 0 0 18px; color: var(--muted); display: grid; gap: 8px; }
-    .steps b { color: var(--ink); font-weight: 650; }
-    .path, .term pre, .cmd-peek { direction: ltr; unicode-bidi: isolate; }
-    .path { font-family: var(--mono); font-size: 12px; color: var(--cyan); }
-    .term { background: #090c10; border: 1px solid var(--line); }
-    .term-bar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: 11px; }
-    .term-bar i { width: 8px; height: 8px; border-radius: 99px; background: #2c3640; display: block; }
-    .term pre { margin: 0; padding: 14px 12px 16px; font-family: var(--mono); font-size: 14px; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-    .go, .quiet {
-      border-radius: 0;
-      padding: 8px 12px;
-    }
-    .go { background: var(--cyan); color: #06211c; border: 0; font-weight: 700; }
-    .quiet { background: transparent; border: 1px solid var(--line); color: var(--ink); text-decoration: none; display: inline-flex; align-items: center; }
-    .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
-    label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
-    label.wide { grid-column: 1 / -1; }
-    input, textarea {
-      background: #090c10;
-      border: 1px solid var(--line);
-      border-radius: 0;
-      padding: 8px 10px;
-    }
-    input:focus, textarea:focus { outline: 1px solid var(--cyan); border-color: var(--cyan); }
-    .note { min-height: 20px; margin: 8px 0 0; color: var(--amber); font-size: 13px; }
-    .ori-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .fact { border-top: 1px solid var(--line); padding-top: 8px; }
-    .fact span { display: block; color: var(--muted); font-size: 12px; }
-    .fact b { font-family: var(--mono); font-weight: 550; }
+    .deg { margin: 0; font-family: var(--mono); font-size: 56px; font-weight: 500; letter-spacing: -0.04em; line-height: 1; }
+    .deg span { font-size: 22px; color: var(--muted); }
+    .role { margin: 0; color: var(--muted); min-height: 22px; }
+    .mem { display: grid; gap: 4px; }
+    .mem b { font-family: var(--mono); font-size: 12px; font-weight: 500; }
     .talk {
-      min-height: 520px;
+      min-height: 420px;
       display: grid;
-      grid-template-rows: auto minmax(180px, 1fr) auto;
+      grid-template-rows: auto minmax(160px, 1fr) auto;
       border-top: 1px solid var(--line);
       background: #0c1014;
     }
@@ -144,7 +85,9 @@
     .ai { align-self: flex-start; background: #141920; }
     .bubble small { display: block; margin-top: 6px; color: var(--muted); font-family: var(--mono); font-size: 11px; }
     #say { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
-    textarea { flex: 1; resize: none; height: 64px; }
+    textarea { flex: 1; resize: none; height: 64px; background: #090c10; border: 1px solid var(--line); padding: 8px 10px; }
+    textarea:focus { outline: 1px solid var(--cyan); border-color: var(--cyan); }
+    .go { background: var(--cyan); color: #06211c; border: 0; font-weight: 700; padding: 8px 12px; }
     .limit { padding: 10px 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
     .on { color: var(--cyan); }
     .wait { color: var(--amber); }
@@ -153,16 +96,7 @@
       70% { box-shadow: 0 0 0 8px rgba(62, 224, 197, 0); }
       100% { box-shadow: 0 0 0 0 rgba(62, 224, 197, 0); }
     }
-    @media (prefers-reduced-motion: reduce) {
-      .sig { animation: none; }
-      .bar i { transition: none; }
-    }
-    @media (max-width: 1180px) {
-      .top { grid-template-columns: 1fr auto; grid-template-areas: "brand gauge" "model model"; }
-      .mark { grid-area: brand; }
-      .model { grid-area: model; justify-content: flex-start; }
-      .gauge { grid-area: gauge; min-width: 220px; }
-    }
+    @media (prefers-reduced-motion: reduce) { .sig { animation: none; } }
     @media (min-width: 1240px) {
       body { height: 100vh; overflow: hidden; }
       .stage { flex: 1; min-height: 0; grid-template-columns: minmax(0, 1fr) 400px; }
@@ -170,8 +104,7 @@
       .talk { min-height: 0; border-top: 0; border-left: 1px solid var(--line); }
     }
     @media (max-width: 680px) {
-      .top, .sheet, .fields, .ori-facts { grid-template-columns: 1fr; }
-      .use, .rack { grid-template-columns: 1fr; }
+      .top, .rack { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -181,7 +114,7 @@
       <span class="sig"></span>
       <div>
         <div class="brand">NEUROAI 1.0</div>
-        <div class="sub">Mesh console</div>
+        <div class="sub">Mesh</div>
       </div>
     </div>
     <div class="model">
@@ -196,145 +129,36 @@
   </header>
   <div class="stage">
     <section class="cluster">
-      <div class="use">
-        <article><div class="n">01 HOST</div><p>This Windows PC holds NeuroAI. Keep this page open.</p></article>
-        <article><div class="n">02 MAC</div><p>On the Mac, inside the folder: <code>bash platforms/start-mac.sh</code></p></article>
-        <article><div class="n">03 LINUX</div><p>On Linux, the same idea: <code>bash platforms/start-linux.sh</code></p></article>
-        <article><div class="n">04 DONE</div><p>This page finds that computer on the private network. There is no file to copy and no address to paste.</p></article>
-      </div>
-      <p class="legend"><span class="on">Live</span> means the other computer answered. <span class="wait">Waiting</span> means the script is not running yet. <span id="token-id"></span></p>
-      <p class="legend" id="found-line"></p>
-      <div class="spine" aria-hidden="true">
-        <span class="dot on" id="dot-ori"></span>
-        <span class="wire" id="wire-mac"></span>
-        <span class="dot" id="dot-mac"></span>
-        <span class="wire" id="wire-linux"></span>
-        <span class="dot" id="dot-linux"></span>
-      </div>
       <div class="rack">
-        <button class="plate" id="plate-ori" type="button" data-os="ori">
-          <div class="plate-top"><span>WINDOWS</span><span class="on" id="st-ori">Live</span></div>
-          <h2 id="name-ori">Ori</h2>
-          <p class="role" id="role-ori">NeuroAI is on this GPU</p>
-          <div class="spec-lines">
-            <div><span>GPU</span><b id="gpu-ori">RTX 4070</b></div>
-            <div><span>RAM</span><b id="ram-ori">–</b></div>
-            <div><span>Chat</span><b id="chat-ori">–</b></div>
-          </div>
-        </button>
-        <button class="plate picked" id="plate-mac" type="button" data-os="mac">
+        <article class="plate" id="plate-windows">
+          <div class="plate-top"><span>WINDOWS</span><span class="on" id="st-windows">Live</span></div>
+          <h2 id="name-windows">Ori</h2>
+          <p class="deg" id="temp-windows">–<span>°</span></p>
+          <p class="role" id="gpu-windows">RTX 4070</p>
+          <div class="mem"><b id="vram-windows">–</b><div class="bar"><i id="vram-bar-windows"></i></div></div>
+          <div class="mem"><b id="ram-windows">–</b><div class="bar"><i id="ram-bar-windows"></i></div></div>
+        </article>
+        <article class="plate" id="plate-mac">
           <div class="plate-top"><span>MACOS</span><span class="wait" id="st-mac">Waiting</span></div>
           <h2 id="name-mac">Mac</h2>
-          <p class="role" id="role-mac">Bay open</p>
-          <div class="spec-lines">
-            <div><span>CPU</span><b id="cpu-mac">–</b></div>
-            <div><span>RAM</span><b id="ram-mac">–</b></div>
-            <div><span>GPU</span><b id="gpu-mac">–</b></div>
-          </div>
-          <div class="cmd-peek">bash platforms/start-mac.sh</div>
-        </button>
-        <button class="plate" id="plate-linux" type="button" data-os="linux">
+          <p class="deg" id="temp-mac">–<span>°</span></p>
+          <p class="role" id="gpu-mac">–</p>
+          <div class="mem"><b id="vram-mac">–</b><div class="bar"><i id="vram-bar-mac"></i></div></div>
+          <div class="mem"><b id="ram-mac">–</b><div class="bar"><i id="ram-bar-mac"></i></div></div>
+        </article>
+        <article class="plate" id="plate-linux">
           <div class="plate-top"><span>LINUX</span><span class="wait" id="st-linux">Waiting</span></div>
           <h2 id="name-linux">Linux</h2>
-          <p class="role" id="role-linux">Bay open</p>
-          <div class="spec-lines">
-            <div><span>CPU</span><b id="cpu-linux">–</b></div>
-            <div><span>RAM</span><b id="ram-linux">–</b></div>
-            <div><span>GPU</span><b id="gpu-linux">–</b></div>
-          </div>
-          <div class="cmd-peek">bash platforms/start-linux.sh</div>
-        </button>
+          <p class="deg" id="temp-linux">–<span>°</span></p>
+          <p class="role" id="gpu-linux">–</p>
+          <div class="mem"><b id="vram-linux">–</b><div class="bar"><i id="vram-bar-linux"></i></div></div>
+          <div class="mem"><b id="ram-linux">–</b><div class="bar"><i id="ram-bar-linux"></i></div></div>
+        </article>
       </div>
-
-      <section class="sheet" id="sheet-ori" hidden>
-        <div>
-          <div class="k">ORI</div>
-          <h2>This machine holds NeuroAI</h2>
-          <p class="role">NeuroAI is serving here. Splitting weights onto another computer starts only after chat stops, because the GPU is full.</p>
-        </div>
-        <div class="ori-facts">
-          <div class="fact"><span>Temperature</span><b id="fact-temp">–</b></div>
-          <div class="fact"><span>VRAM</span><b id="fact-vram">–</b></div>
-          <div class="fact"><span>RAM</span><b id="fact-ram">–</b></div>
-          <div class="fact"><span>RPC</span><b id="fact-rpc">Off</b></div>
-        </div>
-      </section>
-
-      <section class="sheet" id="sheet-mac">
-        <div>
-          <div class="k">01 · MAC</div>
-          <h2>Light join</h2>
-          <ol class="steps">
-            <li><b>Clone the repo once</b><div class="path">neuroai-mesh</div>After that, one command is enough.</li>
-            <li><b>Run the command inside the folder.</b> Do not run mesh.py serve on the Mac.</li>
-            <li><b>Leave this page open.</b> The Mac shows up on its own.</li>
-          </ol>
-        </div>
-        <div>
-          <div class="term">
-            <div class="term-bar"><i></i><i></i><i></i><span>start-mac.sh</span></div>
-            <pre id="cmd-mac">bash platforms/start-mac.sh</pre>
-          </div>
-          <div class="row">
-            <button class="go" id="copy-mac" type="button">Copy command</button>
-            <a class="quiet" href="/platforms/start-mac.sh">View script</a>
-          </div>
-          <form id="form-mac">
-            <div class="fields">
-              <label>Name<input name="name" placeholder="Mac mini"></label>
-              <label>RAM GB<input name="ram_gb" inputmode="numeric" placeholder="16"></label>
-              <label class="wide">Address<input name="url" placeholder="http://192.168.7.20:8781" dir="ltr"></label>
-              <label>CPU<input name="cpu" placeholder="M2"></label>
-              <label>GPU<input name="gpu" placeholder="Apple GPU"></label>
-            </div>
-            <div class="row">
-              <button class="go" type="submit">Save bay</button>
-              <button class="quiet" id="clear-mac" type="button">Clear</button>
-            </div>
-          </form>
-          <p class="note" id="note-mac"></p>
-        </div>
-      </section>
-
-      <section class="sheet" id="sheet-linux" hidden>
-        <div>
-          <div class="k">01 · LINUX</div>
-          <h2>Light join</h2>
-          <ol class="steps">
-            <li><b>Clone the repo once</b><div class="path">neuroai-mesh</div>After that, one command is enough.</li>
-            <li><b>Run the command inside the folder.</b></li>
-            <li><b>Leave this page open.</b> The Linux machine shows up on its own.</li>
-          </ol>
-        </div>
-        <div>
-          <div class="term">
-            <div class="term-bar"><i></i><i></i><i></i><span>start-linux.sh</span></div>
-            <pre id="cmd-linux">bash platforms/start-linux.sh</pre>
-          </div>
-          <div class="row">
-            <button class="go" id="copy-linux" type="button">Copy command</button>
-            <a class="quiet" href="/platforms/start-linux.sh">View script</a>
-          </div>
-          <form id="form-linux">
-            <div class="fields">
-              <label>Name<input name="name" placeholder="spark"></label>
-              <label>RAM GB<input name="ram_gb" inputmode="numeric" placeholder="128"></label>
-              <label class="wide">Address<input name="url" placeholder="http://192.168.7.30:8781" dir="ltr"></label>
-              <label>CPU<input name="cpu" placeholder="Grace"></label>
-              <label>GPU<input name="gpu" placeholder="GB10"></label>
-            </div>
-            <div class="row">
-              <button class="go" type="submit">Save bay</button>
-              <button class="quiet" id="clear-linux" type="button">Clear</button>
-            </div>
-          </form>
-          <p class="note" id="note-linux"></p>
-        </div>
-      </section>
     </section>
     <aside class="talk">
       <h2>Chat</h2>
-      <p class="hint">NeuroAI stays loaded on the GPU. The card works while a reply is generating. Thinking is off so the answer gets the tokens.</p>
+      <p class="hint">NeuroAI stays loaded on the GPU. Thinking is off so the answer gets the tokens.</p>
       <div id="log"></div>
       <form id="say">
         <textarea id="message" placeholder="Message NeuroAI"></textarea>
@@ -342,165 +166,69 @@
       </form>
     </aside>
   </div>
-  <footer class="limit">Training stays on the CUDA machine. Another computer adds memory for running one model. If the worker is up and the bay stays red, allow TCP 8781 on the private firewall once.</footer>
+  <footer class="limit">Training stays on the CUDA machine. Another computer adds memory for one model.</footer>
 <script>
-let picked = "mac";
-let mesh = { nodes: [], specs: [] };
-const commands = {
-  mac: "bash platforms/start-mac.sh",
-  linux: "bash platforms/start-linux.sh",
-};
+let mesh = { nodes: [], found: [] };
 
 function text(id, value) {
   const node = document.getElementById(id);
   if (node) node.textContent = value;
 }
 
-function specFor(os) {
-  return (mesh.specs || []).find((item) => item.os === os) || null;
+function peer(osName) {
+  return (mesh.found || []).find((item) => item.ok && item.status && item.status.os === osName) || null;
 }
 
-function nodeFor(url) {
-  if (!url) return null;
-  return (mesh.nodes || []).find((item) => item.url === url) || null;
+function gb(mib) {
+  if (!mib) return "0";
+  return (mib / 1024).toFixed(mib >= 10240 ? 0 : 1);
 }
 
-function limitedPeers() {
-  return (mesh.found || []).filter((item) => item.ok && item.limited);
-}
-
-function livePeer(os) {
-  const want = os === "mac" ? "darwin" : "linux";
-  const known = (mesh.found || []).find((item) => item.ok && !item.limited && item.status && item.status.os === want);
-  if (known) return known;
-  if (os === "mac" && limitedPeers().length) return limitedPeers()[0];
-  return null;
-}
-
-function stateOf(os, spec) {
-  if (livePeer(os)) return { cls: "on", label: "Live" };
-  if (spec && spec.url) {
-    const node = nodeFor(spec.url);
-    if (node && node.ok) return { cls: "on", label: "Live" };
-    if (node && node.ok === false) return { cls: "down", label: "No reply" };
-    return { cls: "wait", label: "Saved" };
-  }
-  return { cls: "wait", label: spec ? "Saved" : "Waiting" };
-}
-
-function fillForm(os, spec) {
-  const form = document.getElementById("form-" + os);
-  if (!form || form.contains(document.activeElement)) return;
-  for (const name of ["name", "url", "cpu", "ram_gb", "gpu"]) {
-    const field = form.elements[name];
-    if (field) field.value = spec && spec[name] ? spec[name] : "";
-  }
-}
-
-function show(value) {
-  return value || "–";
+function paintDevice(key, status, live) {
+  const state = document.getElementById("st-" + key);
+  state.textContent = live ? "Live" : "Waiting";
+  state.className = live ? "on" : "wait";
+  const gpu = (status && status.gpus && status.gpus[0]) || {};
+  const ram = (status && status.ram) || {};
+  const temp = gpu.temperature_c ?? (status && status.temperature_c);
+  const degree = document.getElementById("temp-" + key);
+  degree.firstChild.textContent = temp == null || temp === "" ? "–" : String(temp);
+  text("name-" + key, (status && status.name) || (key === "windows" ? "Windows" : key === "mac" ? "Mac" : "Linux"));
+  let gpuName = gpu.name || "";
+  if (!gpuName && status && status.os === "darwin") gpuName = "Apple Silicon";
+  text("gpu-" + key, gpuName || "–");
+  const ramTotal = ram.total_mib || 0;
+  const ramFree = ram.free_mib || 0;
+  const ramUsed = Math.max(0, ramTotal - ramFree);
+  text("ram-" + key, ramTotal ? "RAM  " + gb(ramUsed) + " / " + gb(ramTotal) + " GB" : "RAM  –");
+  document.getElementById("ram-bar-" + key).style.width = ramTotal ? Math.round(100 * ramUsed / ramTotal) + "%" : "0";
+  const vramTotal = gpu.memory_total_mib || 0;
+  const vramUsed = gpu.memory_used_mib || 0;
+  const vramLabel = gpu.unified ? "Unified  " : "VRAM  ";
+  text("vram-" + key, vramTotal ? vramLabel + gb(vramUsed) + " / " + gb(vramTotal) + " GB" : (status && status.os === "darwin" && ramTotal ? "Unified  " + gb(ramUsed) + " / " + gb(ramTotal) + " GB" : "VRAM  –"));
+  const vramWidth = vramTotal ? Math.round(100 * vramUsed / vramTotal) : (status && status.os === "darwin" && ramTotal ? Math.round(100 * ramUsed / ramTotal) : 0);
+  document.getElementById("vram-bar-" + key).style.width = vramWidth + "%";
 }
 
 function paint() {
-  const local = mesh.nodes[0]?.status || {};
+  const local = (mesh.nodes[0] && mesh.nodes[0].status) || {};
   const gpu = (local.gpus || [])[0] || {};
-  const used = gpu.memory_total_mib ? Math.round(100 * gpu.memory_used_mib / gpu.memory_total_mib) : 0;
   const ram = local.ram || {};
+  const used = gpu.memory_total_mib ? Math.round(100 * gpu.memory_used_mib / gpu.memory_total_mib) : 0;
   text("host-name", local.name || "ORI");
   text("host-temp", (gpu.temperature_c ?? "–") + "°");
   text("host-mem", (gpu.memory_used_mib || 0) + " / " + (gpu.memory_total_mib || 0) + " MiB");
   document.getElementById("host-bar").style.width = used + "%";
-  text("name-ori", local.name || "Ori");
-  text("gpu-ori", (gpu.name || "RTX 4070").replace("NVIDIA GeForce ", ""));
-  text("ram-ori", ram.total_mib ? Math.round(ram.total_mib / 1024) + " GB" : "–");
-  text("chat-ori", local.chat_server ? "On" : "Off");
-  text("fact-temp", (gpu.temperature_c ?? "–") + "°");
-  text("fact-vram", used + "%");
-  text("fact-ram", ram.free_mib ? Math.round(ram.free_mib / 1024) + " GB free" : "–");
-  text("fact-rpc", local.rpc_listening ? "Listening" : "Off");
-  const joined = (mesh.found || []).filter((item) => item.ok && !item.limited);
-  const limited = limitedPeers();
-  text("token-id", "");
-  const foundLine = document.getElementById("found-line");
-  if (joined.length) {
-    foundLine.textContent = "Joined " + joined.map((item) => item.url).join(" and ") + ".";
-  } else if (limited.length) {
-    foundLine.textContent = "Joined " + limited.map((item) => item.url).join(" and ") + ". Run the script once more on that computer to show its memory.";
-  } else {
-    foundLine.textContent = "";
-  }
-  for (const os of ["mac", "linux"]) {
-    const spec = specFor(os);
-    const peer = livePeer(os);
-    const state = stateOf(os, spec);
-    const status = document.getElementById("st-" + os);
-    status.textContent = state.label;
-    status.className = state.cls;
-    const dot = document.getElementById("dot-" + os);
-    dot.className = "dot " + (state.cls === "on" ? "on" : state.cls);
-    document.getElementById("wire-" + os).className = "wire" + (state.cls === "on" ? " on" : "");
-    const peerRam = peer && peer.status && peer.status.ram && peer.status.ram.total_mib;
-    text("name-" + os, (peer && peer.status && peer.status.name) || spec?.name || (os === "mac" ? "Mac" : "Linux"));
-    text("role-" + os, (peer && peer.url) || spec?.url || (state.label === "Token" && bad[0] ? bad[0].url : "Bay open"));
-    text("cpu-" + os, show((peer && peer.status && peer.status.machine) || spec?.cpu));
-    text("ram-" + os, peerRam ? Math.round(peerRam / 1024) + " GB" : (spec?.ram_gb ? spec.ram_gb + " GB" : "–"));
-    text("gpu-" + os, show(spec?.gpu));
-    fillForm(os, spec);
-  }
-  for (const os of ["ori", "mac", "linux"]) {
-    document.getElementById("plate-" + os).classList.toggle("picked", picked === os);
-    document.getElementById("sheet-" + os).hidden = picked !== os;
-  }
+  paintDevice("windows", local, true);
+  const mac = peer("darwin");
+  paintDevice("mac", mac && mac.status, Boolean(mac));
+  const linux = peer("linux");
+  paintDevice("linux", linux && linux.status, Boolean(linux));
 }
 
 async function refresh() {
   mesh = await (await fetch("/api/mesh")).json();
   paint();
-}
-
-async function saveSpec(os, event) {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const response = await fetch("/api/specs", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      os,
-      name: form.get("name"),
-      url: form.get("url"),
-      cpu: form.get("cpu"),
-      ram_gb: form.get("ram_gb"),
-      gpu: form.get("gpu"),
-    }),
-  });
-  const body = await response.json();
-  document.getElementById("note-" + os).textContent = body.error || "Bay saved. It turns green only when the machine answers.";
-  refresh();
-}
-
-document.querySelectorAll(".plate").forEach((plate) => {
-  plate.onclick = () => {
-    picked = plate.dataset.os;
-    paint();
-  };
-});
-
-for (const os of ["mac", "linux"]) {
-  document.getElementById("copy-" + os).onclick = async () => {
-    const note = document.getElementById("note-" + os);
-    try {
-      await navigator.clipboard.writeText(commands[os]);
-      note.textContent = "Command copied.";
-    } catch (error) {
-      note.textContent = "The browser blocked the clipboard. Select the command and copy it.";
-    }
-  };
-  document.getElementById("form-" + os).onsubmit = (event) => saveSpec(os, event);
-  document.getElementById("clear-" + os).onclick = async () => {
-    await fetch("/api/specs?os=" + os, { method: "DELETE" });
-    document.getElementById("note-" + os).textContent = "Bay cleared.";
-    refresh();
-  };
 }
 
 function bubble(kind, value, meta) {
@@ -532,7 +260,7 @@ document.getElementById("say").onsubmit = async (event) => {
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || "No reply");
-    const tokens = body.tokens?.completion_tokens;
+    const tokens = body.tokens && body.tokens.completion_tokens;
     bubble("ai", body.reply || "NeuroAI returned no text.", tokens ? tokens + " tokens" : "");
   } catch (error) {
     bubble("ai", error.message);

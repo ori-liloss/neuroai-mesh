@@ -201,7 +201,7 @@ def ask_model(prompt: str) -> str:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are NeuroAI 1.0, a local mesh worker. Be concrete. Stay under 70 words.",
+                    "content": "You are NeuroAI Code, a local agent using one NeuroAI 9B. Be concrete and under 90 words. If you need one repo file, reply with only READ relative/path. Do not invent shell commands.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -220,9 +220,45 @@ def ask_model(prompt: str) -> str:
     return (body["choices"][0]["message"].get("content") or "").strip()
 
 
+def safe_read(relative: str) -> str:
+    raw = relative.strip().replace("\\", "/").lstrip("/")
+    if not raw or ".." in raw.split("/"):
+        return "unreadable"
+    path = (ROOT / raw).resolve()
+    root = ROOT.resolve()
+    if path != root and root not in path.parents:
+        return "unreadable"
+    if path.name in {"cluster.token", ".env", ".env.local", "token.txt"}:
+        return "unreadable"
+    if not path.is_file():
+        return "missing"
+    return path.read_text(encoding="utf-8", errors="replace")[:6000]
+
+
+def run_agent(prompt: str) -> str:
+    context = prompt
+    seen: set[str] = set()
+    for _ in range(3):
+        answer = ask_model(context)
+        read_path = ""
+        for line in answer.splitlines():
+            if line.startswith("READ "):
+                read_path = line[5:].strip()
+                break
+        if not read_path or read_path in seen:
+            return answer
+        seen.add(read_path)
+        body = safe_read(read_path)
+        context = (
+            prompt
+            + f"\n\nFile {read_path}:\n{body}\n\nAnswer the task now. Do not request another READ."
+        )
+    return ask_model(context)
+
+
 def worker_main() -> None:
     pid = os.getpid()
-    print(f"NeuroAI agent {pid} on one shared model, {SLOTS} generate at once", flush=True)
+    print(f"NeuroAI Code {pid} on one shared model, {SLOTS} generate at once", flush=True)
     while not STOP_PATH.exists():
         job = claim(pid)
         if job is None:
@@ -230,7 +266,7 @@ def worker_main() -> None:
             continue
         print(f"agent {pid} job {job['id']} {job['title']}", flush=True)
         try:
-            result = ask_model(str(job["prompt"]))
+            result = run_agent(str(job["prompt"]))
             finish(int(job["id"]), pid, result=result)
             print(f"agent {pid} done job {job['id']}", flush=True)
         except (OSError, urllib.error.URLError, KeyError, json.JSONDecodeError, TimeoutError) as exc:
@@ -371,6 +407,62 @@ def draw_terminal(snap: dict, started: dict) -> None:
     lines.append("└" + "─" * inner + "┘")
     sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
     sys.stdout.flush()
+
+
+def job_row(job_id: int) -> dict | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT id, status, result, error FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def ensure_workers(wanted: int = 4) -> dict:
+    alive = len(snapshot()["workers"])
+    if alive >= wanted:
+        return {"started": 0, "already": alive, "slots": SLOTS}
+    started = spawn(wanted - alive)
+    started["already"] = alive
+    return started
+
+
+def wait_job(job_id: int, timeout: int = 180) -> str:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        row = job_row(job_id)
+        if row and row["status"] in {"done", "error"}:
+            return str(row["result"] or row["error"] or "")
+        time.sleep(0.8)
+    return "The model did not answer in time."
+
+
+def code_main(initial: str = "") -> None:
+    started = ensure_workers(4)
+    print("NeuroAI Code", flush=True)
+    print("Welcome back. One local NeuroAI 9B.", flush=True)
+    print("NeuroAI 9B  ·  local  ·  http://127.0.0.1:8080/v1", flush=True)
+    print(f"4 generate at once on one model. workers already up: {started.get('already', 0)}", flush=True)
+    print("Type a task. This window does not stop the other windows.", flush=True)
+
+    def once(text: str) -> None:
+        job_id = enqueue(text[:70], text)
+        print(f"\n> {text}\nqueued {job_id}", flush=True)
+        print(wait_job(job_id), flush=True)
+
+    if initial:
+        once(initial)
+    while True:
+        try:
+            text = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nwindow closed. the workers keep running.", flush=True)
+            return
+        if text in {"exit", "quit"}:
+            print("window closed. the workers keep running.", flush=True)
+            return
+        if text:
+            once(text)
 
 
 def terminal(workers: int = 4) -> None:
