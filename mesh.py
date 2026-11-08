@@ -293,7 +293,7 @@ def heavy_processes() -> list[dict]:
                 if not pid_text.isdigit() or not mem.isdigit():
                     continue
                 mb = int(mem) // 1024
-                if mb < 40:
+                if mb < 12:
                     continue
                 lowered = name.lower()
                 role = "other"
@@ -301,6 +301,8 @@ def heavy_processes() -> list[dict]:
                     role = "model"
                 elif "rpc-server" in lowered:
                     role = "share"
+                elif pid_text.isdigit() and int(pid_text) in keep_pids():
+                    role = "page" if int(pid_text) == os.getpid() else "training"
                 elif lowered.startswith("python"):
                     role = "python"
                 rows.append(
@@ -309,7 +311,7 @@ def heavy_processes() -> list[dict]:
                         "pid": int(pid_text),
                         "mb": mb,
                         "role": role,
-                        "stoppable": lowered not in PROTECTED,
+                        "stoppable": lowered not in PROTECTED and role not in {"training", "page"},
                     }
                 )
         else:
@@ -319,24 +321,36 @@ def heavy_processes() -> list[dict]:
                 if len(bits) < 3 or not bits[0].isdigit() or not bits[1].isdigit():
                     continue
                 mb = int(bits[1]) // 1024
-                if mb < 40:
+                if mb < 12:
                     continue
                 name = bits[2].replace("\\", "/").split("/")[-1][:40]
                 lowered = name.lower()
-                role = "model" if lowered.startswith("llama-server") else "share" if "rpc-server" in lowered else "other"
+                role = "model" if lowered.startswith("llama-server") else "share" if "rpc-server" in lowered else "page" if int(bits[0]) == os.getpid() else "training" if int(bits[0]) in keep_pids() else "other"
                 rows.append(
                     {
                         "name": name,
                         "pid": int(bits[0]),
                         "mb": mb,
                         "role": role,
-                        "stoppable": lowered not in PROTECTED,
+                        "stoppable": lowered not in PROTECTED and role not in {"training", "page"},
                     }
                 )
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
     rows.sort(key=lambda item: item["mb"], reverse=True)
-    return rows[:24]
+    return rows[:40]
+
+
+def keep_pids() -> set[int]:
+    pids = {os.getpid()}
+    lock = Path(r"D:\liliai\train_local\gpu.lock")
+    try:
+        text = lock.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        text = ""
+    if text.isdigit():
+        pids.add(int(text))
+    return pids
 
 
 def dataset_index() -> list[dict]:
@@ -709,6 +723,7 @@ def scan_lan() -> list[dict]:
 
 _seen_peers: set[str] = set()
 _arrivals: list[dict] = []
+_checks: dict[str, dict] = {}
 _arrival_lock = threading.Lock()
 
 
@@ -820,6 +835,7 @@ def mesh_snapshot() -> dict:
         found = list(_found)
     with _arrival_lock:
         arrivals = list(_arrivals)
+        checks = list(_checks.values())
     return {
         "nodes": nodes,
         "found": found,
@@ -836,6 +852,7 @@ def mesh_snapshot() -> dict:
         "models": known_models(),
         "lan": ("http://" + lan_host() + ":" + str(DASHBOARD_PORT)) if lan_host() else "",
         "arrivals": arrivals,
+        "checks": checks,
         "share": {
             "model_on_this_pc": bool(local.get("chat_server")),
             "training": "this PC only",
@@ -887,7 +904,23 @@ def ask_check(url: str) -> dict:
 def check_helpers() -> dict:
     with _found_lock:
         peers = [item for item in _found if item.get("ok") and item.get("url")]
-    return {"checked": [ask_check(str(item["url"])) for item in peers], "training": "unchanged"}
+    rows = [ask_check(str(item["url"])) for item in peers]
+    with _arrival_lock:
+        for row in rows:
+            url = str(row.get("url") or "")
+            if url:
+                _checks[url] = row
+    return {"checked": rows, "training": "unchanged"}
+
+
+def helper_loop() -> None:
+    time.sleep(15)
+    while True:
+        try:
+            check_helpers()
+        except Exception as exc:
+            print(f"agent check failed: {exc}", flush=True)
+        time.sleep(300)
 
 
 def start_rpc() -> dict:
@@ -1007,8 +1040,8 @@ def stop_owned_process(pid: int, expected: str = "") -> dict:
     wanted = expected.strip()
     if not wanted or name.lower() != wanted.lower():
         return {"stopped": False, "note": "That process changed. Nothing was stopped."}
-    if name.lower() in PROTECTED:
-        return {"stopped": False, "note": name + " keeps the computer running, so it was left on."}
+    if name.lower() in PROTECTED or pid in keep_pids():
+        return {"stopped": False, "note": name + " keeps the training run or the computer up, so it was left on."}
     if os.name == "nt":
         done = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
         stopped = done.returncode == 0
@@ -1380,6 +1413,7 @@ def serve(mode: str) -> None:
             print(f"On the Mac open http://{lan_host()}:{DASHBOARD_PORT}", flush=True)
         print(f"token id {token_id()}", flush=True)
         start_discovery()
+        threading.Thread(target=helper_loop, name="neuro-helpers", daemon=True).start()
     else:
         server = ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), Handler)
         print(f"Neuro worker on port {WORKER_PORT}", flush=True)

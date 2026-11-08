@@ -170,7 +170,7 @@
         <article class="card">
           <div class="k">SHARE</div>
           <h2>Who holds the run</h2>
-          <p class="muted">A computer appears here when its command is running. Then this page checks the agent code on that computer. One training run stays on the NVIDIA PC.</p>
+          <p class="muted">This PC trains the model. A joined computer checks the agent code on its own processor. Stop is on every other app. The training run and the system processes stay on.</p>
           <p class="muted" id="lan-open"></p>
           <div id="share-list"></div>
           <p class="muted" id="arrived"></p>
@@ -222,7 +222,7 @@ function hogs(rows, url) {
     const row = document.createElement("div");
     row.className = "row";
     const name = document.createElement("span");
-    name.textContent = item.role === "model" ? item.name + " · holding the model" : item.name;
+    name.textContent = item.role === "model" ? item.name + " · holding the model" : item.role === "training" ? item.name + " · training, left running" : item.role === "page" ? item.name + " · this page" : item.name;
     const size = document.createElement("b");
     size.textContent = item.mb != null ? item.mb + " MB" : "";
     row.append(name, size);
@@ -275,7 +275,9 @@ function cluster() {
   const list = [{ name: local.name || "This PC", status: local, url: "local" }];
   for (const item of mesh.found || []) {
     if (!item.ok || !item.status) continue;
-    list.push({ name: item.status.name || item.url, status: item.status, url: item.url });
+    const status = item.status;
+    if (String(status.os || "").toLowerCase() === "windows") status.kind = "laptop";
+    list.push({ name: status.name || item.url, status, url: item.url });
   }
   return list;
 }
@@ -550,6 +552,28 @@ function paint() {
   const arrived = mesh.arrivals || [];
   text("arrived", arrived.length ? arrived.map((item) => (item.name || item.host || item.url) + ": " + (item.ok ? item.passed + " of " + item.rounds : (item.error || "failed"))).join(" · ") : "");
 }
+function appRows(status, url) {
+  const box = document.createElement("div");
+  for (const app of (status.heavy || []).slice(0, 10)) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const name = document.createElement("span");
+    name.textContent = app.role === "training" ? app.name + " · training, left running" : app.role === "page" ? app.name + " · this page" : app.name;
+    const size = document.createElement("b");
+    size.textContent = (app.mb != null ? app.mb + " MB" : "");
+    row.append(name, size);
+    if (app.pid && app.stoppable !== false) {
+      const button = document.createElement("button");
+      button.className = "quiet";
+      button.type = "button";
+      button.textContent = "Stop";
+      button.onclick = () => stopProcess(app.pid, app.name, url);
+      row.append(button);
+    }
+    box.append(row);
+  }
+  return box;
+}
 function drawShare(list) {
   const box = document.getElementById("share-list");
   if (!box) return;
@@ -566,6 +590,14 @@ function drawShare(list) {
     body.className = "muted";
     body.textContent = doing(item, index);
     copy.append(title, body);
+    const check = (mesh.checks || []).find((row) => row.url === item.url);
+    if (check) {
+      const result = document.createElement("p");
+      result.className = "muted";
+      result.textContent = check.ok ? "Agent check passed " + check.passed + " of " + check.rounds + "." : (check.error || "Agent check failed.");
+      copy.append(result);
+    }
+    if (index > 0 || (item.status && item.status.heavy)) copy.append(appRows(item.status || {}, item.url));
     row.append(icon, copy);
     box.append(row);
   });
