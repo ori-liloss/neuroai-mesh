@@ -47,7 +47,14 @@
     .row, .set { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
     .row button { padding: 4px 10px; font-size: 11px; white-space: nowrap; }
     #pick-hogs { max-height: 320px; overflow: auto; }
-    .bay { display: grid; grid-template-columns: 230px minmax(0, 1fr) 280px; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
+    .bay { display: grid; grid-template-columns: 220px minmax(0, 1fr) 360px; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
+    .detail { overflow: auto; min-height: 0; }
+    #pick-hogs .row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; }
+    #pick-hogs .row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .share-row { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 12px; align-items: center; border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; }
+    .share-row svg { width: 72px; height: 54px; }
+    .plans { margin-top: 14px; }
+    select { background: #0c1220; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
     .map { position: relative; min-height: 420px; height: 100%; background:
       radial-gradient(ellipse at 50% 58%, rgba(240, 200, 75, 0.14), transparent 46%),
       #05060a;
@@ -102,6 +109,7 @@
         <button class="on" type="button" data-view="machines">Machines</button>
         <button type="button" data-view="models">Models</button>
         <button type="button" data-view="try">Try</button>
+        <button type="button" data-view="share">Share</button>
         <button type="button" data-view="training">Training</button>
       </nav>
     </aside>
@@ -127,15 +135,10 @@
             <h2 id="pick-name">–</h2>
             <p class="figure" id="pick-temp">–°</p>
             <p class="muted" id="pick-meta">–</p>
-            <p class="muted" id="pool">–</p>
+            <p class="muted" id="doing">–</p>
             <div class="bar"><i id="pick-bar"></i></div>
             <div id="pick-hogs"></div>
-            <button class="go" id="share-run" type="button">Share the next run</button>
-            <button class="quiet" id="stop-model" type="button">Stop the loaded model</button>
-            <button class="quiet" id="stop-agents" type="button">Stop code workers</button>
             <p class="muted" id="stop-note"></p>
-            <p class="muted">Stop process sits next to every heavy program, on this PC and on a joined computer.</p>
-            <p class="muted">A shop PlayStation or Xbox cannot share this run. Another computer joins by running the worker.</p>
           </article>
         </div>
       </section>
@@ -163,6 +166,18 @@
           </form>
         </article>
       </section>
+      <section class="view" id="view-share" hidden>
+        <article class="card">
+          <div class="k">SHARE</div>
+          <h2>Who holds the run</h2>
+          <p class="muted">Each computer shows what it is doing. A joined computer holds part of the next run only after it is listening. One training run stays on the NVIDIA PC.</p>
+          <div id="share-list"></div>
+          <button class="go" id="share-run" type="button">Ask the other computers to listen</button>
+          <button class="quiet" id="stop-model" type="button">Stop the loaded model</button>
+          <button class="quiet" id="stop-agents" type="button">Stop code workers</button>
+          <p class="muted" id="share-note"></p>
+        </article>
+      </section>
       <section class="view" id="view-training" hidden>
         <article class="card">
           <div class="k">RECORD</div>
@@ -171,6 +186,11 @@
           <p class="muted" id="train-loss">–</p>
           <div class="losses" id="losses"></div>
           <p class="muted" id="train-reason"></p>
+          <div class="plans">
+            <div class="k">TRAIN ON</div>
+            <select id="plan"></select>
+            <p class="muted" id="plan-note">Pick a plan to see its files. This page does not switch the run that is already on the GPU.</p>
+          </div>
           <h2 style="font-size:22px">Datasets</h2>
           <p class="muted">Listed only. Nothing here is filtered or deleted.</p>
           <div id="datasets"></div>
@@ -207,7 +227,7 @@ function hogs(rows, url) {
       const button = document.createElement("button");
       button.className = "quiet";
       button.type = "button";
-      button.textContent = "Stop process";
+      button.textContent = "Stop";
       button.onclick = () => stopProcess(item.pid, item.name, url);
       row.append(button);
     }
@@ -215,7 +235,6 @@ function hogs(rows, url) {
   }
 }
 async function stopProcess(pid, name, url) {
-  if (!window.confirm("Stop " + name + "?")) return;
   const response = await fetch("/api/process/stop", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -259,9 +278,27 @@ function cluster() {
 }
 function duty(item, index) {
   const status = (item && item.status) || {};
+  if (index === 0 && mesh.training && mesh.training.running) return "training";
   if (index === 0) return status.chat_server ? "runs the model" : "this PC";
   if (status.rpc_listening) return "memory waiting";
   return "joined only";
+}
+function doing(item, index) {
+  const status = (item && item.status) || {};
+  const busy = (status.heavy || []).slice(0, 3).map((row) => row.name).filter(Boolean);
+  const tail = busy.length ? " Right now: " + busy.join(", ") + "." : "";
+  if (index === 0 && mesh.training && mesh.training.running) return "This computer is training on its NVIDIA GPU. Chat is paused." + tail;
+  if (status.chat_server) return "This computer is serving chat." + tail;
+  if (status.rpc_listening) return "This computer is listening, ready to hold part of the next run." + tail;
+  if (index > 0) return "This computer joined. It is not holding the model." + tail;
+  return (busy.length ? "This computer is busy." : "This computer is quiet.") + tail;
+}
+function plainDetail(detail) {
+  const text = String(detail || "");
+  if (text.includes("ggml-rpc-server") || text.toLowerCase().includes("not found")) return "The share program is not installed on that computer yet. There, run bash platforms/build-mac-rpc.sh and then bash platforms/start-mac.sh.";
+  if (text.toLowerCase().includes("older worker")) return "That computer is running an older worker. Pull and start it again.";
+  if (text.trim().startsWith("{")) return "That computer could not start listening.";
+  return text;
 }
 function memoryLine(status) {
   const ram = (status && status.ram) || {};
@@ -274,7 +311,8 @@ function kindOf(status) {
   const name = String((status && status.name) || "").toLowerCase();
   if (os === "darwin" && name.includes("mini")) return "mini";
   if (os === "darwin") return "laptop";
-  if (os === "linux") return "tower";
+  if (os === "linux") return "penguin";
+  if (name.includes("laptop") || name.includes("book")) return "laptop";
   return "desktop";
 }
 function deviceArt(kind) {
@@ -283,6 +321,9 @@ function deviceArt(kind) {
   }
   if (kind === "mini") {
     return '<svg viewBox="0 0 160 120" aria-hidden="true"><rect x="34" y="34" width="92" height="58" rx="12" fill="#2a2824" stroke="#f0c84b" stroke-width="2"/><rect x="46" y="46" width="68" height="22" rx="3" fill="#14110c"/><circle class="led" cx="80" cy="80" r="3.2" fill="#f0c84b"/></svg>';
+  }
+  if (kind === "penguin") {
+    return '<svg viewBox="0 0 160 120" aria-hidden="true"><ellipse cx="80" cy="78" rx="28" ry="34" fill="#17140f" stroke="#f0c84b" stroke-width="2"/><ellipse cx="80" cy="84" rx="16" ry="20" fill="#f4f1ea"/><circle cx="80" cy="40" r="16" fill="#17140f" stroke="#f0c84b" stroke-width="2"/><circle cx="74" cy="38" r="2.2" fill="#f0c84b"/><circle cx="86" cy="38" r="2.2" fill="#f0c84b"/><path d="M80 44 l7 7 h-14 z" fill="#e0b15a"/></svg>';
   }
   if (kind === "tower") {
     return '<svg viewBox="0 0 160 120" aria-hidden="true"><rect x="48" y="10" width="64" height="96" rx="6" fill="#17140f" stroke="#f0c84b" stroke-width="2"/><rect class="screen" x="58" y="22" width="44" height="28" rx="2" fill="#123026"/><circle class="led" cx="80" cy="62" r="3" fill="#9dffb0"/><rect x="60" y="74" width="40" height="3" fill="#f0c84b" opacity=".35"/><rect x="60" y="82" width="40" height="3" fill="#f0c84b" opacity=".25"/><rect x="60" y="90" width="40" height="3" fill="#f0c84b" opacity=".2"/></svg>';
@@ -435,8 +476,9 @@ function paint() {
   else pool += "No other computer is connected.";
   text("pool", pool);
   const home = list[0] && list[0].status;
-  text("g-model", home && home.chat_server ? "Model on this PC" : "Model is off");
-  text("g-model-sub", home && home.chat_server ? "Chat is using this computer." : "Nothing is serving chat.");
+  const trainingNow = Boolean(mesh.training && mesh.training.running);
+  text("g-model", trainingNow ? "Training" : home && home.chat_server ? "Model on this PC" : "Model is off");
+  text("g-model-sub", trainingNow ? "Step " + (mesh.training.step || "–") + " of " + (mesh.training.max_steps || "–") : home && home.chat_server ? "Chat is using this computer." : "Nothing is serving chat.");
   text("g-count", list.length + (list.length === 1 ? " computer" : " computers"));
   text("g-count-sub", list.length < 2 ? "The next one shows up on its own." : list.slice(1).map((item) => item.name).join(", "));
   const workers = crew.workers || [];
@@ -448,6 +490,7 @@ function paint() {
   const ram = (current && current.status && current.status.ram) || {};
   const total = ram.total_mib || 0;
   const used = Math.max(0, total - (ram.free_mib || 0));
+  text("doing", current ? doing(current, picked) : "–");
   text("pick-temp", (temp == null || temp === "" ? "–" : temp) + "°");
   text("pick-meta", current ? memoryLine(current.status) + " · " + (gpu.name || (current.url === "local" ? "this PC" : current.url)) : "–");
   const bar = document.getElementById("pick-bar");
@@ -462,31 +505,84 @@ function paint() {
   text("train-step", training.step ? String(training.step) : "–");
   text("train-loss", training.loss != null ? "Last loss " + training.loss + " · step " + training.step + " of " + training.max_steps : "No loss");
   text("train-reason", training.reason || "");
-  lines("datasets", training.datasets, "No dataset files found.");
+  const chosen = document.getElementById("plan") ? document.getElementById("plan").value : "";
+  const allSets = training.datasets || [];
+  const plans = [...new Set(allSets.filter((item) => String(item.name || "").includes("/")).map((item) => String(item.name).split("/")[0]))];
+  const planBox = document.getElementById("plan");
+  const planKey = plans.join("|");
+  if (planBox && planBox.dataset.key !== planKey) {
+    planBox.dataset.key = planKey;
+    planBox.replaceChildren();
+    for (const name of plans) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      planBox.append(option);
+    }
+    if (plans.includes("neuro-ai-long-v1-mix")) planBox.value = "neuro-ai-long-v1-mix";
+  }
+  const activePlan = planBox && planBox.value ? planBox.value : chosen;
+  lines("datasets", allSets.filter((item) => !activePlan || String(item.name).startsWith(activePlan + "/")), "No dataset files found.");
   const losses = document.getElementById("losses");
   losses.replaceChildren();
   const history = training.history || [];
-  const peak = Math.max(...history, 0.001);
+  const low = history.length ? Math.min(...history) : 0;
+  const high = history.length ? Math.max(...history) : 0.001;
+  const span = Math.max(high - low, 0.0001);
   for (const value of history) {
     const bar = document.createElement("i");
-    bar.style.height = Math.max(10, Math.round(120 * value / peak)) + "px";
+    bar.style.height = Math.round(28 + 92 * (value - low) / span) + "px";
+    bar.title = String(value);
     losses.append(bar);
   }
+  const start = document.getElementById("start-train");
+  if (start) {
+    start.disabled = Boolean(training.running);
+    start.textContent = training.running ? "Training is running" : "Start training";
+  }
+  drawShare(list);
+}
+function drawShare(list) {
+  const box = document.getElementById("share-list");
+  if (!box) return;
+  box.replaceChildren();
+  list.forEach((item, index) => {
+    const row = document.createElement("div");
+    row.className = "share-row";
+    const icon = document.createElement("div");
+    icon.innerHTML = deviceArt(kindOf(item.status));
+    const copy = document.createElement("div");
+    const title = document.createElement("b");
+    title.textContent = item.name + " · " + kindLabel(kindOf(item.status));
+    const body = document.createElement("p");
+    body.className = "muted";
+    body.textContent = doing(item, index);
+    copy.append(title, body);
+    row.append(icon, copy);
+    box.append(row);
+  });
+}
+function kindLabel(kind) {
+  if (kind === "penguin") return "Linux";
+  if (kind === "mini") return "Mac";
+  if (kind === "laptop") return "laptop";
+  if (kind === "tower") return "Linux tower";
+  return "desktop";
 }
 function show(view) {
-  for (const name of ["machines", "models", "try", "training"]) document.getElementById("view-" + name).hidden = name !== view;
+  for (const name of ["machines", "models", "try", "share", "training"]) document.getElementById("view-" + name).hidden = name !== view;
   document.querySelectorAll("nav button").forEach((button) => button.classList.toggle("on", button.dataset.view === view));
 }
 document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => show(button.dataset.view); });
 document.getElementById("stop-agents").onclick = async () => {
   const response = await fetch("/api/agents/stop", { method: "POST" });
   const body = await response.json();
-  document.getElementById("stop-note").textContent = "Stopped " + ((body.stopped || []).length) + " code workers. The model is still loaded.";
+  document.getElementById("share-note").textContent = "Stopped " + ((body.stopped || []).length) + " code workers.";
 };
 document.getElementById("stop-model").onclick = async () => {
   const response = await fetch("/api/model/stop", { method: "POST" });
   const body = await response.json();
-  document.getElementById("stop-note").textContent = body.note || "Could not stop the model.";
+  document.getElementById("share-note").textContent = body.note || "Could not stop the model.";
   refresh();
 };
 document.getElementById("share-run").onclick = async () => {
@@ -498,8 +594,8 @@ document.getElementById("share-run").onclick = async () => {
   let note = body.note || "";
   if (!peers.length) note = "No other computer is connected. " + note;
   else if (ready.length) note = ready.join(", ") + " is listening. " + note;
-  else note = blocked.map((item) => item.name + (item.detail ? ": " + item.detail : "")).join(" ") + " " + note;
-  document.getElementById("stop-note").textContent = note;
+  else note = blocked.map((item) => item.name + ": " + plainDetail(item.detail)).join(" ") + " " + note;
+  document.getElementById("share-note").textContent = note;
   refresh();
 };
 document.getElementById("add-model").onsubmit = async (event) => {

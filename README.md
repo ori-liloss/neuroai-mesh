@@ -74,12 +74,25 @@ It reports its memory. If `ggml-rpc-server` is installed on the Mac, the script 
 
 ## The page
 
-Open http://127.0.0.1:8780. It has three views:
+Open http://127.0.0.1:8780.
 
-- **Machines** shows this PC and the Mac side by side, with memory and the large programs when that computer reports them.
-- **Models** lists GGUF files on this PC. Add a file that is already on disk. Adding it does not load it while the GPU is full.
+- **Machines** shows every joined computer, what it is doing, and a Stop button on each heavy program.
+- **Share** is the split view. It says which computer is training or serving chat, and which ones only joined. Asking them to listen does not move a model that is already loaded.
+- **Models** lists GGUF files on this PC. Adding one does not load it while the GPU is full.
 - **Try** is the chat with the loaded model.
-- **Training** shows the stopped run, the recent losses, and a start button. Training stays on the NVIDIA PC. The Mac does not join that step. The button does not start a run while chat is using the GPU, and it does not resume the stopped run.
+- **Training** shows the live step, the recent losses, and the plan name. The button does not start a second run while one is already on the GPU.
+
+A Linux computer is drawn as a penguin. A Mac mini stays a small Mac. A laptop stays a laptop. A Windows desktop stays a desktop.
+
+## Change the training plan
+
+The page can show the plans that are already on disk. It does not rewrite them. To train a different plan, stop the run that is using the GPU, then start the script with your own folder:
+
+```powershell
+powershell -File scripts\run-neuro-ai-training.ps1 -RunId my-plan -Data D:\path\to\your-mix -Epochs 3 -LearningRate 5e-6
+```
+
+`your-mix` needs `manifest.json`, `train.jsonl`, and `validation.jsonl`. The script checks those files and refuses to start if they do not match the saved run. One training run stays on the NVIDIA PC. It is not split across a Mac.
 
 Neuro Code can write files under `workspace/`. A request to make a folder and a game is handled there. Every heavy program has a Stop process button on this PC and on a joined computer.
 

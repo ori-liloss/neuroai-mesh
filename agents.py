@@ -337,6 +337,7 @@ TOOL_HELP = (
     "ENDWRITE\n"
     "RUN command\n"
     "WRITE under workspace/ is allowed. Do not say you cannot create a file there.\n"
+    "Stop when the tool line is done. Do not explain the tool.\n"
     "When the task is done, answer in plain text and do not emit a tool."
 )
 
@@ -450,9 +451,9 @@ def tool_run(command: str) -> str:
 def clean_tool_line(line: str) -> str:
     text = line.strip().strip("`").strip()
     text = text.lstrip("-*•").strip()
-    if len(text) > 2 and text[0].isdigit() and text[1] in ".)":
-        text = text[2:].strip()
-    return text
+    while text[:1].isdigit():
+        text = text[1:]
+    return text.lstrip(".) ").strip()
 
 
 def first_tool(answer: str) -> str:
@@ -464,10 +465,13 @@ def first_tool(answer: str) -> str:
 
 
 def run_agent(prompt: str) -> str:
-    context = TOOL_HELP + "\n\nTask:\n" + prompt + "\n\n" + workspace_note()
     logs: list[str] = []
+    last = ""
     for _ in range(4):
-        answer = visible_answer(ask_model(context, max_tokens=1400))
+        context = TOOL_HELP + "\n\nTask:\n" + prompt + "\n\n" + workspace_note()
+        if last:
+            context += "\n\nLast result:\n" + last
+        answer = visible_answer(ask_model(context, max_tokens=1000))
         tool = first_tool(answer)
         if tool:
             print("tool " + tool.splitlines()[0][:120], flush=True)
@@ -476,7 +480,7 @@ def run_agent(prompt: str) -> str:
         if tool.startswith("WRITE "):
             wrote = apply_actions(answer)
             logs.extend(wrote)
-            context += "\n\nTool result:\n" + "\n".join(wrote)
+            last = "\n".join(wrote)[:1800]
             continue
         if tool.startswith("LIST "):
             result = tool_list(tool[5:])
@@ -495,7 +499,7 @@ def run_agent(prompt: str) -> str:
         else:
             return answer[:4000]
         logs.append(tool + " -> " + (result.splitlines()[0] if result else "empty")[:140])
-        context += "\n\nTool result:\n" + result[:3000]
+        last = result[:1800]
     return "\n".join(logs)[:4000]
 
 
