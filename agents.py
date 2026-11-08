@@ -327,30 +327,61 @@ def snapshot() -> dict:
     }
 
 
+def fit(value: object, width: int) -> str:
+    text = str(value).replace("\n", " ")
+    if len(text) <= width:
+        return text.ljust(width)
+    return text[: width - 1] + "…"
+
+
+def draw_terminal(snap: dict, started: dict) -> None:
+    counts = snap["counts"]
+    workers = snap["workers"]
+    generating = sum(1 for item in workers if item["state"] == "generating")
+    width = 62
+    inner = width - 2
+
+    def row(text: str) -> str:
+        return "│" + fit(text, inner) + "│"
+
+    lines = [
+        "┌" + "─" * inner + "┐",
+        row("  NEUROAI  1.0"),
+        row("  Agent console  ·  one local model"),
+        "├" + "─" * inner + "┤",
+        row("  Model   NeuroAI 9B"),
+        row("  API     http://127.0.0.1:8080/v1"),
+        row(f"  Slots   {generating} generating  ·  {SLOTS} at once  ·  {len(workers)} workers"),
+        row(
+            f"  Jobs    queued {counts.get('queued', 0)}   "
+            f"running {counts.get('running', 0)}   done {counts.get('done', 0)}"
+        ),
+        row(f"  Started {started['started']} of {started['requested']}"),
+        "├" + "─" * inner + "┤",
+        row("  agents"),
+    ]
+    jobs = list(reversed(snap["jobs"][:8]))
+    if not jobs:
+        lines.append(row("  waiting for work"))
+    for job in jobs:
+        lines.append(row(f"  {job['id']:>3}  {str(job['status']):<10} {job['title']}"))
+    lines.append("├" + "─" * inner + "┤")
+    lines.append(row("  The website does not start these. Ctrl+C stops them."))
+    lines.append(row("  > shared NeuroAI 9B"))
+    lines.append("└" + "─" * inner + "┘")
+    sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
 def terminal(workers: int = 4) -> None:
     seeded = seed()
     started = spawn(workers)
-    print("NEUROAI AGENTS", flush=True)
-    print("This window is the agent console. The website stays a cluster dashboard.", flush=True)
-    print(
-        f"started {started['started']} of {started['requested']}  slots {SLOTS}  seeded {seeded}",
-        flush=True,
-    )
-    print("Ctrl+C stops these workers.", flush=True)
+    print(f"seeded {seeded}", flush=True)
     try:
         while True:
-            snap = snapshot()
-            counts = snap["counts"]
-            generating = sum(1 for item in snap["workers"] if item["state"] == "generating")
-            print(
-                f"workers {len(snap['workers'])}  generating {generating}  "
-                f"queued {counts.get('queued', 0)}  done {counts.get('done', 0)}",
-                flush=True,
-            )
-            for job in reversed(snap["jobs"][:8]):
-                print(f"  {job['id']:>3}  {str(job['status']):<10}  {job['title']}", flush=True)
-            print("", flush=True)
-            time.sleep(2)
+            draw_terminal(snapshot(), started)
+            time.sleep(1.5)
     except KeyboardInterrupt:
-        print("stopping workers", flush=True)
+        sys.stdout.write("\nstopping workers\n")
+        sys.stdout.flush()
         stop_workers()

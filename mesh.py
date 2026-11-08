@@ -7,6 +7,7 @@ They do not accept shell commands.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import hmac
 import json
 import os
@@ -15,8 +16,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -36,6 +40,14 @@ def token() -> str:
     if not TOKEN_PATH.exists():
         TOKEN_PATH.write_text(os.urandom(24).hex(), encoding="utf-8")
     return TOKEN_PATH.read_text(encoding="utf-8").strip()
+
+
+def token_id() -> str:
+    return hashlib.sha256(token().encode("utf-8")).hexdigest()[:8]
+
+
+_found_lock = threading.Lock()
+_found: list[dict] = []
 
 
 def authorized(header: str | None) -> bool:
@@ -272,17 +284,133 @@ def fetch_worker(url: str) -> dict:
     return body
 
 
+def pull_worker(url: str) -> dict:
+    try:
+        return {"url": url, "ok": True, "status": fetch_worker(url)}
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return {"url": url, "ok": False, "error": "token"}
+        return {"url": url, "ok": False, "error": f"http {exc.code}"}
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
+        return {"url": url, "ok": False, "error": "no reply"}
+
+
+def ipv4_prefixes() -> tuple[list[str], set[str]]:
+    prefixes: list[str] = []
+    own: set[str] = set()
+    if os.name != "nt":
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return [], set()
+        if ip.count(".") == 3 and not ip.startswith("127."):
+            return [ip.rsplit(".", 1)[0]], {ip}
+        return [], set()
+    out = subprocess.check_output(["ipconfig"], text=True, errors="replace")
+    current = ""
+    for line in out.splitlines():
+        if "IPv4" in line and ":" in line:
+            current = line.split(":")[-1].strip()
+        elif current and "Subnet Mask" in line and ":" in line:
+            mask = line.split(":")[-1].strip()
+            if (
+                mask == "255.255.255.0"
+                and current.count(".") == 3
+                and not current.startswith("127.")
+            ):
+                own.add(current)
+                prefix = current.rsplit(".", 1)[0]
+                if prefix not in prefixes:
+                    prefixes.append(prefix)
+            current = ""
+    return prefixes, own
+
+
+def probe_host(ip: str) -> dict | None:
+    sock = socket.socket()
+    sock.settimeout(0.25)
+    try:
+        sock.connect((ip, WORKER_PORT))
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    return pull_worker(f"http://{ip}:{WORKER_PORT}")
+
+
+def remember_peer(item: dict) -> None:
+    if not item.get("ok"):
+        return
+    status = item.get("status") or {}
+    url = str(item.get("url") or "")
+    if not url:
+        return
+    nodes = read_nodes()
+    if not any(node["url"] == url for node in nodes):
+        nodes.append({"url": url})
+        write_nodes(nodes)
+    bay = {"darwin": "mac", "linux": "linux"}.get(str(status.get("os") or ""))
+    if not bay:
+        return
+    current = next((spec for spec in read_specs() if spec.get("os") == bay), None)
+    if current and current.get("url"):
+        return
+    total = int((status.get("ram") or {}).get("total_mib") or 0)
+    save_spec(
+        {
+            "os": bay,
+            "name": status.get("name") or bay,
+            "url": url,
+            "ram_gb": str(max(1, round(total / 1024))) if total else "",
+            "cpu": status.get("machine") or "",
+            "gpu": "",
+        }
+    )
+
+
+def scan_lan() -> list[dict]:
+    prefixes, own = ipv4_prefixes()
+    hosts = [
+        f"{prefix}.{n}"
+        for prefix in prefixes
+        for n in range(1, 255)
+        if f"{prefix}.{n}" not in own
+    ]
+    if not hosts:
+        return []
+    with ThreadPoolExecutor(max_workers=48) as pool:
+        return [item for item in pool.map(probe_host, hosts) if item]
+
+
+def discovery_loop() -> None:
+    global _found
+    while True:
+        try:
+            found = scan_lan()
+            for item in found:
+                remember_peer(item)
+            with _found_lock:
+                _found = found
+        except Exception:
+            pass
+        time.sleep(12)
+
+
+def start_discovery() -> None:
+    threading.Thread(target=discovery_loop, name="neuro-discovery", daemon=True).start()
+
+
 def mesh_snapshot() -> dict:
     local = local_status()
     nodes = [{"url": "local", "ok": True, "status": local}]
     for item in read_nodes():
-        url = item["url"]
-        try:
-            nodes.append({"url": url, "ok": True, "status": fetch_worker(url)})
-        except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
-            nodes.append({"url": url, "ok": False, "error": str(exc)})
+        nodes.append(pull_worker(item["url"]))
+    with _found_lock:
+        found = list(_found)
     return {
         "nodes": nodes,
+        "found": found,
+        "token_id": token_id(),
         "rpc_port": RPC_PORT,
         "chat": "http://127.0.0.1:8080/v1",
         "limits": {
@@ -561,9 +689,12 @@ def serve(mode: str) -> None:
     if mode == "serve":
         server = ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), Handler)
         print(f"Neuro Mesh dashboard http://127.0.0.1:{DASHBOARD_PORT}", flush=True)
+        print(f"token id {token_id()}", flush=True)
+        start_discovery()
     else:
         server = ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), Handler)
         print(f"Neuro Mesh worker on port {WORKER_PORT}", flush=True)
+        print(f"token id {token_id()}", flush=True)
     token()
     server.serve_forever()
 

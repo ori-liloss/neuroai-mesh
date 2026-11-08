@@ -44,9 +44,11 @@ Before that, copy `cluster.token` from the Windows folder and put it next to `me
 
 If `mesh.py serve` is already running in that terminal, press Ctrl+C, then run the script.
 
-The script prints `http://THE-MAC-IP:8781`. Paste that into the Mac bay on the Windows page, with the Mac's name, CPU, RAM, and GPU.
+The Windows page searches the private network and fills the Mac bay when the worker answers. The script prints every address and a token id. That id must match the token id on the Windows page.
 
-The bay turns **Live** only when the Mac answers. **Waiting** means you have not saved an address. **No reply** means the script is not running, or Windows is blocking TCP 8781.
+If the Mac bay says **Token**, the Mac is running and its `cluster.token` is a different file. Delete the Mac file, copy the Windows `cluster.token` over it, and run the script again. Do not send that file to the internet.
+
+**Waiting** means the page has not found a worker yet. **No reply** means a saved address is not answering.
 
 ## 3. Add a Linux machine
 
@@ -82,7 +84,7 @@ The website does not start agents. On the Windows PC, in this folder:
 python -u mesh.py agents
 ```
 
-That window is the agent console. It shares the one local model. Four workers generate at once. Ctrl+C stops them. A hundred copies of the model do not fit on one 12 GB GPU, so the command does not open a hundred processes.
+That window is the agent console. It shares the one local model. Four workers generate at once. Ctrl+C stops them. A hundred copies of the model do not fit on one 12 GB GPU, so the command does not open a hundred processes. The console shows the model, the four slots, and the job list in that window.
 
 ## Files
 
