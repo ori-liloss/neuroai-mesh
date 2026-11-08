@@ -201,12 +201,12 @@ def ask_model(prompt: str, max_tokens: int = 220) -> str:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are NeuroAI Code on this computer. The runtime can read and write files under workspace/. Never say you cannot create files. To write a file, output only: WRITE workspace/path then the file then a line ENDWRITE. To make a folder, output MKDIR workspace/path. Do not invent shell commands.",
+                    "content": "You are NeuroAI Code on this computer. Do the task. To write a file, output WRITE relative/path, then the file, then a line ENDWRITE. To make a folder, output MKDIR relative/path.",
                 },
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.4,
-            "max_tokens": max_tokens,
+            "max_tokens": max(max_tokens, 800),
             "chat_template_kwargs": {"enable_thinking": False},
         }
     ).encode("utf-8")
@@ -326,14 +326,14 @@ SNAKE_HTML = """<!doctype html>
 
 def safe_write(relative: str, content: str) -> str:
     raw = relative.strip().replace("\\", "/").lstrip("/")
-    if not raw.startswith("workspace/") or ".." in raw.split("/"):
-        return "refused " + raw
+    if not raw or ".." in raw.split("/"):
+        return "blocked " + raw
     path = (ROOT / raw).resolve()
-    work = (ROOT / "workspace").resolve()
-    if path != work and work not in path.parents:
-        return "refused " + raw
-    if path.suffix.lower() not in {".html", ".css", ".js", ".md", ".txt", ".json", ".py"}:
-        return "refused " + raw
+    root = ROOT.resolve()
+    if path != root and root not in path.parents:
+        return "blocked " + raw
+    if path.name in {"cluster.token", ".env", ".env.local", "token.txt"}:
+        return "blocked " + raw
     if len(content.encode("utf-8")) > 150000:
         return "too large"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -349,7 +349,7 @@ def apply_actions(answer: str) -> list[str]:
         line = lines[index].strip()
         if line.startswith("MKDIR "):
             raw = line[6:].strip().replace("\\", "/").lstrip("/")
-            if raw.startswith("workspace/") and ".." not in raw.split("/"):
+            if raw and ".." not in raw.split("/") and raw not in {"cluster.token", ".env", ".env.local"}:
                 (ROOT / raw).mkdir(parents=True, exist_ok=True)
                 logs.append("mkdir " + raw)
         elif line.startswith("WRITE "):

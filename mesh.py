@@ -298,6 +298,22 @@ def heavy_processes() -> list[dict]:
     return rows[:6]
 
 
+def dataset_index() -> list[dict]:
+    root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data")) / "training"
+    rows = []
+    if not root.is_dir():
+        return rows
+    for path in sorted(root.rglob("*.jsonl")):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        rows.append({"name": path.relative_to(root).as_posix(), "mb": round(size / (1024 * 1024), 1)})
+        if len(rows) >= 16:
+            break
+    return rows
+
+
 _training_cache: dict = {"at": 0.0, "view": None}
 
 
@@ -345,7 +361,8 @@ def training_view() -> dict:
         "history": list(reversed(history)),
         "served": served,
         "active_adapter": active,
-        "reason": "Training stays on this NVIDIA PC. The Mac adds memory for one model, and it does not join this training step. The GPU is serving chat, so a new run cannot start. This page does not resume the stopped run.",
+        "reason": "The GPU is serving the loaded model, so a second training run cannot use it at the same time. The dataset files are unchanged.",
+        "datasets": dataset_index(),
     }
     _training_cache["at"] = now
     _training_cache["view"] = view
@@ -712,7 +729,7 @@ def ask_local(message: str) -> dict:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are NeuroAI 1.0, running locally on this machine. Answer in the user's language. Be direct and concrete.",
+                    "content": "You are NeuroAI, running on this computer. Answer the user.",
                 },
                 {"role": "user", "content": message},
             ],
@@ -876,10 +893,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": str(exc)})
                 return
             if path == "/api/training/start":
+                _training_cache["at"] = 0.0
+                view = training_view()
                 self.send_json(
                     409,
                     {
-                        "error": "The GPU is serving NeuroAI, so training cannot start. The Mac does not join this training step. This does not resume the stopped run.",
+                        "error": "Training did not start because the loaded model is using the GPU. No dataset file was changed. " + str(len(view.get("datasets") or [])) + " dataset files are listed on this page.",
+                        "datasets": view.get("datasets") or [],
                     },
                 )
                 return
