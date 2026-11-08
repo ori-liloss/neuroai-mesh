@@ -58,7 +58,7 @@ The Windows page finds the machine. Nothing to paste.
 
 ## 4. Add a Windows laptop
 
-On the Share page, add the laptop by name. It shows as waiting. On that laptop:
+On that laptop, run:
 
 ```powershell
 git clone https://github.com/ori-liloss/neuroai-mesh.git
@@ -66,7 +66,7 @@ cd neuroai-mesh
 powershell -File start-worker.ps1
 ```
 
-Two laptops can be added the same way, next to the Mac mini. Each one that is actually running the worker checks the agent code on its own processor. The weight update stays on the NVIDIA PC. A saved name does no work until that computer is on the network.
+The laptop stays off the page until this command is running. The page then sees it and checks the agent code on that laptop. The weight update stays on the NVIDIA PC. A second laptop is the same command on that second laptop. There is no empty seat waiting for a computer that is not here.
 
 ## 5. If the bay stays red
 

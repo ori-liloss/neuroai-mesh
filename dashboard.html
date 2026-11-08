@@ -170,23 +170,10 @@
         <article class="card">
           <div class="k">SHARE</div>
           <h2>Who holds the run</h2>
-          <p class="muted">Each computer shows what it is doing. A joined computer checks the agent code on its own processor. One training run stays on the NVIDIA PC.</p>
+          <p class="muted">A computer appears here when its command is running. Then this page checks the agent code on that computer. One training run stays on the NVIDIA PC.</p>
           <p class="muted" id="lan-open"></p>
           <div id="share-list"></div>
-          <form id="add-seat">
-            <input name="name" placeholder="Name, for example Laptop 1" required>
-            <select name="seat">
-              <option value="windows-laptop">Windows laptop</option>
-              <option value="mac-laptop">Mac laptop</option>
-              <option value="mac-mini">Mac mini</option>
-              <option value="linux">Linux</option>
-            </select>
-            <input name="cpu" placeholder="Processor, optional">
-            <input name="ram_gb" placeholder="RAM GB, optional">
-            <button class="go" type="submit">Add to the list</button>
-          </form>
-          <p class="muted">A saved computer waits until it runs the worker on this network. Then it checks the agents. It does not take the training step.</p>
-          <div id="seat-list"></div>
+          <p class="muted" id="arrived"></p>
           <button class="go" id="check-helpers" type="button">Check the agents on the joined computers</button>
           <button class="go" id="share-run" type="button">Ask the other computers to listen</button>
           <button class="quiet" id="stop-model" type="button">Stop the loaded model</button>
@@ -290,24 +277,10 @@ function cluster() {
     if (!item.ok || !item.status) continue;
     list.push({ name: item.status.name || item.url, status: item.status, url: item.url });
   }
-  const seen = new Set(list.map((item) => String(item.name || "").toLowerCase()));
-  for (const spec of mesh.specs || []) {
-    const name = String(spec.name || "");
-    if (!name || seen.has(name.toLowerCase())) continue;
-    seen.add(name.toLowerCase());
-    const os = spec.os === "mac" ? "darwin" : spec.os === "linux" ? "linux" : "windows";
-    list.push({
-      name,
-      url: spec.url || "",
-      waiting: true,
-      status: { name, os, kind: spec.kind || "", ram: {}, waiting: true, cpu: spec.cpu || "", ram_gb: spec.ram_gb || "" },
-    });
-  }
   return list;
 }
 function duty(item, index) {
   const status = (item && item.status) || {};
-  if (status.waiting) return "waiting";
   if (index === 0 && mesh.training && mesh.training.running) return "training";
   if (index === 0) return status.chat_server ? "runs the model" : "this PC";
   if (status.rpc_listening) return "memory waiting";
@@ -317,10 +290,6 @@ function doing(item, index) {
   const status = (item && item.status) || {};
   const busy = (status.heavy || []).slice(0, 3).map((row) => row.name).filter(Boolean);
   const tail = busy.length ? " Right now: " + busy.join(", ") + "." : "";
-  if (status.waiting) {
-    const bits = [status.cpu, status.ram_gb ? status.ram_gb + " GB" : ""].filter(Boolean).join(", ");
-    return "Saved on this page" + (bits ? " (" + bits + ")" : "") + ". Start its worker and it will check the agent code. The weight update stays on the NVIDIA PC.";
-  }
   if (index === 0 && mesh.training && mesh.training.running) return "This computer is training on its NVIDIA GPU. Chat is paused." + tail;
   if (status.chat_server) return "This computer is serving chat." + tail;
   if (status.rpc_listening) return "This computer is listening, ready to hold part of the next run, and it can check the agents." + tail;
@@ -497,11 +466,9 @@ function paint() {
   document.querySelectorAll(".rig").forEach((node, index) => node.classList.toggle("picked", index === picked));
   drawRoster(list);
   const current = list[picked] || list[0];
-  const waitingCount = list.filter((item) => item.status && item.status.waiting).length;
-  const liveCount = list.length - waitingCount;
   text("pick-name", current ? current.name : "–");
-  text("pick-k", liveCount + " connected" + (waitingCount ? " · " + waitingCount + " waiting" : ""));
-  text("map-foot", list.length < 2 ? "1 computer · add a laptop on the Share page" : liveCount + " live" + (waitingCount ? " · " + waitingCount + " waiting" : ""));
+  text("pick-k", list.length + " connected");
+  text("map-foot", list.length < 2 ? "1 computer · the next one appears when its command is running" : list.length + " computers · link live");
   const share = mesh.share || {};
   const peers = share.peers || list.slice(1).map((item) => ({ name: item.name, listening: Boolean(item.status && item.status.rpc_listening) }));
   const listening = peers.filter((item) => item.listening).map((item) => item.name);
@@ -517,10 +484,8 @@ function paint() {
   const trainingNow = Boolean(mesh.training && mesh.training.running);
   text("g-model", trainingNow ? "Training" : home && home.chat_server ? "Model on this PC" : "Model is off");
   text("g-model-sub", trainingNow ? "Step " + (mesh.training.step || "–") + " of " + (mesh.training.max_steps || "–") : home && home.chat_server ? "Chat is using this computer." : "Nothing is serving chat.");
-  text("g-count", liveCount + (liveCount === 1 ? " computer" : " computers"));
-  const liveNames = list.slice(1).filter((item) => !(item.status && item.status.waiting)).map((item) => item.name);
-  const waitNames = list.filter((item) => item.status && item.status.waiting).map((item) => item.name);
-  text("g-count-sub", (liveNames.join(", ") || "No other computer is live yet.") + (waitNames.length ? " Waiting: " + waitNames.join(", ") + "." : ""));
+  text("g-count", list.length + (list.length === 1 ? " computer" : " computers"));
+  text("g-count-sub", list.length < 2 ? "The next one appears when its command is running." : list.slice(1).map((item) => item.name).join(", "));
   const workers = crew.workers || [];
   const busy = workers.filter((item) => item.state === "generating").length;
   text("g-agents", workers.length + (workers.length === 1 ? " agent" : " agents"));
@@ -582,7 +547,8 @@ function paint() {
     start.textContent = training.running ? "Training is running" : "Start training";
   }
   drawShare(list);
-  drawSeats();
+  const arrived = mesh.arrivals || [];
+  text("arrived", arrived.length ? arrived.map((item) => (item.name || item.host || item.url) + ": " + (item.ok ? item.passed + " of " + item.rounds : (item.error || "failed"))).join(" · ") : "");
 }
 function drawShare(list) {
   const box = document.getElementById("share-list");
@@ -603,29 +569,6 @@ function drawShare(list) {
     row.append(icon, copy);
     box.append(row);
   });
-}
-function drawSeats() {
-  const box = document.getElementById("seat-list");
-  if (!box) return;
-  box.replaceChildren();
-  for (const spec of mesh.specs || []) {
-    const row = document.createElement("div");
-    row.className = "row";
-    const live = new Set((mesh.found || []).filter((item) => item.ok && item.status).map((item) => String(item.status.name || "").toLowerCase()));
-    const name = document.createElement("span");
-    const joined = live.has(String(spec.name || "").toLowerCase());
-    name.textContent = spec.name + " · " + (spec.kind || spec.os) + (joined ? " · joined" : " · waiting to check agents");
-    const button = document.createElement("button");
-    button.className = "quiet";
-    button.type = "button";
-    button.textContent = "Remove";
-    button.onclick = async () => {
-      await fetch("/api/specs?name=" + encodeURIComponent(spec.name), { method: "DELETE" });
-      refresh();
-    };
-    row.append(name, button);
-    box.append(row);
-  }
 }
 function kindLabel(kind) {
   if (kind === "penguin") return "Linux";
@@ -656,27 +599,10 @@ document.getElementById("check-helpers").onclick = async () => {
   const body = await response.json();
   const rows = body.checked || [];
   if (!rows.length) {
-    document.getElementById("share-note").textContent = "No joined computer yet. Add the laptop here, then start its worker. The Mac mini checks after it pulls and starts again.";
+    document.getElementById("share-note").textContent = "No other computer is running the worker yet. It appears after the command starts.";
     return;
   }
   document.getElementById("share-note").textContent = rows.map((item) => (item.host || item.url) + ": " + (item.ok ? item.passed + " of " + item.rounds : (item.error || "failed"))).join(" · ");
-};
-document.getElementById("add-seat").onsubmit = async (event) => {
-  event.preventDefault();
-  const form = event.target;
-  const seat = form.seat.value;
-  const body = {
-    name: form.name.value,
-    cpu: form.cpu.value,
-    ram_gb: form.ram_gb.value,
-    os: seat.startsWith("mac") ? "mac" : seat === "linux" ? "linux" : "windows",
-    kind: seat === "mac-mini" ? "mini" : seat === "linux" ? "penguin" : "laptop",
-  };
-  const response = await fetch("/api/specs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const saved = await response.json();
-  document.getElementById("share-note").textContent = saved.error || (saved.name + " is on the list. It checks the agents after its worker is running.");
-  form.reset();
-  refresh();
 };
 document.getElementById("share-run").onclick = async () => {
   const response = await fetch("/api/share/offer", { method: "POST" });

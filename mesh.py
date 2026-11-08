@@ -707,15 +707,43 @@ def scan_lan() -> list[dict]:
     return kept
 
 
+_seen_peers: set[str] = set()
+_arrivals: list[dict] = []
+_arrival_lock = threading.Lock()
+
+
+def note_arrival(item: dict) -> None:
+    url = str(item.get("url") or "")
+    if not url:
+        return
+    with _arrival_lock:
+        if url in _seen_peers:
+            return
+        _seen_peers.add(url)
+    result = ask_check(url)
+    status = item.get("status") or {}
+    result["name"] = str(status.get("name") or url)
+    with _arrival_lock:
+        _arrivals.append(result)
+        del _arrivals[:-8]
+
+
 def discovery_loop() -> None:
     global _found
     while True:
         try:
             found = scan_lan()
+            fresh: list[dict] = []
+            with _found_lock:
+                previous = {str(item.get("url") or "") for item in _found}
             for item in found:
                 remember_peer(item)
+                if str(item.get("url") or "") not in previous:
+                    fresh.append(item)
             with _found_lock:
                 _found = found
+            for item in fresh:
+                threading.Thread(target=note_arrival, args=(item,), name="neuro-arrival", daemon=True).start()
         except Exception as exc:
             print(f"discovery failed: {exc}", flush=True)
         time.sleep(12)
@@ -790,6 +818,8 @@ def mesh_snapshot() -> dict:
         nodes.append(pull_worker(item["url"]))
     with _found_lock:
         found = list(_found)
+    with _arrival_lock:
+        arrivals = list(_arrivals)
     return {
         "nodes": nodes,
         "found": found,
@@ -805,6 +835,7 @@ def mesh_snapshot() -> dict:
         "training": training_view(),
         "models": known_models(),
         "lan": ("http://" + lan_host() + ":" + str(DASHBOARD_PORT)) if lan_host() else "",
+        "arrivals": arrivals,
         "share": {
             "model_on_this_pc": bool(local.get("chat_server")),
             "training": "this PC only",
