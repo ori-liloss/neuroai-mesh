@@ -8,13 +8,14 @@ if /I "%~1"=="tools" (
 set "PY="
 if exist "%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe" set "PY=%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe"
 if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\Python314\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python314\python.exe"
-if defined PY (
-  "%PY%" -u mesh.py code %*
-  exit /b %errorlevel%
-)
+if defined PY goto usepy
 where py >nul 2>&1
-if %errorlevel%==0 (
-  py -3 -u mesh.py code %*
-  exit /b %errorlevel%
-)
+if %errorlevel%==0 goto usepylauncher
 python -u mesh.py code %*
+exit /b %errorlevel%
+:usepy
+"%PY%" -u mesh.py code %*
+exit /b %errorlevel%
+:usepylauncher
+py -3 -u mesh.py code %*
+exit /b %errorlevel%

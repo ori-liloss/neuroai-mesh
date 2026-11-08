@@ -26,6 +26,37 @@ SLOTS = 4
 CHAT_URL = "http://127.0.0.1:8080/v1/chat/completions"
 
 
+def append_capped(path: Path, line: str, limit: int = 200000, keep: int = 100) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+b") as lock:
+        lock.seek(0)
+        if lock.read(1) == b"":
+            lock.write(b"0")
+            lock.flush()
+        lock.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line if line.endswith("\n") else line + "\n")
+            if path.stat().st_size > limit:
+                lines = path.read_text(encoding="utf-8").splitlines()[-keep:]
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def connect() -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
@@ -952,12 +983,7 @@ def drill_round(index: int) -> dict:
         and native_tool("<tool_call><function=write_file><parameter=path></parameter><parameter=content>nope</parameter></function></tool_call>") == ""
     )
     row = {"t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), "round": index, "ok": ok}
-    log_path = LOG_DIR / "drill.jsonl"
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row) + "\n")
-    if log_path.stat().st_size > 200000:
-        lines = log_path.read_text(encoding="utf-8").splitlines()[-100:]
-        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    append_capped(LOG_DIR / "drill.jsonl", json.dumps(row))
     return row
 
 
