@@ -1,4 +1,4 @@
-# Neuro Mesh 1.0
+# Neuro
 
 A local console for one Windows GPU machine plus Mac and Linux workers. The dashboard stays on the Windows machine. Chat goes to a llama.cpp server you start yourself. This repository does not contain model weights.
 
@@ -61,7 +61,7 @@ The Windows page at http://127.0.0.1:8780 finds the machine. Nothing to paste.
 On the Windows machine, in an Administrator PowerShell, allow the worker port on the private network only:
 
 ```powershell
-netsh advfirewall firewall add rule name="NeuroAI Mesh worker" dir=in action=allow protocol=TCP localport=8781 profile=private
+netsh advfirewall firewall add rule name="Neuro worker" dir=in action=allow protocol=TCP localport=8781 profile=private
 ```
 
 Do not open 8781, or the llama.cpp RPC port 50052, to the public internet. RPC has no login.
@@ -78,10 +78,10 @@ Open http://127.0.0.1:8780. It has three views:
 
 - **Machines** shows this PC and the Mac side by side, with memory and the large programs when that computer reports them.
 - **Models** lists GGUF files on this PC. Add a file that is already on disk. Adding it does not load it while the GPU is full.
-- **Try** is the chat with the loaded NeuroAI 9B.
+- **Try** is the chat with the loaded model.
 - **Training** shows the stopped run, the recent losses, and a start button. Training stays on the NVIDIA PC. The Mac does not join that step. The button does not start a run while chat is using the GPU, and it does not resume the stopped run.
 
-NeuroAI Code can write files under `workspace/`. A request to make a folder and a game is handled there.
+Neuro Code can write files under `workspace/`. A request to make a folder and a game is handled there. A heavy program that belongs to Neuro has a Stop process button on this PC and on a joined computer. Other programs stay open.
 
 A Mac still joins with `bash platforms/start-mac.sh` even if its GPU name is missing. The bay stays live. The chip name appears after that script is started again.
 
@@ -91,7 +91,7 @@ A Mac still joins with `bash platforms/start-mac.sh` even if its GPU name is mis
 neuro
 ```
 
-`neuro` opens NeuroAI Code from the project folder, or from any folder after the command is on PATH. It uses one local model. The worker can list, search, read, write, run a command in this repo, and read its own saved session. Every finished task is appended on this computer under `agent-logs/`, which git does not upload. Closing the window leaves the workers running.
+`neuro` opens Neuro Code from the project folder, or from any folder after the command is on PATH. It uses one local model. The worker can list, search, read, write, run a command in this repo, and read its own saved session. Every finished task is appended on this computer under `agent-logs/`, which git does not upload. Closing the window leaves the workers running.
 
 A hundred copies of the model do not fit on one 12 GB GPU. The queue can hold many tasks. Four of them generate at once.
 

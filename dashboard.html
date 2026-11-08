@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NeuroAI Mesh</title>
+  <title>Neuro</title>
   <style>
     :root {
       --bg: #070b14;
@@ -44,7 +44,8 @@
     .bar { height: 8px; border-radius: 99px; background: #243049; margin-top: 14px; overflow: hidden; }
     .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--ice), var(--gold)); }
     .bar.hot i { background: linear-gradient(90deg, #e0b15a, #ff5c7a); }
-    .row, .set { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
+    .row, .set { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
+    .row button { padding: 4px 10px; font-size: 11px; white-space: nowrap; }
     .bay { display: grid; grid-template-columns: 230px minmax(0, 1fr) 280px; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
     .map { position: relative; min-height: 420px; height: 100%; background:
       radial-gradient(ellipse at 50% 58%, rgba(240, 200, 75, 0.14), transparent 46%),
@@ -94,7 +95,7 @@
 <body>
   <div class="app">
     <aside>
-      <div class="brand">Neuro<span>AI</span></div>
+      <div class="brand"><span>Neuro</span></div>
       <p>The computers, the loaded model, the datasets, and the training record.</p>
       <nav>
         <button class="on" type="button" data-view="machines">Machines</button>
@@ -116,7 +117,7 @@
             <div id="roster"></div>
           </article>
           <div class="map" id="map">
-            <div class="word">NEUROAI</div>
+            <div class="word">NEURO</div>
             <svg class="links" id="links"></svg>
             <div class="map-foot" id="map-foot"></div>
           </div>
@@ -132,6 +133,7 @@
             <button class="quiet" id="stop-model" type="button">Stop the loaded model</button>
             <button class="quiet" id="stop-agents" type="button">Stop code workers</button>
             <p class="muted" id="stop-note"></p>
+            <p class="muted">Stop process is on each heavy program that belongs to Neuro, here and on a joined computer. Other programs stay open.</p>
             <p class="muted">A shop PlayStation or Xbox cannot share this run. Another computer joins by running the worker.</p>
           </article>
         </div>
@@ -152,10 +154,10 @@
       <section class="view" id="view-try" hidden>
         <article class="card">
           <div class="k">LOADED</div>
-          <h2>Try NeuroAI</h2>
+          <h2>Try Neuro</h2>
           <div id="log"></div>
           <form id="say">
-            <textarea id="message" placeholder="Ask NeuroAI"></textarea>
+            <textarea id="message" placeholder="Ask Neuro"></textarea>
             <button class="go" id="send" type="submit">Send</button>
           </form>
         </article>
@@ -182,6 +184,45 @@ let mesh = { nodes: [], found: [], training: {}, models: [] };
 let crew = { workers: [], counts: {} };
 function text(id, value) { const node = document.getElementById(id); if (node) node.textContent = value; }
 function gb(mib) { return mib ? (mib / 1024).toFixed(mib >= 10240 ? 0 : 1) : "0"; }
+function hogs(rows, url) {
+  const box = document.getElementById("pick-hogs");
+  box.replaceChildren();
+  if (!rows || !rows.length) {
+    const note = document.createElement("p");
+    note.className = "muted";
+    note.textContent = "No program list from this computer yet.";
+    box.append(note);
+    return;
+  }
+  for (const item of rows) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const name = document.createElement("span");
+    name.textContent = item.role === "model" ? item.name + " · holding the model" : item.name;
+    const size = document.createElement("b");
+    size.textContent = item.mb != null ? item.mb + " MB" : "";
+    row.append(name, size);
+    if (item.stoppable && item.pid) {
+      const button = document.createElement("button");
+      button.className = "quiet";
+      button.type = "button";
+      button.textContent = "Stop process";
+      button.onclick = () => stopProcess(item.pid, url);
+      row.append(button);
+    }
+    box.append(row);
+  }
+}
+async function stopProcess(pid, url) {
+  const response = await fetch("/api/process/stop", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pid, url: url === "local" ? "" : url }),
+  });
+  const body = await response.json();
+  document.getElementById("stop-note").textContent = body.note || body.error || "Could not stop that process.";
+  refresh();
+}
 function lines(id, rows, empty) {
   const box = document.getElementById(id);
   box.replaceChildren();
@@ -207,7 +248,7 @@ let picked = 0;
 let mapKey = "";
 function cluster() {
   const local = (mesh.nodes[0] && mesh.nodes[0].status) || {};
-  const list = [{ name: local.name || "This PC", status: local, url: "this PC" }];
+  const list = [{ name: local.name || "This PC", status: local, url: "local" }];
   for (const item of mesh.found || []) {
     if (!item.ok || !item.status) continue;
     list.push({ name: item.status.name || item.url, status: item.status, url: item.url });
@@ -406,13 +447,13 @@ function paint() {
   const total = ram.total_mib || 0;
   const used = Math.max(0, total - (ram.free_mib || 0));
   text("pick-temp", (temp == null || temp === "" ? "–" : temp) + "°");
-  text("pick-meta", current ? memoryLine(current.status) + " · " + (gpu.name || current.url) : "–");
+  text("pick-meta", current ? memoryLine(current.status) + " · " + (gpu.name || (current.url === "local" ? "this PC" : current.url)) : "–");
   const bar = document.getElementById("pick-bar");
   if (bar) {
     bar.style.width = total ? Math.round(100 * used / total) + "%" : "0";
     bar.parentElement.classList.toggle("hot", Boolean(total && used / total >= 0.9));
   }
-  lines("pick-hogs", current && current.status.heavy, "No program list from this computer yet.");
+  hogs(current && current.status.heavy, current ? current.url : "");
   lines("model-list", (mesh.models || []).map((item) => ({ name: item.name + (item.loaded ? " · loaded" : " · on disk"), mb: item.mb })), "No GGUF files found.");
   const training = mesh.training || {};
   text("train-title", training.running ? "Running" : "Stopped");

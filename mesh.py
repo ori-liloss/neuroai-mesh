@@ -214,6 +214,16 @@ def nvidia() -> list[dict]:
     return cards
 
 
+STOPPABLE = {
+    "llama-server.exe",
+    "llama-server",
+    "ggml-rpc-server.exe",
+    "ggml-rpc-server",
+    "rpc-server.exe",
+    "rpc-server",
+}
+
+
 def process_running(image: str) -> bool:
     try:
         if os.name == "nt":
@@ -268,30 +278,51 @@ def heavy_processes() -> list[dict]:
                 if len(parts) < 5:
                     continue
                 name = parts[0].strip('"')
+                pid_text = parts[1].strip()
                 mem = parts[-1].replace(",", "").replace(" K", "").replace(" ", "")
-                if not mem.isdigit():
+                if not pid_text.isdigit() or not mem.isdigit():
                     continue
                 mb = int(mem) // 1024
                 if mb < 80:
                     continue
-                role = "other"
                 lowered = name.lower()
+                role = "other"
                 if lowered.startswith("llama-server"):
                     role = "model"
+                elif "rpc-server" in lowered:
+                    role = "share"
                 elif lowered.startswith("python"):
                     role = "python"
-                rows.append({"name": name, "mb": mb, "role": role})
+                rows.append(
+                    {
+                        "name": name,
+                        "pid": int(pid_text),
+                        "mb": mb,
+                        "role": role,
+                        "stoppable": lowered in STOPPABLE,
+                    }
+                )
         else:
-            out = subprocess.check_output(["ps", "-axo", "rss=,comm="], text=True, timeout=4)
+            out = subprocess.check_output(["ps", "-axo", "pid=,rss=,comm="], text=True, timeout=4)
             for line in out.splitlines():
-                bits = line.strip().split(None, 1)
-                if len(bits) < 2 or not bits[0].isdigit():
+                bits = line.strip().split(None, 2)
+                if len(bits) < 3 or not bits[0].isdigit() or not bits[1].isdigit():
                     continue
-                mb = int(bits[0]) // 1024
+                mb = int(bits[1]) // 1024
                 if mb < 80:
                     continue
-                name = bits[1].replace("\\", "/").split("/")[-1][:40]
-                rows.append({"name": name, "mb": mb, "role": "other"})
+                name = bits[2].replace("\\", "/").split("/")[-1][:40]
+                lowered = name.lower()
+                role = "model" if lowered.startswith("llama-server") else "share" if "rpc-server" in lowered else "other"
+                rows.append(
+                    {
+                        "name": name,
+                        "pid": int(bits[0]),
+                        "mb": mb,
+                        "role": role,
+                        "stoppable": lowered in STOPPABLE,
+                    }
+                )
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
     rows.sort(key=lambda item: item["mb"], reverse=True)
@@ -325,7 +356,7 @@ def training_view() -> dict:
     data_root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data"))
     versions_path = data_root / "versions.json"
     active = ""
-    served = "NeuroAI 9B"
+    served = "Neuro"
     if versions_path.is_file():
         try:
             versions = json.loads(versions_path.read_text(encoding="utf-8"))
@@ -731,7 +762,7 @@ def lan_host() -> str:
 def start_rpc() -> dict:
     status = local_status()
     if status["chat_server"]:
-        raise RuntimeError("The GPU is serving NeuroAI. Stop the chat server before splitting weights.")
+        raise RuntimeError("The GPU is serving Neuro. Stop the chat server before splitting weights.")
     if status["rpc_listening"]:
         return {"started": False, "already": True, "port": RPC_PORT}
     binary = status["rpc_binary"]
@@ -756,7 +787,7 @@ def ask_local(message: str) -> dict:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are NeuroAI, running on this computer. Answer the user.",
+                    "content": "You are Neuro, running on this computer. Answer the user.",
                 },
                 {"role": "user", "content": message},
             ],
@@ -812,6 +843,102 @@ def offer_share() -> dict:
         "peers": results,
         "note": "The loaded model stays on this PC. A computer that is listening joins the next start. Splitting a model that already fits this GPU makes the run slower.",
     }
+
+
+def process_name(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    try:
+        if os.name == "nt":
+            out = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                text=True,
+                timeout=8,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                if "No tasks" in line or not line.strip():
+                    continue
+                parts = [part.strip().strip('"') for part in line.split('","')]
+                if parts:
+                    return parts[0].strip('"')
+            return ""
+        out = subprocess.check_output(["ps", "-p", str(pid), "-o", "comm="], text=True, timeout=4)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.strip().replace("\\", "/").split("/")[-1]
+
+
+def stop_owned_process(pid: int) -> dict:
+    name = process_name(pid)
+    if name.lower() not in STOPPABLE:
+        return {
+            "stopped": False,
+            "note": "Left that program running. Stop process only stops the loaded model or the share listener.",
+        }
+    if os.name == "nt":
+        done = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
+        stopped = done.returncode == 0
+    else:
+        try:
+            os.kill(pid, 15)
+            stopped = True
+        except OSError:
+            stopped = False
+    if not stopped:
+        return {"stopped": False, "note": "Could not stop " + name + "."}
+    return {"stopped": True, "name": name, "pid": pid, "note": "Stopped " + name + ". That memory is being released."}
+
+
+def peer_known(url: str) -> bool:
+    try:
+        clean = clean_url(url)
+    except ValueError:
+        return False
+    with _found_lock:
+        found = list(_found)
+    known: list[str] = []
+    for item in list(found) + read_nodes():
+        raw = str(item.get("url") or "")
+        if not raw:
+            continue
+        try:
+            known.append(clean_url(raw))
+        except ValueError:
+            continue
+    return clean in known
+
+
+def stop_at(url: str, pid: int) -> dict:
+    if pid <= 0:
+        return {"stopped": False, "note": "Missing process."}
+    if not url:
+        return stop_owned_process(pid)
+    try:
+        clean = clean_url(url)
+    except ValueError:
+        return {"stopped": False, "note": "That address is not a joined computer."}
+    if not peer_known(clean):
+        return {"stopped": False, "note": "That computer is not in this mesh."}
+    request = urllib.request.Request(
+        clean + "/process/stop",
+        data=json.dumps({"pid": pid}).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        if isinstance(body, dict):
+            return body
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:180]
+        if exc.code in {404, 401} or "token" in detail.lower():
+            return {"stopped": False, "note": "That computer is running an older worker. Pull and start it again."}
+        return {"stopped": False, "note": detail or "Could not stop that process."}
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        return {"stopped": False, "note": "That computer did not answer."}
+    return {"stopped": False, "note": "Could not stop that process."}
 
 
 def stop_model() -> dict:
@@ -926,6 +1053,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.mode == "work":
             # Listening for a shared run does not use the other computer's token.
             # Each machine keeps its own token, and this port stays on the LAN.
+            if path == "/process/stop":
+                try:
+                    pid = int(self.read_json().get("pid") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+                self.send_json(200, stop_owned_process(pid))
+                return
             if path in {"/rpc/start", "/rpc/stop"}:
                 try:
                     if path == "/rpc/start":
@@ -986,6 +1120,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/model/stop":
                 self.send_json(200, stop_model())
+                return
+            if path == "/api/process/stop":
+                body = self.read_json()
+                try:
+                    pid = int(body.get("pid") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+                self.send_json(200, stop_at(str(body.get("url") or ""), pid))
                 return
             if path == "/api/share/offer":
                 self.send_json(200, offer_share())

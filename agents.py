@@ -1,4 +1,4 @@
-"""CMD workers for NeuroAI Mesh.
+"""CMD workers for Neuro.
 
 One llama-server holds the model. Workers are separate Python processes.
 Only a few of them may generate at once, because the GPU has four slots.
@@ -128,7 +128,7 @@ def seed() -> int:
     tasks = [
         ("Red bay", "A Mac worker is running but the bay stays red. Give the one Windows firewall check and the address format."),
         ("Copy step", "Write the exact files a person must copy to a Mac before the worker script can start."),
-        ("Chat idle", "Explain in two sentences why the GPU can sit near zero while NeuroAI is still loaded."),
+        ("Chat idle", "Explain in two sentences why the GPU can sit near zero while Neuro is still loaded."),
         ("Linux command", "Give the one command that starts a Linux worker from the neuro-cluster folder."),
         ("Token", "Say where cluster.token must sit, and why it must stay off the public internet."),
         ("Slots", "Explain why many CMD workers share one model and only four generate at once."),
@@ -207,7 +207,7 @@ def ask_model(prompt: str, max_tokens: int = 220) -> str:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are NeuroAI. Do the task the user asked.",
+                    "content": "You are Neuro. Do the task the user asked. When a tool is needed, put that tool on the first line.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -265,70 +265,6 @@ def files_named_in(prompt: str) -> list[str]:
     return found
 
 
-SNAKE_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Snake</title>
-  <style>
-    body { margin: 0; background: #111; color: #eee; font-family: sans-serif; display: grid; place-items: center; min-height: 100vh; }
-    canvas { background: #1b1b1b; }
-  </style>
-</head>
-<body>
-  <p id="score">Score 0</p>
-  <canvas id="board" width="400" height="400"></canvas>
-  <script>
-    const size = 20;
-    const cells = 20;
-    const canvas = document.getElementById("board");
-    const pen = canvas.getContext("2d");
-    let snake = [{x: 8, y: 10}, {x: 7, y: 10}, {x: 6, y: 10}];
-    let dir = {x: 1, y: 0};
-    let next = {x: 1, y: 0};
-    let food = {x: 14, y: 10};
-    let score = 0;
-    let alive = true;
-    addEventListener("keydown", (event) => {
-      const map = {ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0]};
-      const move = map[event.key];
-      if (!move || (move[0] === -dir.x && move[1] === -dir.y)) return;
-      next = {x: move[0], y: move[1]};
-    });
-    function place() {
-      do {
-        food = {x: Math.floor(Math.random() * cells), y: Math.floor(Math.random() * cells)};
-      } while (snake.some((part) => part.x === food.x && part.y === food.y));
-    }
-    function frame() {
-      if (!alive) return;
-      dir = next;
-      const head = {x: snake[0].x + dir.x, y: snake[0].y + dir.y};
-      if (head.x < 0 || head.y < 0 || head.x >= cells || head.y >= cells || snake.some((part) => part.x === head.x && part.y === head.y)) {
-        alive = false;
-        document.getElementById("score").textContent = "Score " + score + " — press F5";
-        return;
-      }
-      snake.unshift(head);
-      if (head.x === food.x && head.y === food.y) {
-        score += 1;
-        document.getElementById("score").textContent = "Score " + score;
-        place();
-      } else {
-        snake.pop();
-      }
-      pen.clearRect(0, 0, 400, 400);
-      pen.fillStyle = "#3ee0c5";
-      pen.fillRect(food.x * size, food.y * size, size - 1, size - 1);
-      pen.fillStyle = "#eee";
-      for (const part of snake) pen.fillRect(part.x * size, part.y * size, size - 1, size - 1);
-    }
-    setInterval(frame, 140);
-  </script>
-</body>
-</html>
-"""
-
 
 def safe_write(relative: str, content: str) -> str:
     raw = relative.strip().replace("\\", "/").lstrip("/")
@@ -375,8 +311,19 @@ def apply_actions(answer: str) -> list[str]:
     return logs
 
 
+def visible_answer(answer: str) -> str:
+    text = answer or ""
+    while "<think>" in text and "</think>" in text:
+        start = text.find("<think>")
+        end = text.find("</think>", start)
+        if end < 0:
+            break
+        text = text[:start] + text[end + len("</think>") :]
+    return text.strip()
+
+
 TOOL_HELP = (
-    "You are NeuroAI Code in this repo. Use one tool, then wait for the result.\n"
+    "You are Neuro Code in this repo. The first line is one tool, then wait for the result.\n"
     "LIST relative/dir\n"
     "GREP text\n"
     "READ relative/path\n"
@@ -386,6 +333,7 @@ TOOL_HELP = (
     "the file contents\n"
     "ENDWRITE\n"
     "RUN command\n"
+    "WRITE under workspace/ is allowed. Do not say you cannot create a file there.\n"
     "When the task is done, answer in plain text and do not emit a tool."
 )
 
@@ -508,13 +456,11 @@ def run_agent(prompt: str) -> str:
     context = TOOL_HELP + "\n\nTask:\n" + prompt + "\n\n" + workspace_note()
     logs: list[str] = []
     for _ in range(4):
-        answer = ask_model(context, max_tokens=1400)
+        answer = visible_answer(ask_model(context, max_tokens=1400))
         tool = first_tool(answer)
         if tool:
             print("tool " + tool.splitlines()[0][:120], flush=True)
         if not tool:
-            if "snake" in prompt.lower() and not any(item.startswith("wrote ") for item in logs):
-                logs.append(safe_write("workspace/snake/index.html", SNAKE_HTML))
             return "\n".join([*logs, answer]).strip()[:4000]
         if tool.startswith("WRITE "):
             wrote = apply_actions(answer)
@@ -544,7 +490,7 @@ def run_agent(prompt: str) -> str:
 
 def worker_main() -> None:
     pid = os.getpid()
-    print(f"NeuroAI Code {pid} on one shared model, {SLOTS} generate at once", flush=True)
+    print(f"Neuro Code {pid} on one shared model, {SLOTS} generate at once", flush=True)
     while not STOP_PATH.exists():
         job = claim(pid)
         if job is None:
@@ -560,7 +506,7 @@ def worker_main() -> None:
             print(f"agent {pid} error job {job['id']}: {exc}", flush=True)
     with connect() as db:
         db.execute("DELETE FROM workers WHERE pid=?", (pid,))
-    print(f"NeuroAI agent {pid} stopped", flush=True)
+    print(f"Neuro agent {pid} stopped", flush=True)
 
 
 def spawn(requested: int, *, exact: bool = False) -> dict:
@@ -669,10 +615,10 @@ def draw_terminal(snap: dict, started: dict) -> None:
 
     lines = [
         "┌" + "─" * inner + "┐",
-        row("  NEUROAI  1.0"),
+        row("  NEURO  1.0"),
         row("  Agent console  ·  one local model"),
         "├" + "─" * inner + "┤",
-        row("  Model   NeuroAI 9B"),
+        row("  Model   local"),
         row("  API     http://127.0.0.1:8080/v1"),
         row(f"  Slots   {generating} generating  ·  {SLOTS} at once  ·  {len(workers)} workers"),
         row(
@@ -690,7 +636,7 @@ def draw_terminal(snap: dict, started: dict) -> None:
         lines.append(row(f"  {job['id']:>3}  {str(job['status']):<10} {job['title']}"))
     lines.append("├" + "─" * inner + "┤")
     lines.append(row("  The website does not start these. Ctrl+C stops them."))
-    lines.append(row("  > shared NeuroAI 9B"))
+    lines.append(row("  > shared local model"))
     lines.append("└" + "─" * inner + "┘")
     sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
     sys.stdout.flush()
@@ -756,13 +702,13 @@ def code_screen(snap: dict, typed: str, note: str, beat: int = 0) -> str:
 
     brain = BRAIN[beat % len(BRAIN)]
     saved = recent_sessions(4)
-    left = ["", *brain, "", "NeuroAI Code"]
+    left = ["", *brain, "", "Neuro Code"]
     right = ["saved on this PC"] + (saved or ["nothing saved yet"])
     while len(right) < len(left):
         right.append("")
     lines = [
         pink + "┌" + "─" * inner + "┐" + reset,
-        row("  NeuroAI Code", soft),
+        row("  Neuro Code", soft),
         pink + "├" + "─" * inner + "┤" + reset,
     ]
     half = 34
