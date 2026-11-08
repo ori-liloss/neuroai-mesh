@@ -2,5 +2,10 @@ cluster.token
 rpc.pid
 nodes.json
 specs.json
+agents.db
+agents.db-wal
+agents.db-shm
+agents.stop
+agent-logs/
 __pycache__/
 *.pyc

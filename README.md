@@ -70,6 +70,24 @@ It reports its memory and can later hold part of one inference run. Training sta
 
 Weight split starts only after the chat server stops, because one GPU cannot serve chat and lend its memory at the same time.
 
+## Agents from CMD
+
+The model stays in one llama-server. Agents are extra Python processes. They share that model. Four can generate at the same time, because the server has four slots. More workers wait in line. A hundred model copies do not fit on one 12 GB GPU.
+
+One worker in this window:
+
+```powershell
+python -u mesh.py agent
+```
+
+A detached pool, visible in Task Manager as `python.exe`:
+
+```powershell
+python -u mesh.py swarm 8
+```
+
+`swarm 100` starts only as many processes as free RAM allows, and never more than 24. The queue can hold as many tasks as you add. The page has **Start 8** and **Stop** next to the chat.
+
 ## Files
 
 | File | Role |

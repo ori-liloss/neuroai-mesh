@@ -374,6 +374,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/mesh":
             self.send_json(200, mesh_snapshot())
             return
+        if path == "/api/agents":
+            from agents import snapshot
+
+            self.send_json(200, snapshot())
+            return
         if path == "/api/token":
             self.send_json(200, {"token": token()})
             return
@@ -410,6 +415,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not found"})
             return
         try:
+            if path == "/api/agents/jobs":
+                from agents import enqueue
+
+                body = self.read_json()
+                title = str(body.get("title", "")).strip()
+                prompt = str(body.get("prompt", "")).strip()
+                if not prompt:
+                    self.send_json(400, {"error": "Missing task"})
+                    return
+                self.send_json(200, {"id": enqueue(title or prompt[:40], prompt)})
+                return
+            if path == "/api/agents/swarm":
+                from agents import seed, spawn
+
+                body = self.read_json()
+                requested = int(body.get("count", 4) or 4)
+                seeded = seed()
+                self.send_json(200, {"seeded": seeded, **spawn(requested)})
+                return
+            if path == "/api/agents/stop":
+                from agents import stop_workers
+
+                self.send_json(200, stop_workers())
+                return
             if path == "/api/chat":
                 message = str(self.read_json(64000).get("message", "")).strip()
                 if not message:
@@ -506,8 +535,22 @@ def serve(mode: str) -> None:
 
 def main() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    if command == "agent":
+        from agents import worker_main
+
+        worker_main()
+        return
+    if command == "swarm":
+        from agents import seed, spawn
+
+        requested = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+        seeded = seed()
+        result = spawn(requested)
+        print(f"seeded {seeded} jobs; started {result['started']} of {result['requested']}", flush=True)
+        print("pids " + " ".join(str(pid) for pid in result["pids"]), flush=True)
+        return
     if command not in {"serve", "work"}:
-        raise SystemExit("use: mesh.py serve | mesh.py work")
+        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py agent | mesh.py swarm COUNT")
     serve(command)
 
 
