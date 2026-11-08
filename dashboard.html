@@ -28,8 +28,13 @@
     nav { display: grid; gap: 4px; margin-top: 28px; }
     nav button { text-align: left; background: transparent; border: 0; border-left: 2px solid transparent; color: var(--muted); padding: 10px 12px; }
     nav button.on { color: var(--ink); border-left-color: var(--gold); background: rgba(224, 177, 90, 0.08); }
-    main { padding: 28px; }
+    main { height: 100vh; overflow: auto; padding: 16px; display: flex; flex-direction: column; }
+    .view { display: flex; flex-direction: column; gap: 12px; min-height: 0; flex: 1; }
     .view[hidden] { display: none; }
+    .glance { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .glance p { margin: 0; background: #10141f; border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
+    .glance b { display: block; font-family: Georgia, serif; font-size: 20px; font-weight: 500; }
+    .glance span { display: block; margin-top: 4px; color: var(--muted); font-family: var(--mono); font-size: 12px; }
     .stage { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; }
     .card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 20px; }
     .k { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em; color: var(--muted); }
@@ -38,9 +43,10 @@
     .muted { color: var(--muted); line-height: 1.45; }
     .bar { height: 8px; border-radius: 99px; background: #243049; margin-top: 14px; overflow: hidden; }
     .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--ice), var(--gold)); }
+    .bar.hot i { background: linear-gradient(90deg, #e0b15a, #ff5c7a); }
     .row, .set { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
-    .bay { display: grid; grid-template-columns: 230px minmax(0, 1fr) 280px; gap: 16px; align-items: stretch; }
-    .map { position: relative; min-height: 540px; background:
+    .bay { display: grid; grid-template-columns: 230px minmax(0, 1fr) 280px; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
+    .map { position: relative; min-height: 420px; height: 100%; background:
       radial-gradient(ellipse at 50% 58%, rgba(240, 200, 75, 0.14), transparent 46%),
       #05060a;
       border: 1px solid var(--line); border-radius: 18px; overflow: hidden; }
@@ -82,7 +88,7 @@
     #log { display: flex; flex-direction: column; gap: 8px; min-height: 280px; }
     .bubble { max-width: 78%; padding: 12px 14px; border-radius: 16px; border: 1px solid var(--line); white-space: pre-wrap; }
     .user { align-self: end; background: #18243b; }
-    @media (max-width: 1100px) { .app, .stage, .bay { grid-template-columns: 1fr; } }
+    @media (max-width: 1100px) { .app, .stage, .bay, .glance { grid-template-columns: 1fr; } .app { height: auto; } main { height: auto; } }
   </style>
 </head>
 <body>
@@ -99,6 +105,11 @@
     </aside>
     <main>
       <section class="view" id="view-machines">
+        <div class="glance">
+          <p><b id="g-model">Model</b><span id="g-model-sub">–</span></p>
+          <p><b id="g-count">Computers</b><span id="g-count-sub">–</span></p>
+          <p><b id="g-agents">Agents</b><span id="g-agents-sub">–</span></p>
+        </div>
         <div class="bay">
           <article class="card">
             <div class="k">MACHINES</div>
@@ -165,6 +176,7 @@
   </div>
 <script>
 let mesh = { nodes: [], found: [], training: {}, models: [] };
+let crew = { workers: [], counts: {} };
 function text(id, value) { const node = document.getElementById(id); if (node) node.textContent = value; }
 function gb(mib) { return mib ? (mib / 1024).toFixed(mib >= 10240 ? 0 : 1) : "0"; }
 function lines(id, rows, empty) {
@@ -198,6 +210,12 @@ function cluster() {
     list.push({ name: item.status.name || item.url, status: item.status, url: item.url });
   }
   return list;
+}
+function duty(item, index) {
+  const status = (item && item.status) || {};
+  if (index === 0) return status.chat_server ? "runs the model" : "this PC";
+  if (status.rpc_listening) return "memory waiting";
+  return "joined only";
 }
 function memoryLine(status) {
   const ram = (status && status.ram) || {};
@@ -253,7 +271,7 @@ function drawRoster(list) {
     name.textContent = item.name;
     const sub = document.createElement("span");
     const gpu = ((item.status && item.status.gpus) || [])[0] || {};
-    sub.textContent = memoryLine(item.status) + (gpu.name ? " · " + gpu.name : "");
+    sub.textContent = duty(item, index) + " · " + memoryLine(item.status);
     button.append(dot, name, sub);
     button.onclick = () => { picked = index; paint(); };
     box.append(button);
@@ -331,7 +349,7 @@ function drawMap(list) {
     title.textContent = item.name;
     const meta = document.createElement("span");
     const gpu = ((item.status && item.status.gpus) || [])[0] || {};
-    meta.textContent = gpu.name || (item.status && item.status.os) || "live";
+    meta.textContent = duty(item, index);
     node.append(title, meta);
     node.style.width = points[index].rig + "px";
     const art = node.querySelector("svg");
@@ -348,7 +366,7 @@ function drawMap(list) {
 function paint() {
   const list = cluster();
   if (picked >= list.length) picked = 0;
-  const key = list.map((item) => (item.url || item.name) + ":" + kindOf(item.status)).join("|");
+  const key = list.map((item, index) => (item.url || item.name) + ":" + kindOf(item.status) + ":" + duty(item, index)).join("|");
   if (key !== mapKey) {
     mapKey = key;
     drawMap(list);
@@ -366,6 +384,15 @@ function paint() {
     return item.name + " offers " + free + "." + waiting;
   });
   text("pool", "The loaded model stays on this PC. " + (offered.join(" ") || "No other computer is connected."));
+  const home = list[0] && list[0].status;
+  text("g-model", home && home.chat_server ? "Model on this PC" : "Model is off");
+  text("g-model-sub", home && home.chat_server ? "Chat is using this computer." : "Nothing is serving chat.");
+  text("g-count", list.length + (list.length === 1 ? " computer" : " computers"));
+  text("g-count-sub", list.length < 2 ? "The next one shows up on its own." : list.slice(1).map((item) => item.name).join(", "));
+  const workers = crew.workers || [];
+  const busy = workers.filter((item) => item.state === "generating").length;
+  text("g-agents", workers.length + (workers.length === 1 ? " agent" : " agents"));
+  text("g-agents-sub", busy ? busy + " answering now" : "Idle on this PC");
   const gpu = (((current && current.status && current.status.gpus) || [])[0]) || {};
   const temp = gpu.temperature_c ?? (current && current.status.temperature_c);
   const ram = (current && current.status && current.status.ram) || {};
@@ -374,7 +401,10 @@ function paint() {
   text("pick-temp", (temp == null || temp === "" ? "–" : temp) + "°");
   text("pick-meta", current ? memoryLine(current.status) + " · " + (gpu.name || current.url) : "–");
   const bar = document.getElementById("pick-bar");
-  if (bar) bar.style.width = total ? Math.round(100 * used / total) + "%" : "0";
+  if (bar) {
+    bar.style.width = total ? Math.round(100 * used / total) + "%" : "0";
+    bar.parentElement.classList.toggle("hot", Boolean(total && used / total >= 0.9));
+  }
   lines("pick-hogs", current && current.status.heavy, "No program list from this computer yet.");
   lines("model-list", (mesh.models || []).map((item) => ({ name: item.name + (item.loaded ? " · loaded" : " · on disk"), mb: item.mb })), "No GGUF files found.");
   const training = mesh.training || {};
@@ -445,7 +475,11 @@ document.getElementById("say").onsubmit = async (event) => {
   }
   document.getElementById("send").disabled = false;
 };
-async function refresh() { mesh = await (await fetch("/api/mesh")).json(); paint(); }
+async function refresh() {
+  mesh = await (await fetch("/api/mesh")).json();
+  try { crew = await (await fetch("/api/agents")).json(); } catch (error) { crew = { workers: [] }; }
+  paint();
+}
 refresh();
 setInterval(refresh, 4000);
 </script>
