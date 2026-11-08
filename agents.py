@@ -299,7 +299,8 @@ def apply_actions(answer: str) -> list[str]:
                 logs.append("mkdir " + raw)
             else:
                 logs.append("blocked path")
-        elif line.startswith("WRITE "):
+            return logs
+        if line.startswith("WRITE "):
             raw = tool_path(line[6:])
             index += 1
             body = []
@@ -310,6 +311,7 @@ def apply_actions(answer: str) -> list[str]:
                 logs.append("blocked path")
             else:
                 logs.append(safe_write(raw, "\n".join(body)))
+            return logs
         index += 1
     return logs
 
@@ -907,6 +909,14 @@ def drill_round(index: int) -> dict:
     numbered = first_tool("1. LIST workspace")
     native = native_tool("<tool_call><function=grep><parameter=query>def drill_round</parameter></function></tool_call>")
     searched = tool_grep("def drill_round")
+    acted = apply_actions(
+        "WRITE workspace/agent-check/drill-one.txt\nonly-one\nENDWRITE\nWRITE workspace/agent-check/drill-two.txt\nnope\nENDWRITE"
+    )
+    second = safe_read("workspace/agent-check/drill-two.txt")
+    escape = safe_write("../outside.txt", "nope")
+    made = apply_actions("MKDIR workspace/agent-check/drill-dir")
+    ran = tool_run("echo drill-ok")
+    blocked_run = tool_run("rm -rf /")
     ok = (
         wrote.startswith("wrote ")
         and f"round {index}" in read
@@ -915,6 +925,12 @@ def drill_round(index: int) -> dict:
         and numbered == "LIST workspace"
         and native == "GREP def drill_round"
         and "agents.py" in searched
+        and acted == ["wrote workspace/agent-check/drill-one.txt"]
+        and second == "missing"
+        and escape.startswith("blocked")
+        and made == ["mkdir workspace/agent-check/drill-dir"]
+        and "drill-ok" in ran
+        and blocked_run == "blocked"
     )
     row = {"t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), "round": index, "ok": ok}
     log_path = LOG_DIR / "drill.jsonl"
