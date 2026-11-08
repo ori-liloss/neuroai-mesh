@@ -366,24 +366,26 @@ def apply_actions(answer: str) -> list[str]:
 
 def wants_files(prompt: str) -> bool:
     text = prompt.lower()
+    if any(phrase in text for phrase in ("do not create", "don't create", "do not write", "no files")):
+        return False
     return any(word in text for word in ("create", "folder", "game", "snake", "write", "file", "תיקי"))
 
 
 def run_agent(prompt: str) -> str:
     if wants_files(prompt):
-        order = (
-            "Create the files with WRITE and ENDWRITE. "
-            "For a snake game use WRITE workspace/snake/index.html and a complete single html file."
-        )
+        snake = "snake" in prompt.lower()
+        order = "Create the files with WRITE and ENDWRITE."
+        if snake:
+            order += " For a snake game use WRITE workspace/snake/index.html and a complete single html file."
         answer = ask_model(order + "\n\nTask:\n" + prompt, max_tokens=1400)
         logs = apply_actions(answer)
-        if not any(item.startswith("wrote ") for item in logs):
+        if snake and not any(item.startswith("wrote ") for item in logs):
             answer = ask_model(
                 "Output only WRITE workspace/snake/index.html, then the html, then ENDWRITE.",
                 max_tokens=1400,
             )
             logs = apply_actions(answer)
-        if not any(item.startswith("wrote ") for item in logs) and "snake" in prompt.lower():
+        if snake and not any(item.startswith("wrote ") for item in logs):
             logs.append(safe_write("workspace/snake/index.html", SNAKE_HTML))
             logs.append("The model did not emit a file. The worker wrote the game.")
         return "\n".join(logs) or answer[:500]
