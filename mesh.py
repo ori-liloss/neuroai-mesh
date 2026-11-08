@@ -49,6 +49,8 @@ def token_id() -> str:
 
 _found_lock = threading.Lock()
 _found: list[dict] = []
+_heavy_cache = {"at": 0.0, "rows": []}
+_node_cache = {"at": 0.0, "rows": []}
 
 
 def authorized(header: str | None) -> bool:
@@ -279,6 +281,9 @@ def rpc_binary() -> str | None:
 
 
 def heavy_processes() -> list[dict]:
+    now = time.time()
+    if now - _heavy_cache["at"] < 4:
+        return list(_heavy_cache["rows"])
     rows: list[dict] = []
     try:
         if os.name == "nt":
@@ -338,7 +343,10 @@ def heavy_processes() -> list[dict]:
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
     rows.sort(key=lambda item: item["mb"], reverse=True)
-    return rows[:40]
+    kept = rows[:40]
+    _heavy_cache["at"] = time.time()
+    _heavy_cache["rows"] = kept
+    return list(kept)
 
 
 def keep_pids() -> set[int]:
@@ -828,9 +836,11 @@ def save_model(raw_path: str) -> dict:
 
 def mesh_snapshot() -> dict:
     local = local_status()
-    nodes = [{"url": "local", "ok": True, "status": local}]
-    for item in read_nodes():
-        nodes.append(pull_worker(item["url"]))
+    now = time.time()
+    if now - _node_cache["at"] >= 8:
+        _node_cache["rows"] = [pull_worker(item["url"]) for item in read_nodes()]
+        _node_cache["at"] = now
+    nodes = [{"url": "local", "ok": True, "status": local}, *list(_node_cache["rows"])]
     with _found_lock:
         found = list(_found)
     with _arrival_lock:
@@ -1053,6 +1063,7 @@ def stop_owned_process(pid: int, expected: str = "") -> dict:
             stopped = False
     if not stopped:
         return {"stopped": False, "note": "Could not stop " + name + "."}
+    _heavy_cache["at"] = 0.0
     return {"stopped": True, "name": name, "pid": pid, "note": "Stopped " + name + ". That memory is being released."}
 
 
@@ -1086,6 +1097,7 @@ def stop_at(url: str, pid: int, name: str = "") -> dict:
         return {"stopped": False, "note": "That address is not a joined computer."}
     if not peer_known(clean):
         return {"stopped": False, "note": "That computer is not connected."}
+    _node_cache["at"] = 0.0
     request = urllib.request.Request(
         clean + "/process/stop",
         data=json.dumps({"pid": pid, "name": name}).encode("utf-8"),
