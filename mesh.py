@@ -42,8 +42,16 @@ WORKER_PORT = 8781
 
 
 def token() -> str:
-    if not TOKEN_PATH.exists():
-        TOKEN_PATH.write_text(os.urandom(24).hex(), encoding="utf-8")
+    try:
+        TOKEN_PATH.stat()
+    except FileNotFoundError:
+        try:
+            with TOKEN_PATH.open("x", encoding="utf-8") as handle:
+                handle.write(os.urandom(24).hex())
+        except FileExistsError:
+            pass
+    except OSError as exc:
+        raise RuntimeError("The cluster token cannot be read.") from exc
     return TOKEN_PATH.read_text(encoding="utf-8").strip()
 
 
@@ -365,12 +373,26 @@ def keep_pids() -> set[int]:
     return pids
 
 
+def lock_held(lock: Path) -> bool:
+    try:
+        lock.stat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def dataset_index() -> list[dict]:
     root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data")) / "training"
+    if lock_held(root.parent.parent / "train_local" / "gpu.lock"):
+        return [{"name": "held while training runs", "mb": 0}]
     rows = []
-    if not root.is_dir():
+    try:
+        paths = root.rglob("*.jsonl")
+    except OSError:
         return rows
-    for path in sorted(root.rglob("*.jsonl")):
+    for path in paths:
         try:
             size = path.stat().st_size
         except OSError:
@@ -386,17 +408,26 @@ _training_cache: dict = {"at": 0.0, "view": None}
 
 def live_training(data_root: Path) -> dict:
     lock = data_root.parent / "train_local" / "gpu.lock"
-    running = lock.is_file()
+    running = lock_held(lock)
     step = None
     max_steps = None
     loss = None
     log_dir = data_root / "training" / "logs"
     newest = None
-    if log_dir.is_dir():
-        logs = list(log_dir.glob("neuro-ai-long-v1-*.log"))
-        if logs:
-            newest = max(logs, key=lambda path: path.stat().st_mtime)
-    if newest is not None and time.time() - newest.stat().st_mtime < 180:
+    try:
+        if log_dir.is_dir():
+            logs = list(log_dir.glob("neuro-ai-long-v1-*.log"))
+            if logs:
+                newest = max(logs, key=lambda path: path.stat().st_mtime)
+    except OSError:
+        newest = None
+    fresh = False
+    if newest is not None:
+        try:
+            fresh = time.time() - newest.stat().st_mtime < 180
+        except OSError:
+            fresh = False
+    if fresh:
         running = True
         try:
             size = newest.stat().st_size
@@ -666,7 +697,7 @@ def ipv4_prefixes() -> tuple[list[str], set[str]]:
 
 def probe_host(ip: str) -> dict | None:
     sock = socket.socket()
-    sock.settimeout(0.25)
+    sock.settimeout(0.6)
     try:
         sock.connect((ip, WORKER_PORT))
     except OSError:
@@ -687,27 +718,40 @@ def remember_peer(item: dict) -> None:
     if not any(node["url"] == url for node in nodes):
         nodes.append({"url": url})
         write_nodes(nodes)
-    bay = {"darwin": "mac", "linux": "linux"}.get(str(status.get("os") or ""))
+    system = str(status.get("os") or "").lower()
+    bay = {"darwin": "mac", "linux": "linux", "windows": "windows"}.get(system)
     if not bay:
         return
-    current = next((spec for spec in read_specs() if spec.get("os") == bay), None)
-    if current and current.get("url"):
+    name = clip(status.get("name") or "", 40)
+    if not name:
+        return
+    if any(spec.get("url") == url or spec.get("name") == name for spec in read_specs()):
         return
     total = int((status.get("ram") or {}).get("total_mib") or 0)
-    save_spec(
-        {
-            "os": bay,
-            "name": status.get("name") or bay,
-            "url": url,
-            "ram_gb": str(max(1, round(total / 1024))) if total else "",
-            "cpu": status.get("machine") or "",
-            "gpu": "",
-        }
-    )
+    kind = {"windows": "laptop", "mac": "mini", "linux": "penguin"}[bay]
+    if bay == "mac" and "mini" not in name.lower():
+        kind = "desktop"
+    try:
+        save_spec(
+            {
+                "os": bay,
+                "kind": kind,
+                "name": name,
+                "url": url,
+                "ram_gb": str(max(1, round(total / 1024))) if total else "",
+                "cpu": status.get("machine") or "",
+                "gpu": "",
+            }
+        )
+    except ValueError:
+        return
 
 
 def scan_lan() -> list[dict]:
     prefixes, own = ipv4_prefixes()
+    lan = lan_host()
+    if lan.count(".") == 3:
+        prefixes = [lan.rsplit(".", 1)[0]]
     hosts = [
         f"{prefix}.{n}"
         for prefix in prefixes
@@ -716,21 +760,8 @@ def scan_lan() -> list[dict]:
     ]
     if not hosts:
         return []
-    with ThreadPoolExecutor(max_workers=48) as pool:
-        found = [item for item in pool.map(probe_host, hosts) if item and item.get("ok")]
-    kept: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for item in found:
-        status = item.get("status") or {}
-        if status.get("os") and not item.get("limited"):
-            key = (str(status.get("name") or ""), str(status.get("os")))
-        else:
-            key = ("url", str(item.get("url") or ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        kept.append(item)
-    return kept
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        return [item for item in pool.map(probe_host, hosts) if item and item.get("ok")]
 
 
 _seen_peers: set[str] = set()
@@ -755,14 +786,77 @@ def note_arrival(item: dict) -> None:
         del _arrivals[:-8]
 
 
+_hold: dict[str, dict] = {}
+_sweep_at = 0.0
+
+
+def peer_identity(item: dict) -> tuple[str, str]:
+    status = item.get("status") or {}
+    if status.get("os") and not item.get("limited"):
+        return (str(status.get("name") or ""), str(status.get("os")))
+    return ("url", str(item.get("url") or ""))
+
+
+def settle_peers(items: list[dict], prefer: set[str]) -> list[dict]:
+    ranked: dict[tuple[str, str], dict] = {}
+    for item in items:
+        key = peer_identity(item)
+        current = ranked.get(key)
+        if current is None:
+            ranked[key] = item
+            continue
+        url = str(item.get("url") or "")
+        current_url = str(current.get("url") or "")
+        if url in prefer and current_url not in prefer:
+            ranked[key] = item
+    return list(ranked.values())
+
+
+def known_worker_urls() -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for node in read_nodes():
+        url = str(node.get("url") or "")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    with _found_lock:
+        for item in _found:
+            url = str(item.get("url") or "")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
 def discovery_loop() -> None:
-    global _found
+    global _found, _sweep_at
     while True:
         try:
-            found = scan_lan()
-            fresh: list[dict] = []
             with _found_lock:
                 previous = {str(item.get("url") or "") for item in _found}
+            alive: list[dict] = []
+            for url in known_worker_urls():
+                item = pull_worker(url)
+                if item.get("ok"):
+                    alive.append(item)
+            now = time.time()
+            if now - _sweep_at >= 45:
+                _sweep_at = now
+                alive.extend(scan_lan())
+            fresh_urls = {str(item.get("url") or "") for item in alive}
+            for url, held in list(_hold.items()):
+                if url in fresh_urls:
+                    continue
+                held["misses"] = int(held.get("misses") or 0) + 1
+                if held["misses"] > 3:
+                    _hold.pop(url, None)
+            for item in alive:
+                url = str(item.get("url") or "")
+                if url:
+                    _hold[url] = {"item": item, "misses": 0}
+            found = settle_peers([held["item"] for held in _hold.values()], previous)
+            fresh: list[dict] = []
             for item in found:
                 remember_peer(item)
                 if str(item.get("url") or "") not in previous:
@@ -773,7 +867,7 @@ def discovery_loop() -> None:
                 threading.Thread(target=note_arrival, args=(item,), name="neuro-arrival", daemon=True).start()
         except Exception as exc:
             print(f"discovery failed: {exc}", flush=True)
-        time.sleep(12)
+        time.sleep(10)
 
 
 def start_discovery() -> None:
@@ -998,10 +1092,13 @@ def ask_local(message: str) -> dict:
     )
     with urllib.request.urlopen(request, timeout=180) as response:
         body = json.loads(response.read().decode("utf-8"))
-    choice = body["choices"][0]["message"]
+    choices = body.get("choices") if isinstance(body, dict) else None
+    message_body = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+    if not isinstance(message_body, dict):
+        return {"reply": "", "reasoning": "", "tokens": {}, "error": "Neuro did not answer."}
     return {
-        "reply": choice.get("content") or "",
-        "reasoning": choice.get("reasoning_content") or "",
+        "reply": message_body.get("content") or "",
+        "reasoning": message_body.get("reasoning_content") or "",
         "tokens": body.get("usage") or {},
     }
 
@@ -1190,11 +1287,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def read_json(self, limit: int = 10000) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except (TypeError, ValueError):
+            return {}
         if length <= 0 or length > limit:
             return {}
-        body = self.rfile.read(length)
-        data = json.loads(body.decode("utf-8"))
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return {}
         return data if isinstance(data, dict) else {}
 
     def do_GET(self) -> None:
@@ -1231,7 +1333,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, snapshot())
             return
         if path == "/api/token":
-            self.send_json(200, {"token": token()})
+            self.send_json(404, {"error": "not found"})
             return
         if path.startswith("/platforms/"):
             name = Path(path).name

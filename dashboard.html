@@ -210,6 +210,7 @@ function text(id, value) { const node = document.getElementById(id); if (node) n
 function gb(mib) { return mib ? (mib / 1024).toFixed(mib >= 10240 ? 0 : 1) : "0"; }
 function hogs(rows, url) {
   const box = document.getElementById("pick-hogs");
+  if (!box) return;
   box.replaceChildren();
   if (!rows || !rows.length) {
     const note = document.createElement("p");
@@ -258,6 +259,7 @@ async function stopProcess(pid, name, url) {
 }
 function lines(id, rows, empty) {
   const box = document.getElementById(id);
+  if (!box) return;
   box.replaceChildren();
   if (!rows || !rows.length) {
     const note = document.createElement("p");
@@ -282,11 +284,18 @@ let mapKey = "";
 function cluster() {
   const local = (mesh.nodes[0] && mesh.nodes[0].status) || {};
   const list = [{ name: local.name || "This PC", status: local, url: "local" }];
-  for (const item of mesh.found || []) {
-    if (!item.ok || !item.status) continue;
+  const seen = new Set();
+  const rows = [].concat(mesh.found || [], (mesh.nodes || []).slice(1));
+  for (const item of rows) {
+    if (!item || !item.ok || !item.status || item.url === "local") continue;
     const status = item.status;
-    if (String(status.os || "").toLowerCase() === "windows") status.kind = "laptop";
-    list.push({ name: status.name || item.url, status, url: item.url });
+    const os = String(status.os || "").toLowerCase();
+    if (os === "windows") status.kind = "laptop";
+    const name = status.name || item.url;
+    const key = String(name) + "|" + os;
+    if (!name || seen.has(key)) continue;
+    seen.add(key);
+    list.push({ name, status, url: item.url });
   }
   return list;
 }
@@ -624,26 +633,41 @@ function show(view) {
 }
 document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => show(button.dataset.view); });
 document.getElementById("stop-agents").onclick = async () => {
-  const response = await fetch("/api/agents/stop", { method: "POST" });
-  const body = await response.json();
-  document.getElementById("share-note").textContent = "Stopped " + ((body.stopped || []).length) + " code workers.";
+  const note = document.getElementById("share-note");
+  try {
+    const response = await fetch("/api/agents/stop", { method: "POST" });
+    const body = await response.json();
+    if (note) note.textContent = "Stopped " + ((body.stopped || []).length) + " code workers.";
+  } catch (error) {
+    if (note) note.textContent = "Could not stop the code workers.";
+  }
 };
 document.getElementById("stop-model").onclick = async () => {
-  const response = await fetch("/api/model/stop", { method: "POST" });
-  const body = await response.json();
-  document.getElementById("share-note").textContent = body.note || "Could not stop the model.";
+  const note = document.getElementById("share-note");
+  try {
+    const response = await fetch("/api/model/stop", { method: "POST" });
+    const body = await response.json();
+    if (note) note.textContent = body.note || "Could not stop the model.";
+  } catch (error) {
+    if (note) note.textContent = "Could not stop the model.";
+  }
   refresh();
 };
 document.getElementById("check-helpers").onclick = async () => {
-  document.getElementById("share-note").textContent = "Checking the joined computers. Training stays on this PC.";
-  const response = await fetch("/api/helpers/check", { method: "POST" });
-  const body = await response.json();
-  const rows = body.checked || [];
-  if (!rows.length) {
-    document.getElementById("share-note").textContent = "No other computer is running the worker yet. It appears after the command starts.";
-    return;
+  const note = document.getElementById("share-note");
+  if (note) note.textContent = "Checking the joined computers. Training stays on this PC.";
+  try {
+    const response = await fetch("/api/helpers/check", { method: "POST" });
+    const body = await response.json();
+    const rows = body.checked || [];
+    if (!rows.length) {
+      if (note) note.textContent = "No other computer is running the worker yet. It appears after the command starts.";
+      return;
+    }
+    if (note) note.textContent = rows.map((item) => (item.host || item.url) + ": " + (item.ok ? item.passed + " of " + item.rounds : (item.error || "failed"))).join(" · ");
+  } catch (error) {
+    if (note) note.textContent = "The joined computers did not answer.";
   }
-  document.getElementById("share-note").textContent = rows.map((item) => (item.host || item.url) + ": " + (item.ok ? item.passed + " of " + item.rounds : (item.error || "failed"))).join(" · ");
 };
 document.getElementById("share-run").onclick = async () => {
   const response = await fetch("/api/share/offer", { method: "POST" });
