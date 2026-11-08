@@ -221,8 +221,11 @@ def ask_model(prompt: str, max_tokens: int = 220) -> str:
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        body = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError("The model is training on this PC, so this task has to wait.") from exc
     return (body["choices"][0]["message"].get("content") or "").strip()
 
 
@@ -509,7 +512,7 @@ def worker_main() -> None:
             result = run_agent(str(job["prompt"]))
             finish(int(job["id"]), pid, result=result)
             print(f"agent {pid} done job {job['id']}", flush=True)
-        except (OSError, urllib.error.URLError, KeyError, json.JSONDecodeError, TimeoutError) as exc:
+        except (OSError, urllib.error.URLError, RuntimeError, KeyError, json.JSONDecodeError, TimeoutError) as exc:
             finish(int(job["id"]), pid, error=str(exc))
             print(f"agent {pid} error job {job['id']}: {exc}", flush=True)
     with connect() as db:

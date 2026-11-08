@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -357,6 +358,47 @@ def dataset_index() -> list[dict]:
 _training_cache: dict = {"at": 0.0, "view": None}
 
 
+def live_training(data_root: Path) -> dict:
+    lock = data_root.parent / "train_local" / "gpu.lock"
+    running = lock.is_file()
+    step = None
+    max_steps = None
+    loss = None
+    log_dir = data_root / "training" / "logs"
+    newest = None
+    if log_dir.is_dir():
+        logs = list(log_dir.glob("neuro-ai-long-v1-*.log"))
+        if logs:
+            newest = max(logs, key=lambda path: path.stat().st_mtime)
+    if newest is not None and time.time() - newest.stat().st_mtime < 180:
+        running = True
+        try:
+            size = newest.stat().st_size
+            start = max(0, size - 24000)
+            if start % 2:
+                start -= 1
+            with newest.open("rb") as handle:
+                handle.seek(start)
+                raw = handle.read()
+            if b"\x00" in raw[:80]:
+                tail = raw.decode("utf-16-le", errors="replace")
+            else:
+                tail = raw.decode("utf-8", errors="replace")
+        except OSError:
+            tail = ""
+        marks = re.findall(r"(\d+)/(\d+)", tail)
+        if marks:
+            step = int(marks[-1][0])
+            max_steps = int(marks[-1][1])
+        losses = re.findall(r"'loss': '([0-9.]+)'", tail)
+        if losses:
+            try:
+                loss = round(float(losses[-1]), 4)
+            except ValueError:
+                loss = None
+    return {"running": running, "step": step, "max_steps": max_steps, "loss": loss}
+
+
 def training_view() -> dict:
     now = time.time()
     cached = _training_cache.get("view")
@@ -392,8 +434,19 @@ def training_view() -> dict:
                         break
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             step = 0
+    live = live_training(data_root)
+    if live["step"]:
+        step = live["step"]
+    if live["max_steps"]:
+        max_steps = live["max_steps"]
+    if live["loss"] is not None:
+        loss = live["loss"]
+    if live["running"]:
+        reason = "Resumed on this NVIDIA PC from the saved checkpoint. The run continues on this computer. One training run is not split across computers. The dataset files are unchanged."
+    else:
+        reason = "Training stays on this NVIDIA PC. A joined computer can hold part of the served model only after chat is stopped and that computer is listening on its own LAN address. One training run is not split across the machines. The dataset files are unchanged."
     view = {
-        "running": False,
+        "running": bool(live["running"]),
         "run": "neuro-ai-long-v1",
         "step": step,
         "max_steps": max_steps,
@@ -401,7 +454,7 @@ def training_view() -> dict:
         "history": list(reversed(history)),
         "served": served,
         "active_adapter": active,
-        "reason": "Training stays on this NVIDIA PC. A joined computer can hold part of the served model only after chat is stopped and that computer is listening on its own LAN address. One training run is not split across the machines. The dataset files are unchanged.",
+        "reason": reason,
         "datasets": dataset_index(),
     }
     _training_cache["at"] = now
@@ -1120,7 +1173,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(
                     409,
                     {
-                        "error": "Training did not start because the loaded model is using the GPU. No dataset file was changed. " + str(len(view.get("datasets") or [])) + " dataset files are listed on this page.",
+                        "error": "Training is already running from the saved checkpoint. No dataset file was changed." if view.get("running") else "Training did not start because the loaded model is using the GPU. No dataset file was changed. " + str(len(view.get("datasets") or [])) + " dataset files are listed on this page.",
                         "datasets": view.get("datasets") or [],
                     },
                 )
