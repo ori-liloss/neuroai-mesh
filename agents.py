@@ -207,7 +207,7 @@ def ask_model(prompt: str, max_tokens: int = 220) -> str:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are Neuro. Do the task the user asked. When a tool is needed, put that tool on the first line.",
+                    "content": "You are Neuro. Do the task. One tool call, then stop. Do not explain the tool.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -253,22 +253,6 @@ def workspace_note() -> str:
             continue
         names.append(path.name + ("/" if path.is_dir() else ""))
     return "Repo files: " + ", ".join(names[:24])
-
-
-def files_named_in(prompt: str) -> list[str]:
-    found = []
-    for path in ROOT.rglob("*"):
-        if not path.is_file() or path.name in {"cluster.token", ".env", ".env.local", "token.txt"}:
-            continue
-        if "agent-logs" in path.parts or "__pycache__" in path.parts:
-            continue
-        relative = path.relative_to(ROOT).as_posix()
-        if relative in prompt or path.name in prompt:
-            found.append(relative)
-        if len(found) >= 2:
-            break
-    return found
-
 
 
 def safe_write(relative: str, content: str) -> str:
@@ -330,7 +314,7 @@ def visible_answer(answer: str) -> str:
 
 
 TOOL_HELP = (
-    "You are Neuro Code in this repo. The first line is one tool, then wait for the result.\n"
+    "You are Neuro Code in this repo. Emit one tool and stop. No sentence before it or after it.\n"
     "LIST relative/dir\n"
     "GREP text\n"
     "READ relative/path\n"
@@ -525,8 +509,10 @@ def first_tool(answer: str) -> str:
 def run_agent(prompt: str) -> str:
     logs: list[str] = []
     last = ""
-    for _ in range(4):
-        context = TOOL_HELP + "\n\nTask:\n" + prompt + "\n\n" + workspace_note()
+    for turn in range(4):
+        context = TOOL_HELP + "\n\nTask:\n" + prompt
+        if turn == 0:
+            context += "\n\n" + workspace_note()
         if last:
             context += "\n\n" + tool_response(last)
         answer = visible_answer(ask_model(context, max_tokens=1000))
