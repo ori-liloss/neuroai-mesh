@@ -24,6 +24,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+_agent_home = Path(__file__).resolve().parent.parent / "neuro-agents"
+if (_agent_home / "agents.py").is_file():
+    sys.path.insert(0, str(_agent_home))
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
