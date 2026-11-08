@@ -58,7 +58,7 @@ if [ -n "$rpc" ] && [ -n "$lan_ip" ]; then
   if "$PY" -c "import socket,sys; s=socket.socket(); s.settimeout(0.4); r=s.connect_ex(('$lan_ip', 50052)); s.close(); sys.exit(0 if r==0 else 1)"; then
     echo "Mac memory is already waiting on ${lan_ip}:50052."
   else
-    "$rpc" --host "$lan_ip" --port 50052 >/tmp/neuroai-rpc.log 2>&1 &
+    nohup "$rpc" --host "$lan_ip" --port 50052 >/tmp/neuroai-rpc.log 2>&1 </dev/null &
     echo "Mac memory is waiting on ${lan_ip}:50052."
     echo "The model already loaded on Windows stays there. This Mac joins the next start."
   fi

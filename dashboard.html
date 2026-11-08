@@ -238,13 +238,22 @@ function hogs(rows, url) {
   }
 }
 async function stopProcess(pid, name, url) {
-  const response = await fetch("/api/process/stop", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pid, name, url: url === "local" ? "" : url }),
-  });
-  const body = await response.json();
-  document.getElementById("stop-note").textContent = body.note || body.error || "Could not stop that process.";
+  let text = "That computer did not answer.";
+  try {
+    const response = await fetch("/api/process/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pid, name, url: url === "local" ? "" : url }),
+    });
+    const body = await response.json();
+    text = body.note || body.error || "Could not stop that process.";
+  } catch (error) {
+    text = "That computer did not answer.";
+  }
+  const local = document.getElementById("stop-note");
+  const share = document.getElementById("share-note");
+  if (local) local.textContent = text;
+  if (share) share.textContent = text;
   refresh();
 }
 function lines(id, rows, empty) {
