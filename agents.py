@@ -721,7 +721,7 @@ BRAIN = (
 )
 
 
-def code_screen(snap: dict, typed: str, note: str) -> str:
+def code_screen(snap: dict, typed: str, note: str, beat: int = 0) -> str:
     pink = "\x1b[38;2;255;92;146m"
     soft = "\x1b[38;2;255;176;198m"
     reset = "\x1b[0m"
@@ -737,7 +737,7 @@ def code_screen(snap: dict, typed: str, note: str) -> str:
             body = color + body + reset
         return pink + "│" + reset + body + pink + "│" + reset
 
-    brain = BRAIN[int(time.time() * 3) % len(BRAIN)]
+    brain = BRAIN[beat % len(BRAIN)]
     saved = recent_sessions(4)
     left = ["", *brain, "", "NeuroAI Code"]
     right = ["saved on this PC"] + (saved or ["nothing saved yet"])
@@ -773,10 +773,12 @@ def code_screen(snap: dict, typed: str, note: str) -> str:
             lines.append(row("  " + text[: inner - 4], soft))
             text = text[inner - 4 :]
     lines.append(pink + "├" + "─" * inner + "┤" + reset)
-    lines.append(row("  > " + typed, soft))
+    prompt_row = len(lines) + 1
+    lines.append(row("  > " + typed + "▌", soft))
     lines.append(row("  exit closes this window. tasks stay in the local session."))
     lines.append(pink + "└" + "─" * inner + "┘" + reset)
-    return "\x1b[H\x1b[J" + "\n".join(lines) + "\n"
+    body = "\n".join(lines)
+    return "\x1b[H\x1b[J" + body + "\n", prompt_row, lines[prompt_row - 1]
 
 
 def code_main(initial: str = "") -> None:
@@ -788,20 +790,74 @@ def code_main(initial: str = "") -> None:
         import msvcrt
     else:
         msvcrt = None
+    snap = snapshot()
+    beat = 0
     painted = ""
+    prompt_at = 1
+    prompt_line = ""
+    next_snap = 0.0
+    next_beat = time.time() + 0.8
+
+    def show(full: bool) -> None:
+        nonlocal painted, prompt_at, prompt_line
+        frame, prompt_at, prompt_line = code_screen(snap, typed, note, beat)
+        if not full:
+            sys.stdout.write(f"\x1b[{prompt_at};1H" + prompt_line)
+            sys.stdout.flush()
+            return
+        if frame != painted:
+            sys.stdout.write(frame)
+            sys.stdout.flush()
+            painted = frame
+
     try:
+        show(True)
         while True:
-            snap = snapshot()
-            if pending:
-                row = job_row(pending)
-                if row and row["status"] in {"done", "error"}:
-                    note = str(row["result"] or row["error"] or "")[:360]
-                    pending = None
-            frame = code_screen(snap, typed, note)
-            if frame != painted:
-                sys.stdout.write(frame)
-                sys.stdout.flush()
-                painted = frame
+            if msvcrt is not None:
+                typed_changed = False
+                while msvcrt.kbhit():
+                    char = msvcrt.getwch()
+                    if char in {"\x00", "\xe0"}:
+                        if msvcrt.kbhit():
+                            msvcrt.getwch()
+                        continue
+                    if char in {"\x03"}:
+                        return
+                    if char in {"\r", "\n"}:
+                        text = typed.strip()
+                        typed = ""
+                        typed_changed = True
+                        if text in {"exit", "quit"}:
+                            return
+                        if text:
+                            pending = enqueue(text[:70], text)
+                            note = ""
+                            next_snap = 0.0
+                        break
+                    if char in {"\x08", "\x7f"}:
+                        typed = typed[:-1]
+                        typed_changed = True
+                        continue
+                    if char >= " ":
+                        typed += char
+                        typed_changed = True
+                if typed_changed:
+                    show(not typed and not note)
+                    continue
+            now = time.time()
+            if now >= next_snap:
+                snap = snapshot()
+                if pending:
+                    row = job_row(pending)
+                    if row and row["status"] in {"done", "error"}:
+                        note = str(row["result"] or row["error"] or "")[:360]
+                        pending = None
+                next_snap = now + 0.45
+                show(True)
+            elif not typed and now >= next_beat:
+                beat = (beat + 1) % len(BRAIN)
+                next_beat = now + 0.8
+                show(True)
             if msvcrt is None:
                 text = input("> ").strip()
                 if text in {"exit", "quit"}:
@@ -810,34 +866,12 @@ def code_main(initial: str = "") -> None:
                     pending = enqueue(text[:70], text)
                     note = ""
                 continue
-            time.sleep(0.25)
-            if not msvcrt.kbhit():
-                continue
-            char = msvcrt.getwch()
-            if char in {"\x00", "\xe0"}:
-                if msvcrt.kbhit():
-                    msvcrt.getwch()
-                continue
-            if char in {"\x03"}:
-                break
-            if char in {"\r", "\n"}:
-                text = typed.strip()
-                typed = ""
-                if text in {"exit", "quit"}:
-                    break
-                if text:
-                    pending = enqueue(text[:70], text)
-                    note = ""
-                continue
-            if char in {"\x08", "\x7f"}:
-                typed = typed[:-1]
-                continue
-            if char >= " ":
-                typed += char
+            time.sleep(0.02)
     except KeyboardInterrupt:
         pass
-    sys.stdout.write("\x1b[0m\nwindow closed. the workers keep running.\n")
-    sys.stdout.flush()
+    finally:
+        sys.stdout.write("\x1b[0m\nwindow closed. the workers keep running.\n")
+        sys.stdout.flush()
 
 
 def terminal(workers: int = 4) -> None:
