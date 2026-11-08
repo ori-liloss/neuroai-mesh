@@ -692,9 +692,15 @@ document.getElementById("say").onsubmit = async (event) => {
   document.getElementById("send").disabled = false;
 };
 async function refresh() {
-  mesh = await (await fetch("/api/mesh")).json();
-  try { crew = await (await fetch("/api/agents")).json(); } catch (error) { crew = { workers: [] }; }
-  paint();
+  try {
+    const response = await fetch("/api/mesh");
+    if (!response.ok) return;
+    mesh = await response.json();
+    try { crew = await (await fetch("/api/agents")).json(); } catch (error) { crew = { workers: [] }; }
+    paint();
+  } catch (error) {
+    return;
+  }
 }
 refresh();
 setInterval(refresh, 4000);

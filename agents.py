@@ -404,6 +404,8 @@ def tool_grep(needle: str) -> str:
         if not path.is_file() or path.name in secret or any(part in skip for part in path.parts):
             continue
         try:
+            if path.stat().st_size > 300000:
+                continue
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
