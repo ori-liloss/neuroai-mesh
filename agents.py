@@ -226,7 +226,9 @@ def ask_model(prompt: str, max_tokens: int = 220) -> str:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise RuntimeError("The model is training on this PC, so this task has to wait.") from exc
-    return (body["choices"][0]["message"].get("content") or "").strip()
+    message = body["choices"][0]["message"]
+    # Qwen puts reasoning in a side field. The reply is only the content.
+    return (message.get("content") or "").strip()
 
 
 def safe_read(relative: str) -> str:
@@ -340,6 +342,7 @@ TOOL_HELP = (
     "RUN command\n"
     "WRITE under workspace/ is allowed. Do not say you cannot create a file there.\n"
     "Stop when the tool line is done. Do not explain the tool.\n"
+    "A tool result comes back inside <tool_response>. Read it, then one tool or a plain answer.\n"
     "When the task is done, answer in plain text and do not emit a tool."
 )
 
@@ -501,6 +504,11 @@ def native_tool(answer: str) -> str:
     return command + " " + path
 
 
+def tool_response(text: str) -> str:
+    body = (text or "").strip()[:1800]
+    return "<tool_response>\n" + body + "\n</tool_response>"
+
+
 def first_tool(answer: str) -> str:
     for line in answer.splitlines():
         stripped = clean_tool_line(line)
@@ -515,7 +523,7 @@ def run_agent(prompt: str) -> str:
     for _ in range(4):
         context = TOOL_HELP + "\n\nTask:\n" + prompt + "\n\n" + workspace_note()
         if last:
-            context += "\n\nLast result:\n" + last
+            context += "\n\n" + tool_response(last)
         answer = visible_answer(ask_model(context, max_tokens=1000))
         native = native_tool(answer)
         tool = first_tool(answer) or (native.splitlines()[0] if native else "")
@@ -526,7 +534,7 @@ def run_agent(prompt: str) -> str:
         if tool.startswith("WRITE "):
             wrote = apply_actions(native or answer)
             logs.extend(wrote)
-            last = "\n".join(wrote)[:1800]
+            last = "\n".join(wrote)
             continue
         if tool.startswith("LIST "):
             result = tool_list(tool[5:])
@@ -545,7 +553,7 @@ def run_agent(prompt: str) -> str:
         else:
             return answer[:4000]
         logs.append(tool + " -> " + (result.splitlines()[0] if result else "empty")[:140])
-        last = result[:1800]
+        last = result
     return "\n".join(logs)[:4000]
 
 
@@ -931,6 +939,8 @@ def drill_round(index: int) -> dict:
         and made == ["mkdir workspace/agent-check/drill-dir"]
         and "drill-ok" in ran
         and blocked_run == "blocked"
+        and tool_response("only-one").startswith("<tool_response>")
+        and "only-one" in tool_response("only-one")
     )
     row = {"t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), "round": index, "ok": ok}
     log_path = LOG_DIR / "drill.jsonl"
