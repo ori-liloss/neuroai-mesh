@@ -565,6 +565,20 @@ def worker_main() -> None:
             finish(int(job["id"]), pid, result=result)
             print(f"agent {pid} done job {job['id']}", flush=True)
         except (OSError, urllib.error.URLError, RuntimeError, KeyError, json.JSONDecodeError, TimeoutError) as exc:
+            if "training" in str(exc).lower():
+                now = time.time()
+                with connect() as db:
+                    db.execute(
+                        "UPDATE jobs SET status='queued', worker_pid=NULL, updated=? WHERE id=? AND status='running'",
+                        (now, int(job["id"])),
+                    )
+                    db.execute(
+                        "UPDATE workers SET state='waiting', job_id=NULL, heartbeat=? WHERE pid=?",
+                        (now, pid),
+                    )
+                print(f"agent {pid} waits, the model is training", flush=True)
+                time.sleep(30)
+                continue
             finish(int(job["id"]), pid, error=str(exc))
             print(f"agent {pid} error job {job['id']}: {exc}", flush=True)
     with connect() as db:
@@ -903,7 +917,7 @@ def code_main(initial: str = "") -> None:
 def drill_round(index: int) -> dict:
     folder = LOG_DIR / "drill"
     folder.mkdir(parents=True, exist_ok=True)
-    relative = f"agent-logs/drill/round.txt"
+    relative = f"agent-logs/drill/round-{os.getpid()}.txt"
     wrote = safe_write(relative, f"round {index}")
     read = safe_read(relative)
     listed = tool_list("agent-logs/drill")
@@ -922,7 +936,7 @@ def drill_round(index: int) -> dict:
     ok = (
         wrote.startswith("wrote ")
         and f"round {index}" in read
-        and "round.txt" in listed
+        and f"round-{os.getpid()}.txt" in listed
         and secret.startswith("blocked")
         and numbered == "LIST workspace"
         and native == "GREP def drill_round"
