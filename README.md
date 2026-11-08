@@ -60,13 +60,20 @@ The Windows page finds the machine. Nothing to paste.
 
 On that laptop, run:
 
-```powershell
-git clone https://github.com/ori-liloss/neuroai-mesh.git
-cd neuroai-mesh
-start-worker.cmd
+On that laptop, run this. It does not open a PowerShell script:
+
+```bat
+cd C:\Users\oriha\neuroai-mesh
+python -u mesh.py work
 ```
 
-`start-worker.cmd` runs the worker even when Windows blocks PowerShell scripts. The command does not change the laptop's execution policy.
+Leave that window open. If `python` is missing, run `py -3 -u mesh.py work` in the same folder.
+
+In a second window, opened as Administrator:
+
+```bat
+netsh advfirewall firewall add rule name="Neuro worker" dir=in action=allow protocol=TCP localport=8781 profile=private
+```
 
 The laptop stays off the page until this command is running. The page then sees it and checks the agent code on that laptop. The weight update stays on the NVIDIA PC. A second laptop is the same command on that second laptop. There is no empty seat waiting for a computer that is not here.
 
