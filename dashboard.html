@@ -6,241 +6,251 @@
   <title>NeuroAI Mesh</title>
   <style>
     :root {
-      --bg: #070809; --ink: #e8eef2; --muted: #8d9aa4; --line: rgba(232,238,242,.12);
-      --panel: #101418; --cyan: #3ee0c5; --amber: #e2b15a; --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+      --bg: #12161a;
+      --card: #1a2026;
+      --ink: #e7ece8;
+      --muted: #93a099;
+      --line: rgba(231, 236, 232, 0.12);
+      --cyan: #7ddec8;
+      --amber: #e2b15a;
+      --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
     }
     * { box-sizing: border-box; }
-    html, body { margin: 0; background: var(--bg); color: var(--ink); }
-    body { min-height: 100vh; font-family: "Segoe UI", sans-serif; font-size: 15px; }
-    button, textarea { font: inherit; color: inherit; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font-family: "Segoe UI", sans-serif; font-size: 15px; }
+    button, input, textarea { font: inherit; color: inherit; }
     button { cursor: pointer; }
-    button:disabled { opacity: .45; cursor: wait; }
-    .top { display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 16px 22px; border-bottom: 1px solid var(--line); }
-    .brand { letter-spacing: .18em; font-size: 13px; font-weight: 700; }
-    .sub { margin-top: 4px; color: var(--muted); font-size: 12px; }
-    .nav { display: flex; gap: 8px; }
-    .nav button { background: transparent; border: 1px solid var(--line); padding: 8px 12px; }
-    .nav button.on { background: var(--cyan); color: #06211c; border-color: var(--cyan); font-weight: 700; }
-    .view { padding: 22px; }
+    button:disabled { opacity: .5; cursor: wait; }
+    header { display: flex; justify-content: space-between; gap: 16px; align-items: end; padding: 22px 28px 8px; }
+    .brand { font-size: 13px; letter-spacing: .16em; font-weight: 700; }
+    .sub { color: var(--muted); margin-top: 6px; }
+    nav { display: flex; gap: 6px; }
+    nav button { background: transparent; border: 0; color: var(--muted); padding: 8px 10px; }
+    nav button.on { color: var(--ink); border-bottom: 2px solid var(--cyan); }
+    main { padding: 8px 28px 28px; }
     .view[hidden] { display: none; }
-    .rack { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px; }
-    .plate { background: var(--panel); border: 1px solid var(--line); padding: 16px; min-height: 250px; display: flex; flex-direction: column; gap: 8px; }
-    .plate-top, .k { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; color: var(--muted); }
-    .plate-top { display: flex; justify-content: space-between; }
-    h2 { margin: 0; font-size: 22px; font-weight: 650; }
-    .deg { margin: 0; font-family: var(--mono); font-size: 52px; line-height: 1; }
-    .deg span, .role, .plain { color: var(--muted); }
-    .role, .plain { margin: 0; }
-    .bar { height: 4px; background: #242b32; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .card { background: var(--card); border: 1px solid var(--line); padding: 18px; }
+    .k { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; color: var(--muted); }
+    h2 { margin: 8px 0; font-size: 28px; font-weight: 600; letter-spacing: -.03em; }
+    .big { margin: 0; font-family: var(--mono); font-size: 40px; font-weight: 500; }
+    .muted { color: var(--muted); margin: 6px 0 0; }
+    .bar { height: 6px; background: #2a3238; margin-top: 12px; }
     .bar i { display: block; height: 100%; width: 0; background: var(--cyan); }
-    .mem b { font-family: var(--mono); font-size: 12px; font-weight: 500; }
-    .split { display: grid; grid-template-columns: minmax(0,1fr) 320px; gap: 12px; margin-top: 12px; }
-    .panel { background: var(--panel); border: 1px solid var(--line); padding: 16px; }
-    .hog { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); padding-top: 8px; margin-top: 8px; font-family: var(--mono); font-size: 12px; }
-    .go { background: var(--cyan); color: #06211c; border: 0; font-weight: 700; padding: 8px 12px; }
-    .quiet { background: transparent; border: 1px solid var(--line); padding: 8px 12px; }
-    .talk { min-height: 460px; display: grid; grid-template-rows: auto minmax(220px,1fr) auto; background: var(--panel); border: 1px solid var(--line); }
-    #log { overflow: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
-    .bubble { max-width: 92%; padding: 10px 12px; border: 1px solid var(--line); white-space: pre-wrap; line-height: 1.5; }
-    .user { align-self: flex-end; background: #14211e; }
-    .ai { align-self: flex-start; background: #141920; }
-    #say { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
-    textarea { flex: 1; resize: none; height: 72px; background: #090c10; border: 1px solid var(--line); padding: 8px 10px; }
-    .train { display: grid; grid-template-columns: 180px 1fr; gap: 18px; align-items: center; }
-    .step { font-family: var(--mono); font-size: 42px; margin: 0; }
-    .on { color: var(--cyan); }
+    .row { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
+    .live { color: var(--cyan); }
     .wait { color: var(--amber); }
-    @media (max-width: 800px) { .rack, .split, .train, .top { grid-template-columns: 1fr; display: grid; } .top { display: grid; } }
+    .go, .quiet { border: 0; padding: 8px 12px; }
+    .go { background: var(--cyan); color: #10211c; font-weight: 700; }
+    .quiet { background: transparent; border: 1px solid var(--line); }
+    .talk { min-height: 480px; display: grid; grid-template-rows: auto 1fr auto; }
+    #log { overflow: auto; display: flex; flex-direction: column; gap: 8px; min-height: 240px; }
+    .bubble { max-width: 80%; padding: 10px 12px; border: 1px solid var(--line); white-space: pre-wrap; }
+    .user { align-self: end; }
+    form { display: flex; gap: 8px; margin-top: 12px; }
+    input, textarea { background: #101418; border: 1px solid var(--line); padding: 8px 10px; }
+    textarea { flex: 1; height: 72px; resize: none; }
+    input { width: min(100%, 520px); }
+    .losses { display: flex; align-items: end; gap: 6px; height: 72px; margin-top: 16px; }
+    .losses i { flex: 1; background: var(--cyan); display: block; min-height: 4px; }
+    @media (max-width: 800px) { .grid, header { display: grid; } .grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  <header class="top">
+  <header>
     <div>
-      <div class="brand">NEUROAI 1.0</div>
-      <div class="sub">Machines, try the model, training</div>
+      <div class="brand">NEUROAI</div>
+      <div class="sub">Two computers. One loaded model.</div>
     </div>
-    <nav class="nav">
-      <button type="button" class="on" data-view="machines">Machines</button>
+    <nav>
+      <button class="on" type="button" data-view="machines">Machines</button>
+      <button type="button" data-view="models">Models</button>
       <button type="button" data-view="try">Try</button>
       <button type="button" data-view="training">Training</button>
     </nav>
   </header>
-
-  <section class="view" id="view-machines">
-    <div class="rack">
-      <article class="plate">
-        <div class="plate-top"><span>WINDOWS</span><span class="on" id="st-windows">Live</span></div>
-        <h2 id="name-windows">This PC</h2>
-        <p class="deg" id="temp-windows">–<span>°</span></p>
-        <p class="role" id="gpu-windows">–</p>
-        <div class="mem"><b id="vram-windows">–</b><div class="bar"><i id="vram-bar-windows"></i></div></div>
-        <div class="mem"><b id="ram-windows">–</b><div class="bar"><i id="ram-bar-windows"></i></div></div>
-      </article>
-      <article class="plate">
-        <div class="plate-top"><span>MACOS</span><span class="wait" id="st-mac">Waiting</span></div>
-        <h2 id="name-mac">Mac</h2>
-        <p class="deg" id="temp-mac">–<span>°</span></p>
-        <p class="role" id="gpu-mac">–</p>
-        <p class="plain" id="mac-note"></p>
-        <div class="mem"><b id="ram-mac">–</b><div class="bar"><i id="ram-bar-mac"></i></div></div>
-      </article>
-      <article class="plate">
-        <div class="plate-top"><span>LINUX</span><span class="wait" id="st-linux">Waiting</span></div>
-        <h2 id="name-linux">Linux</h2>
-        <p class="deg" id="temp-linux">–<span>°</span></p>
-        <p class="role" id="gpu-linux">–</p>
-        <div class="mem"><b id="ram-linux">–</b><div class="bar"><i id="ram-bar-linux"></i></div></div>
-      </article>
-    </div>
-    <div class="split">
-      <div class="panel">
-        <div class="k">MEMORY ON THIS PC</div>
-        <div id="hogs"></div>
+  <main>
+    <section class="view" id="view-machines">
+      <div class="grid">
+        <article class="card">
+          <div class="k">THIS PC <span class="live" id="st-windows">Live</span></div>
+          <h2 id="name-windows">Windows</h2>
+          <p class="big" id="temp-windows">–°</p>
+          <p class="muted" id="gpu-windows">–</p>
+          <p class="muted" id="mem-windows">–</p>
+          <div class="bar"><i id="bar-windows"></i></div>
+          <div id="hogs-windows"></div>
+        </article>
+        <article class="card">
+          <div class="k">MAC <span class="wait" id="st-mac">Waiting</span></div>
+          <h2 id="name-mac">Mac</h2>
+          <p class="big" id="temp-mac">–°</p>
+          <p class="muted" id="gpu-mac">–</p>
+          <p class="muted" id="mem-mac">–</p>
+          <div class="bar"><i id="bar-mac"></i></div>
+          <div id="hogs-mac"></div>
+        </article>
       </div>
-      <div class="panel">
-        <div class="k">FREE SOME RAM</div>
-        <p class="plain">The large program is the model. Stopping it would end chat, so this button does not touch it. It stops the agent workers on this PC only.</p>
+      <div class="card" style="margin-top:14px">
+        <div class="k">RAM</div>
+        <p class="muted">The large program on this PC is the model. Stop agents closes the agent workers here. It does not stop the model, and it does not close programs on the Mac.</p>
         <button class="go" id="stop-agents" type="button">Stop agents</button>
-        <p class="plain" id="stop-note"></p>
+        <p class="muted" id="stop-note"></p>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <section class="view" id="view-try" hidden>
-    <div class="talk">
-      <div style="padding:16px 16px 0">
-        <h2>Try NeuroAI</h2>
-        <p class="plain">This is the model loaded on the GPU. One reply at a time.</p>
-      </div>
-      <div id="log"></div>
-      <form id="say">
-        <textarea id="message" placeholder="Ask NeuroAI"></textarea>
-        <button class="go" id="send" type="submit">Send</button>
-      </form>
-    </div>
-  </section>
+    <section class="view" id="view-models" hidden>
+      <article class="card">
+        <div class="k">ON THIS PC</div>
+        <h2>Models</h2>
+        <p class="muted">A model is connected when its GGUF file is on this computer. Only one can be loaded, because the GPU is full. Adding a file does not load it yet.</p>
+        <div id="model-list"></div>
+        <form id="add-model">
+          <input name="path" placeholder="D:\path\to\model.gguf">
+          <button class="go" type="submit">Add</button>
+        </form>
+        <p class="muted" id="model-note"></p>
+      </article>
+    </section>
 
-  <section class="view" id="view-training" hidden>
-    <div class="panel">
-      <div class="k">TRAINING</div>
-      <div class="train">
-        <p class="step" id="train-step">–</p>
+    <section class="view" id="view-try" hidden>
+      <article class="card talk">
         <div>
-          <h2 id="train-title">Stopped</h2>
-          <p class="plain" id="train-loss">–</p>
-          <div class="bar" style="margin:12px 0"><i id="train-bar"></i></div>
-          <p class="plain" id="train-reason"></p>
-          <button class="quiet" id="go-try" type="button">Try the loaded model</button>
+          <div class="k">LOADED MODEL</div>
+          <h2>Try NeuroAI</h2>
         </div>
-      </div>
-    </div>
-  </section>
+        <div id="log"></div>
+        <form id="say">
+          <textarea id="message" placeholder="Ask NeuroAI"></textarea>
+          <button class="go" id="send" type="submit">Send</button>
+        </form>
+      </article>
+    </section>
 
+    <section class="view" id="view-training" hidden>
+      <article class="card">
+        <div class="k">CUDA ONLY</div>
+        <h2 id="train-title">Stopped</h2>
+        <p class="big" id="train-step">–</p>
+        <p class="muted" id="train-loss">–</p>
+        <div class="losses" id="losses"></div>
+        <p class="muted" id="train-reason"></p>
+        <button class="quiet" id="start-train" type="button">Start training</button>
+        <p class="muted" id="train-note"></p>
+      </article>
+    </section>
+  </main>
 <script>
-let mesh = { nodes: [], found: [], training: {} };
+let mesh = { nodes: [], found: [], training: {}, models: [] };
 
 function text(id, value) {
   const node = document.getElementById(id);
   if (node) node.textContent = value;
 }
-function peer(osName) {
-  return (mesh.found || []).find((item) => item.ok && item.status && item.status.os === osName) || null;
+function peer() {
+  return (mesh.found || []).find((item) => item.ok && item.status && item.status.os === "darwin") || null;
 }
 function gb(mib) {
-  if (!mib) return "0";
-  return (mib / 1024).toFixed(mib >= 10240 ? 0 : 1);
+  return mib ? (mib / 1024).toFixed(mib >= 10240 ? 0 : 1) : "0";
 }
-function setTemp(id, value) {
-  const node = document.getElementById(id);
-  if (node && node.firstChild) node.firstChild.textContent = value == null || value === "" ? "–" : String(value);
+function hogs(id, rows, empty) {
+  const box = document.getElementById(id);
+  box.replaceChildren();
+  if (!rows || !rows.length) {
+    const line = document.createElement("p");
+    line.className = "muted";
+    line.textContent = empty;
+    box.append(line);
+    return;
+  }
+  for (const item of rows) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const name = document.createElement("span");
+    name.textContent = item.role === "model" ? item.name + " · model" : item.name;
+    const size = document.createElement("b");
+    size.textContent = item.mb + " MB";
+    row.append(name, size);
+    box.append(row);
+  }
 }
-function paintMachine(key, status, live) {
-  const state = document.getElementById("st-" + key);
-  state.textContent = live ? "Live" : "Waiting";
-  state.className = live ? "on" : "wait";
+function paintMachine(prefix, status, live) {
+  const mark = document.getElementById("st-" + prefix);
+  mark.textContent = live ? "Live" : "Waiting";
+  mark.className = live ? "live" : "wait";
   const gpu = (status && status.gpus && status.gpus[0]) || {};
   const ram = (status && status.ram) || {};
-  setTemp("temp-" + key, gpu.temperature_c ?? (status && status.temperature_c));
-  text("name-" + key, (status && status.name) || (key === "windows" ? "This PC" : key === "mac" ? "Mac" : "Linux"));
+  const temp = gpu.temperature_c ?? (status && status.temperature_c);
+  text("name-" + prefix, (status && status.name) || (prefix === "windows" ? "Windows" : "Mac"));
+  text("temp-" + prefix, (temp == null || temp === "" ? "–" : temp) + "°");
   let gpuName = gpu.name || "";
-  if (!gpuName && live && key === "mac") gpuName = "Apple Silicon";
-  const gpuNode = document.getElementById("gpu-" + key);
-  if (gpuNode) gpuNode.textContent = gpuName || "–";
-  const total = ram.total_mib || 0;
-  const used = Math.max(0, total - (ram.free_mib || 0));
-  text("ram-" + key, total ? "Memory  " + gb(used) + " / " + gb(total) + " GB" : "Memory  –");
-  const ramBar = document.getElementById("ram-bar-" + key);
-  if (ramBar) ramBar.style.width = total ? Math.round(100 * used / total) + "%" : "0";
-  if (key === "windows") {
-    const vramTotal = gpu.memory_total_mib || 0;
-    const vramUsed = gpu.memory_used_mib || 0;
-    text("vram-windows", vramTotal ? "VRAM  " + gb(vramUsed) + " / " + gb(vramTotal) + " GB" : "VRAM  –");
-    document.getElementById("vram-bar-windows").style.width = vramTotal ? Math.round(100 * vramUsed / vramTotal) + "%" : "0";
-  }
+  if (!gpuName && live && prefix === "mac") gpuName = "Apple Silicon";
+  text("gpu-" + prefix, gpuName || "GPU not named. The computer stays connected.");
+  const total = ram.total_mib || gpu.memory_total_mib || 0;
+  const used = ram.total_mib ? Math.max(0, ram.total_mib - (ram.free_mib || 0)) : (gpu.memory_used_mib || 0);
+  text("mem-" + prefix, total ? "Memory " + gb(used) + " / " + gb(total) + " GB" : "Memory –");
+  document.getElementById("bar-" + prefix).style.width = total ? Math.round(100 * used / total) + "%" : "0";
 }
 function paint() {
   const local = (mesh.nodes[0] && mesh.nodes[0].status) || {};
   paintMachine("windows", local, true);
-  const mac = peer("darwin");
+  hogs("hogs-windows", local.heavy, "No large programs reported.");
+  const mac = peer();
   paintMachine("mac", mac && mac.status, Boolean(mac));
-  text("mac-note", mac ? "Connected. A missing GPU name does not drop this Mac." : "");
-  const linux = peer("linux");
-  paintMachine("linux", linux && linux.status, Boolean(linux));
-  const hogs = document.getElementById("hogs");
-  hogs.replaceChildren();
-  for (const item of local.heavy || []) {
+  hogs("hogs-mac", mac && mac.status && mac.status.heavy, mac ? "Memory is above. Program names appear after the Mac script is started again." : "The Mac is not connected.");
+  const list = document.getElementById("model-list");
+  list.replaceChildren();
+  for (const model of mesh.models || []) {
     const row = document.createElement("div");
-    row.className = "hog";
+    row.className = "row";
     const name = document.createElement("span");
-    name.textContent = item.role === "model" ? item.name + "  ·  model" : item.name;
+    name.textContent = model.name + (model.loaded ? " · loaded" : " · on disk");
     const size = document.createElement("b");
-    size.textContent = item.mb + " MB";
+    size.textContent = model.mb + " MB";
     row.append(name, size);
-    hogs.append(row);
+    list.append(row);
   }
   const training = mesh.training || {};
-  const step = training.step || 0;
-  const max = training.max_steps || 0;
-  text("train-step", step ? String(step) : "–");
   text("train-title", training.running ? "Running" : "Stopped");
-  text("train-loss", training.loss != null ? "Last loss " + training.loss + (max ? "  ·  step " + step + " of " + max : "") : "No loss recorded");
+  text("train-step", training.step ? String(training.step) : "–");
+  text("train-loss", training.loss != null ? "Last loss " + training.loss + " · step " + training.step + " of " + training.max_steps : "No loss");
   text("train-reason", training.reason || "");
-  document.getElementById("train-bar").style.width = max ? Math.round(100 * step / max) + "%" : "0";
+  const losses = document.getElementById("losses");
+  losses.replaceChildren();
+  const history = training.history || [];
+  const peak = Math.max(...history, 0.001);
+  for (const value of history) {
+    const bar = document.createElement("i");
+    bar.style.height = Math.max(8, Math.round(72 * value / peak)) + "px";
+    losses.append(bar);
+  }
 }
 function show(view) {
-  for (const name of ["machines", "try", "training"]) {
+  for (const name of ["machines", "models", "try", "training"]) {
     document.getElementById("view-" + name).hidden = name !== view;
   }
-  document.querySelectorAll(".nav button").forEach((button) => {
-    button.classList.toggle("on", button.dataset.view === view);
-  });
+  document.querySelectorAll("nav button").forEach((button) => button.classList.toggle("on", button.dataset.view === view));
 }
-document.querySelectorAll(".nav button").forEach((button) => {
-  button.onclick = () => show(button.dataset.view);
-});
-document.getElementById("go-try").onclick = () => show("try");
+document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => show(button.dataset.view); });
 document.getElementById("stop-agents").onclick = async () => {
   const note = document.getElementById("stop-note");
-  note.textContent = "Stopping agent workers…";
-  try {
-    const response = await fetch("/api/agents/stop", { method: "POST" });
-    const body = await response.json();
-    note.textContent = "Stopped " + ((body.stopped || []).length) + " agent workers. The model is still loaded.";
-  } catch (error) {
-    note.textContent = "Could not stop the agents.";
-  }
+  const response = await fetch("/api/agents/stop", { method: "POST" });
+  const body = await response.json();
+  note.textContent = "Stopped " + ((body.stopped || []).length) + " agent workers.";
 };
-async function refresh() {
-  mesh = await (await fetch("/api/mesh")).json();
-  paint();
-}
-function bubble(kind, value) {
-  const item = document.createElement("div");
-  item.className = "bubble " + kind;
-  item.textContent = value;
-  document.getElementById("log").appendChild(item);
-  item.scrollIntoView({ block: "nearest" });
-}
+document.getElementById("add-model").onsubmit = async (event) => {
+  event.preventDefault();
+  const path = new FormData(event.target).get("path");
+  const response = await fetch("/api/models", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ path }) });
+  const body = await response.json();
+  document.getElementById("model-note").textContent = body.error || "Added. It stays on disk until the GPU is free.";
+  if (response.ok) event.target.reset();
+  refresh();
+};
+document.getElementById("start-train").onclick = async () => {
+  const response = await fetch("/api/training/start", { method: "POST" });
+  const body = await response.json();
+  document.getElementById("train-note").textContent = body.error || "Started.";
+};
 document.getElementById("say").onsubmit = async (event) => {
   event.preventDefault();
   const box = document.getElementById("message");
@@ -248,21 +258,31 @@ document.getElementById("say").onsubmit = async (event) => {
   if (!message) return;
   box.value = "";
   document.getElementById("send").disabled = true;
-  bubble("user", message);
+  const log = document.getElementById("log");
+  const mine = document.createElement("div");
+  mine.className = "bubble user";
+  mine.textContent = message;
+  log.append(mine);
   try {
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }),
-    });
+    const response = await fetch("/api/chat", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ message }) });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || "No reply");
-    bubble("ai", body.reply || "NeuroAI returned no text.");
+    const reply = document.createElement("div");
+    reply.className = "bubble";
+    reply.textContent = body.reply || "No text.";
+    log.append(reply);
   } catch (error) {
-    bubble("ai", error.message);
+    const reply = document.createElement("div");
+    reply.className = "bubble";
+    reply.textContent = error.message;
+    log.append(reply);
   }
   document.getElementById("send").disabled = false;
 };
+async function refresh() {
+  mesh = await (await fetch("/api/mesh")).json();
+  paint();
+}
 refresh();
 setInterval(refresh, 4000);
 </script>

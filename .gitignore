@@ -7,5 +7,6 @@ agents.db-wal
 agents.db-shm
 agents.stop
 agent-logs/
+models.json
 __pycache__/
 *.pyc

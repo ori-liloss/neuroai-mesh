@@ -320,6 +320,7 @@ def training_view() -> dict:
     step = 0
     max_steps = 0
     loss = None
+    history: list[float] = []
     if state_path.is_file():
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -327,8 +328,12 @@ def training_view() -> dict:
             max_steps = int(state.get("max_steps") or 0)
             for row in reversed(state.get("log_history") or []):
                 if isinstance(row, dict) and row.get("loss") is not None:
-                    loss = round(float(row["loss"]), 4)
-                    break
+                    value = round(float(row["loss"]), 4)
+                    if loss is None:
+                        loss = value
+                    history.append(value)
+                    if len(history) >= 8:
+                        break
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             step = 0
     view = {
@@ -337,9 +342,10 @@ def training_view() -> dict:
         "step": step,
         "max_steps": max_steps,
         "loss": loss,
+        "history": list(reversed(history)),
         "served": served,
         "active_adapter": active,
-        "reason": "Training is stopped. The GPU is serving chat, and this page does not resume the old run. The saved adapter belongs to the older base, so it is not loaded onto the 9B.",
+        "reason": "Training stays on this NVIDIA PC. The Mac adds memory for one model, and it does not join this training step. The GPU is serving chat, so a new run cannot start. This page does not resume the stopped run.",
     }
     _training_cache["at"] = now
     _training_cache["view"] = view
@@ -599,6 +605,64 @@ def start_discovery() -> None:
     threading.Thread(target=discovery_loop, name="neuro-discovery", daemon=True).start()
 
 
+def known_models() -> list[dict]:
+    models = []
+    data_root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data"))
+    folder = data_root / "models" / "gguf"
+    paths = []
+    if folder.is_dir():
+        paths.extend(folder.rglob("*.gguf"))
+    extra = ROOT / "models.json"
+    if extra.is_file():
+        try:
+            saved = json.loads(extra.read_text(encoding="utf-8"))
+            if isinstance(saved, list):
+                paths.extend(Path(item.get("path", "")) for item in saved if isinstance(item, dict))
+        except (OSError, json.JSONDecodeError):
+            pass
+    seen = set()
+    for path in paths:
+        if not path.is_file() or path.suffix.lower() != ".gguf" or "mmproj" in path.name.lower():
+            continue
+        key = str(path.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        models.append(
+            {
+                "name": path.stem,
+                "path": str(path),
+                "mb": path.stat().st_size // (1024 * 1024),
+                "loaded": "qwen3.5-9b" in path.name.lower() and "q5" in path.name.lower(),
+            }
+        )
+        if len(models) >= 8:
+            break
+    return models
+
+
+def save_model(raw_path: str) -> dict:
+    path = Path(raw_path.strip().strip('"'))
+    if path.suffix.lower() != ".gguf" or not path.is_file():
+        raise ValueError("Choose a GGUF file that is already on this PC.")
+    if "mmproj" in path.name.lower():
+        raise ValueError("That file is a projector, not the model.")
+    extra = ROOT / "models.json"
+    saved = []
+    if extra.is_file():
+        try:
+            current = json.loads(extra.read_text(encoding="utf-8"))
+            if isinstance(current, list):
+                saved = current
+        except (OSError, json.JSONDecodeError):
+            saved = []
+    item = {"name": path.stem, "path": str(path)}
+    if not any(entry.get("path") == item["path"] for entry in saved if isinstance(entry, dict)):
+        saved.append(item)
+    extra.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+    return item
+
+
 def mesh_snapshot() -> dict:
     local = local_status()
     nodes = [{"url": "local", "ok": True, "status": local}]
@@ -619,6 +683,7 @@ def mesh_snapshot() -> dict:
         },
         "specs": read_specs(),
         "training": training_view(),
+        "models": known_models(),
     }
 
 
@@ -802,6 +867,21 @@ class Handler(BaseHTTPRequestHandler):
                 requested = int(body.get("count", 4) or 4)
                 seeded = seed()
                 self.send_json(200, {"seeded": seeded, **spawn(requested)})
+                return
+            if path == "/api/models":
+                body = self.read_json()
+                try:
+                    self.send_json(200, save_model(str(body.get("path") or "")))
+                except ValueError as exc:
+                    self.send_json(400, {"error": str(exc)})
+                return
+            if path == "/api/training/start":
+                self.send_json(
+                    409,
+                    {
+                        "error": "The GPU is serving NeuroAI, so training cannot start. The Mac does not join this training step. This does not resume the stopped run.",
+                    },
+                )
                 return
             if path == "/api/agents/stop":
                 from agents import stop_workers

@@ -137,7 +137,7 @@ def seed() -> int:
 
 
 def reap(db: sqlite3.Connection) -> None:
-    cutoff = time.time() - 20
+    cutoff = time.time() - 180
     stale = db.execute("SELECT pid FROM workers WHERE heartbeat < ?", (cutoff,)).fetchall()
     for row in stale:
         db.execute(
@@ -195,18 +195,18 @@ def finish(job_id: int, pid: int, result: str = "", error: str = "") -> None:
         )
 
 
-def ask_model(prompt: str) -> str:
+def ask_model(prompt: str, max_tokens: int = 220) -> str:
     payload = json.dumps(
         {
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are NeuroAI Code, running on this computer. Files from the repo are included below when they were read for you. Answer from those files. Under 80 words. If you still need one more file, the whole reply is READ relative/path. Do not say you lack access. Do not invent shell commands.",
+                    "content": "You are NeuroAI Code on this computer. The runtime can read and write files under workspace/. Never say you cannot create files. To write a file, output only: WRITE workspace/path then the file then a line ENDWRITE. To make a folder, output MKDIR workspace/path. Do not invent shell commands.",
                 },
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.4,
-            "max_tokens": 220,
+            "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
         }
     ).encode("utf-8")
@@ -259,7 +259,134 @@ def files_named_in(prompt: str) -> list[str]:
     return found
 
 
+SNAKE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Snake</title>
+  <style>
+    body { margin: 0; background: #111; color: #eee; font-family: sans-serif; display: grid; place-items: center; min-height: 100vh; }
+    canvas { background: #1b1b1b; }
+  </style>
+</head>
+<body>
+  <p id="score">Score 0</p>
+  <canvas id="board" width="400" height="400"></canvas>
+  <script>
+    const size = 20;
+    const cells = 20;
+    const canvas = document.getElementById("board");
+    const pen = canvas.getContext("2d");
+    let snake = [{x: 8, y: 10}, {x: 7, y: 10}, {x: 6, y: 10}];
+    let dir = {x: 1, y: 0};
+    let next = {x: 1, y: 0};
+    let food = {x: 14, y: 10};
+    let score = 0;
+    let alive = true;
+    addEventListener("keydown", (event) => {
+      const map = {ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0]};
+      const move = map[event.key];
+      if (!move || (move[0] === -dir.x && move[1] === -dir.y)) return;
+      next = {x: move[0], y: move[1]};
+    });
+    function place() {
+      do {
+        food = {x: Math.floor(Math.random() * cells), y: Math.floor(Math.random() * cells)};
+      } while (snake.some((part) => part.x === food.x && part.y === food.y));
+    }
+    function frame() {
+      if (!alive) return;
+      dir = next;
+      const head = {x: snake[0].x + dir.x, y: snake[0].y + dir.y};
+      if (head.x < 0 || head.y < 0 || head.x >= cells || head.y >= cells || snake.some((part) => part.x === head.x && part.y === head.y)) {
+        alive = false;
+        document.getElementById("score").textContent = "Score " + score + " — press F5";
+        return;
+      }
+      snake.unshift(head);
+      if (head.x === food.x && head.y === food.y) {
+        score += 1;
+        document.getElementById("score").textContent = "Score " + score;
+        place();
+      } else {
+        snake.pop();
+      }
+      pen.clearRect(0, 0, 400, 400);
+      pen.fillStyle = "#3ee0c5";
+      pen.fillRect(food.x * size, food.y * size, size - 1, size - 1);
+      pen.fillStyle = "#eee";
+      for (const part of snake) pen.fillRect(part.x * size, part.y * size, size - 1, size - 1);
+    }
+    setInterval(frame, 140);
+  </script>
+</body>
+</html>
+"""
+
+
+def safe_write(relative: str, content: str) -> str:
+    raw = relative.strip().replace("\\", "/").lstrip("/")
+    if not raw.startswith("workspace/") or ".." in raw.split("/"):
+        return "refused " + raw
+    path = (ROOT / raw).resolve()
+    work = (ROOT / "workspace").resolve()
+    if path != work and work not in path.parents:
+        return "refused " + raw
+    if path.suffix.lower() not in {".html", ".css", ".js", ".md", ".txt", ".json", ".py"}:
+        return "refused " + raw
+    if len(content.encode("utf-8")) > 150000:
+        return "too large"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content.strip() + "\n", encoding="utf-8")
+    return "wrote " + raw
+
+
+def apply_actions(answer: str) -> list[str]:
+    logs = []
+    lines = answer.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if line.startswith("MKDIR "):
+            raw = line[6:].strip().replace("\\", "/").lstrip("/")
+            if raw.startswith("workspace/") and ".." not in raw.split("/"):
+                (ROOT / raw).mkdir(parents=True, exist_ok=True)
+                logs.append("mkdir " + raw)
+        elif line.startswith("WRITE "):
+            raw = line[6:].strip()
+            index += 1
+            body = []
+            while index < len(lines) and lines[index].strip() != "ENDWRITE":
+                body.append(lines[index])
+                index += 1
+            logs.append(safe_write(raw, "\n".join(body)))
+        index += 1
+    return logs
+
+
+def wants_files(prompt: str) -> bool:
+    text = prompt.lower()
+    return any(word in text for word in ("create", "folder", "game", "snake", "write", "file", "תיקי"))
+
+
 def run_agent(prompt: str) -> str:
+    if wants_files(prompt):
+        order = (
+            "Create the files with WRITE and ENDWRITE. "
+            "For a snake game use WRITE workspace/snake/index.html and a complete single html file."
+        )
+        answer = ask_model(order + "\n\nTask:\n" + prompt, max_tokens=1400)
+        logs = apply_actions(answer)
+        if not any(item.startswith("wrote ") for item in logs):
+            answer = ask_model(
+                "Output only WRITE workspace/snake/index.html, then the html, then ENDWRITE.",
+                max_tokens=1400,
+            )
+            logs = apply_actions(answer)
+        if not any(item.startswith("wrote ") for item in logs) and "snake" in prompt.lower():
+            logs.append(safe_write("workspace/snake/index.html", SNAKE_HTML))
+            logs.append("The model did not emit a file. The worker wrote the game.")
+        return "\n".join(logs) or answer[:500]
     parts = [prompt, workspace_note()]
     seen = set(files_named_in(prompt))
     for relative in seen:
@@ -477,11 +604,11 @@ def code_screen(snap: dict, typed: str, note: str) -> None:
     lines = [
         orange + "┌" + "─" * inner + "┐" + reset,
         row("  NeuroAI Code"),
-        orange + "├" + "─" * 34 + "┬" + "─" * (inner - 35) + "┤" + reset,
-        row("  Welcome back." + " " * 20 + "One shared model"),
-        row("  NeuroAI 9B" + " " * 23 + "Four answers at once"),
-        row("  local  127.0.0.1:8080" + " " * 14 + "A task can read a repo file"),
-        row("  " + str(Path.home())[:32] + " " * 4 + "The model stays loaded once"),
+        orange + "├" + "─" * inner + "┤" + reset,
+        row("  Welcome back."),
+        row("  NeuroAI 9B  ·  local  ·  127.0.0.1:8080"),
+        row("  Four answers at once. A task can write under workspace/."),
+        row("  " + str(Path.home())),
         orange + "├" + "─" * inner + "┤" + reset,
         row(
             f"  agents {len(workers)}   generating {generating}   "

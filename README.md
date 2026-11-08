@@ -76,9 +76,12 @@ Weight split starts only after the chat server stops, because one GPU cannot ser
 
 Open http://127.0.0.1:8780. It has three views:
 
-- **Machines** shows each computer, its temperature when the machine reports one, and the programs using the most memory. Stop agents frees the agent workers on this PC. It does not stop the model, and it does not close programs on the Mac.
-- **Try** is the chat. That is the served NeuroAI 9B.
-- **Training** shows the stopped run: step, loss, and why it is not running. The page does not resume it. The saved adapter does not load onto the 9B. Use Try to talk to the model that is actually loaded.
+- **Machines** shows this PC and the Mac side by side, with memory and the large programs when that computer reports them.
+- **Models** lists GGUF files on this PC. Add a file that is already on disk. Adding it does not load it while the GPU is full.
+- **Try** is the chat with the loaded NeuroAI 9B.
+- **Training** shows the stopped run, the recent losses, and a start button. Training stays on the NVIDIA PC. The Mac does not join that step. The button does not start a run while chat is using the GPU, and it does not resume the stopped run.
+
+NeuroAI Code can write files under `workspace/`. A request to make a folder and a game is handled there.
 
 A Mac still joins with `bash platforms/start-mac.sh` even if its GPU name is missing. The bay stays live. The chip name appears after that script is started again.
 
