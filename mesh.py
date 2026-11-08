@@ -561,7 +561,7 @@ def fetch_worker(url: str) -> dict:
         url.rstrip("/") + "/status",
         headers={"Authorization": "Bearer " + token()},
     )
-    with urllib.request.urlopen(request, timeout=0.8) as response:
+    with urllib.request.urlopen(request, timeout=4) as response:
         body = json.loads(response.read().decode("utf-8"))
     if not isinstance(body, dict):
         raise ValueError("Bad worker response")
@@ -570,7 +570,7 @@ def fetch_worker(url: str) -> dict:
 
 def fetch_public(url: str, path: str) -> dict:
     request = urllib.request.Request(url.rstrip("/") + path)
-    with urllib.request.urlopen(request, timeout=0.8) as response:
+    with urllib.request.urlopen(request, timeout=4) as response:
         body = json.loads(response.read().decode("utf-8"))
     if not isinstance(body, dict):
         raise ValueError("Bad worker response")
