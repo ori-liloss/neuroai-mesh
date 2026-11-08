@@ -201,7 +201,7 @@ def ask_model(prompt: str, max_tokens: int = 220) -> str:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are NeuroAI Code on this computer. Do the task. To write a file, output WRITE relative/path, then the file, then a line ENDWRITE. To make a folder, output MKDIR relative/path.",
+                    "content": "You are NeuroAI. Do the task the user asked.",
                 },
                 {"role": "user", "content": prompt},
             ],

@@ -38,6 +38,15 @@
     .bar { height: 8px; border-radius: 99px; background: #243049; margin-top: 14px; overflow: hidden; }
     .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--ice), var(--gold)); }
     .row, .set { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
+    .map { position: relative; min-height: 560px; background: #05070d; border: 1px solid var(--line); border-radius: 18px; overflow: hidden; }
+    .word { position: absolute; top: 28px; left: 0; right: 0; text-align: center; font-family: Georgia, serif; font-size: 54px; letter-spacing: 0.18em; color: #f0c84b; }
+    .links { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .node { position: absolute; width: 180px; transform: translate(-50%, -50%); background: #12100a; border: 1px solid #f0c84b; color: #f0c84b; padding: 12px; text-align: center; cursor: pointer; }
+    .node b, .node span { display: block; }
+    .node b { font-size: 16px; margin-bottom: 6px; }
+    .node span { font-family: var(--mono); font-size: 12px; color: #f4f1ea; }
+    .node.picked { background: #2a220c; }
+    .detail { margin-top: 16px; }
     .live { color: var(--ice); }
     .wait { color: var(--gold); }
     .go, .quiet { border-radius: 999px; padding: 10px 16px; }
@@ -68,29 +77,16 @@
     </aside>
     <main>
       <section class="view" id="view-machines">
-        <div class="stage">
-          <article class="card">
-            <div class="k">THIS PC <span class="live" id="st-windows">Live</span></div>
-            <h2 id="name-windows">Windows</h2>
-            <p class="figure" id="temp-windows">–°</p>
-            <p class="muted" id="gpu-windows">–</p>
-            <p class="muted" id="mem-windows">–</p>
-            <div class="bar"><i id="bar-windows"></i></div>
-            <div id="hogs-windows"></div>
-          </article>
-          <article class="card">
-            <div class="k">MAC <span class="wait" id="st-mac">Waiting</span></div>
-            <h2 id="name-mac">Mac</h2>
-            <p class="figure" id="temp-mac">–°</p>
-            <p class="muted" id="gpu-mac">–</p>
-            <p class="muted" id="mem-mac">–</p>
-            <div class="bar"><i id="bar-mac"></i></div>
-            <div id="hogs-mac"></div>
-          </article>
+        <div class="map" id="map">
+          <div class="word">NEUROAI</div>
+          <svg class="links" id="links"></svg>
         </div>
-        <article class="card" style="margin-top:16px">
-          <p class="muted">Stop agents closes agent workers on this PC. It does not stop the loaded model and it does not edit datasets.</p>
-          <button class="quiet" id="stop-agents" type="button">Stop agents</button>
+        <article class="card detail">
+          <div class="k" id="pick-k">SELECTED</div>
+          <h2 id="pick-name">–</h2>
+          <p class="muted" id="pick-meta">–</p>
+          <div id="pick-hogs"></div>
+          <button class="quiet" id="stop-agents" type="button">Stop agents on this PC</button>
           <p class="muted" id="stop-note"></p>
         </article>
       </section>
@@ -161,28 +157,71 @@ function lines(id, rows, empty) {
     box.append(row);
   }
 }
-function paintMachine(prefix, status, live) {
-  const mark = document.getElementById("st-" + prefix);
-  mark.textContent = live ? "Live" : "Waiting";
-  mark.className = live ? "live" : "wait";
-  const gpu = (status && status.gpus && status.gpus[0]) || {};
+let picked = 0;
+function cluster() {
+  const local = (mesh.nodes[0] && mesh.nodes[0].status) || {};
+  const list = [{ name: local.name || "This PC", status: local, url: "this PC" }];
+  for (const item of mesh.found || []) {
+    if (!item.ok || !item.status) continue;
+    list.push({ name: item.status.name || item.url, status: item.status, url: item.url });
+  }
+  return list;
+}
+function memoryLine(status) {
   const ram = (status && status.ram) || {};
-  const temp = gpu.temperature_c ?? (status && status.temperature_c);
-  text("name-" + prefix, (status && status.name) || (prefix === "windows" ? "Windows" : "Mac"));
-  text("temp-" + prefix, (temp == null || temp === "" ? "–" : temp) + "°");
-  text("gpu-" + prefix, gpu.name || (live && prefix === "mac" ? "Apple Silicon" : "–"));
   const total = ram.total_mib || 0;
   const used = Math.max(0, total - (ram.free_mib || 0));
-  text("mem-" + prefix, total ? "Memory " + gb(used) + " / " + gb(total) + " GB" : "Memory –");
-  document.getElementById("bar-" + prefix).style.width = total ? Math.round(100 * used / total) + "%" : "0";
+  return total ? gb(used) + " / " + gb(total) + " GB" : "memory pending";
+}
+function drawMap(list) {
+  const map = document.getElementById("map");
+  map.querySelectorAll(".node").forEach((node) => node.remove());
+  const svg = document.getElementById("links");
+  const width = map.clientWidth || 800;
+  const height = map.clientHeight || 560;
+  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+  svg.replaceChildren();
+  const points = list.map((item, index) => ({
+    x: width / 2,
+    y: 150 + index * Math.min(120, (height - 220) / Math.max(list.length, 1)),
+  }));
+  for (let index = 1; index < points.length; index += 1) {
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", points[index - 1].x);
+    line.setAttribute("y1", points[index - 1].y);
+    line.setAttribute("x2", points[index].x);
+    line.setAttribute("y2", points[index].y);
+    line.setAttribute("stroke", "#f0c84b");
+    line.setAttribute("stroke-width", "2");
+    svg.append(line);
+  }
+  list.forEach((item, index) => {
+    const node = document.createElement("button");
+    node.type = "button";
+    node.className = "node" + (index === picked ? " picked" : "");
+    const title = document.createElement("b");
+    title.textContent = item.name;
+    const meta = document.createElement("span");
+    const gpu = (item.status.gpus || [])[0] || {};
+    meta.textContent = memoryLine(item.status) + (gpu.name ? " · " + gpu.name : "");
+    node.append(title, meta);
+    node.style.left = points[index].x + "px";
+    node.style.top = points[index].y + "px";
+    node.onclick = () => { picked = index; paint(); };
+    map.append(node);
+  });
 }
 function paint() {
-  const local = (mesh.nodes[0] && mesh.nodes[0].status) || {};
-  paintMachine("windows", local, true);
-  lines("hogs-windows", (local.heavy || []).map((item) => ({ name: item.role === "model" ? item.name + " · model" : item.name, mb: item.mb })), "No large programs reported.");
-  const mac = peer();
-  paintMachine("mac", mac && mac.status, Boolean(mac));
-  lines("hogs-mac", mac && mac.status && mac.status.heavy, mac ? "Memory is shown. Program names appear after the Mac script starts again." : "The Mac is not connected.");
+  const list = cluster();
+  if (picked >= list.length) picked = 0;
+  drawMap(list);
+  const current = list[picked] || list[0];
+  text("pick-name", current ? current.name : "–");
+  text("pick-k", list.length + " connected");
+  const gpu = (((current && current.status && current.status.gpus) || [])[0]) || {};
+  const temp = gpu.temperature_c ?? (current && current.status.temperature_c);
+  text("pick-meta", current ? (temp == null || temp === "" ? "–" : temp) + "° · " + memoryLine(current.status) + " · " + (gpu.name || current.url) : "–");
+  lines("pick-hogs", current && current.status.heavy, "No program list from this computer yet.");
   lines("model-list", (mesh.models || []).map((item) => ({ name: item.name + (item.loaded ? " · loaded" : " · on disk"), mb: item.mb })), "No GGUF files found.");
   const training = mesh.training || {};
   text("train-title", training.running ? "Running" : "Stopped");
