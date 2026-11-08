@@ -63,8 +63,10 @@ On that laptop, run:
 ```powershell
 git clone https://github.com/ori-liloss/neuroai-mesh.git
 cd neuroai-mesh
-powershell -File start-worker.ps1
+start-worker.cmd
 ```
+
+`start-worker.cmd` runs the worker even when Windows blocks PowerShell scripts. The command does not change the laptop's execution policy.
 
 The laptop stays off the page until this command is running. The page then sees it and checks the agent code on that laptop. The weight update stays on the NVIDIA PC. A second laptop is the same command on that second laptop. There is no empty seat waiting for a computer that is not here.
 
