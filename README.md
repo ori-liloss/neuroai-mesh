@@ -105,3 +105,6 @@ A hundred copies of the model do not fit on one 12 GB GPU. The queue can hold ma
 | `platforms/start-linux.sh` | Linux worker |
 | `start-dashboard.ps1` | Windows dashboard |
 | `start-worker.ps1` | Windows worker, for a second Windows PC |
+
+
+I will keep updating this Project Hope it will help you !
