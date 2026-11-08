@@ -198,11 +198,11 @@
     <section class="cluster">
       <div class="use">
         <article><div class="n">01 HOST</div><p>This Windows PC holds NeuroAI. Keep this page open.</p></article>
-        <article><div class="n">02 COPY</div><p>Copy the neuro-cluster folder to the other computer, including cluster.token.</p></article>
-        <article><div class="n">03 RUN</div><p>On the Mac, do not run <code>mesh.py serve</code>. Inside the folder: <code>bash platforms/start-mac.sh</code></p></article>
-        <article><div class="n">04 JOIN</div><p>This page searches the private network. A matching worker fills its bay. <span class="down">Token</span> means that computer has a different <code>cluster.token</code>.</p></article>
+        <article><div class="n">02 MAC</div><p>On the Mac, inside the folder: <code>bash platforms/start-mac.sh</code></p></article>
+        <article><div class="n">03 LINUX</div><p>On Linux, the same idea: <code>bash platforms/start-linux.sh</code></p></article>
+        <article><div class="n">04 DONE</div><p>This page finds that computer on the private network. There is no file to copy and no address to paste.</p></article>
       </div>
-      <p class="legend"><span class="on">Live</span> means the machine answered with this PC's token. <span class="wait">Waiting</span> means nothing found yet. <span class="down">Token</span> means the worker is up and the token file is different. <span id="token-id"></span></p>
+      <p class="legend"><span class="on">Live</span> means the other computer answered. <span class="wait">Waiting</span> means the script is not running yet. <span id="token-id"></span></p>
       <p class="legend" id="found-line"></p>
       <div class="spine" aria-hidden="true">
         <span class="dot on" id="dot-ori"></span>
@@ -265,9 +265,9 @@
           <div class="k">01 · MAC</div>
           <h2>Light join</h2>
           <ol class="steps">
-            <li><b>Copy this folder</b><div class="path">neuro-cluster</div>The Mac must use this PC's cluster.token, beside mesh.py. If the Mac already made its own file, replace it.</li>
-            <li><b>On the Mac, run the command inside the folder.</b> Do not run mesh.py serve there.</li>
-            <li><b>Leave this page open.</b> It finds the Mac on the local network. Paste an address only if the search misses it.</li>
+            <li><b>Clone the repo once</b><div class="path">neuroai-mesh</div>After that, one command is enough.</li>
+            <li><b>Run the command inside the folder.</b> Do not run mesh.py serve on the Mac.</li>
+            <li><b>Leave this page open.</b> The Mac shows up on its own.</li>
           </ol>
         </div>
         <div>
@@ -301,9 +301,9 @@
           <div class="k">01 · LINUX</div>
           <h2>Light join</h2>
           <ol class="steps">
-            <li><b>Copy this folder</b><div class="path">neuro-cluster</div>Include cluster.token beside mesh.py. On this PC that folder is D:\liliai\neuro-cluster.</li>
-            <li><b>On Linux, run the command inside the folder.</b> The script prints the address to paste.</li>
-            <li><b>Paste the address and the spec here.</b> This page does not run anything on Linux.</li>
+            <li><b>Clone the repo once</b><div class="path">neuroai-mesh</div>After that, one command is enough.</li>
+            <li><b>Run the command inside the folder.</b></li>
+            <li><b>Leave this page open.</b> The Linux machine shows up on its own.</li>
           </ol>
         </div>
         <div>
@@ -365,9 +365,16 @@ function nodeFor(url) {
   return (mesh.nodes || []).find((item) => item.url === url) || null;
 }
 
+function limitedPeers() {
+  return (mesh.found || []).filter((item) => item.ok && item.limited);
+}
+
 function livePeer(os) {
   const want = os === "mac" ? "darwin" : "linux";
-  return (mesh.found || []).find((item) => item.ok && item.status && item.status.os === want) || null;
+  const known = (mesh.found || []).find((item) => item.ok && !item.limited && item.status && item.status.os === want);
+  if (known) return known;
+  if (os === "mac" && limitedPeers().length) return limitedPeers()[0];
+  return null;
 }
 
 function stateOf(os, spec) {
@@ -375,12 +382,8 @@ function stateOf(os, spec) {
   if (spec && spec.url) {
     const node = nodeFor(spec.url);
     if (node && node.ok) return { cls: "on", label: "Live" };
-    if (node && node.error === "token") return { cls: "down", label: "Token" };
     if (node && node.ok === false) return { cls: "down", label: "No reply" };
     return { cls: "wait", label: "Saved" };
-  }
-  if (os === "mac" && (mesh.found || []).some((item) => item.error === "token")) {
-    return { cls: "down", label: "Token" };
   }
   return { cls: "wait", label: spec ? "Saved" : "Waiting" };
 }
@@ -415,14 +418,14 @@ function paint() {
   text("fact-vram", used + "%");
   text("fact-ram", ram.free_mib ? Math.round(ram.free_mib / 1024) + " GB free" : "–");
   text("fact-rpc", local.rpc_listening ? "Listening" : "Off");
-  const bad = (mesh.found || []).filter((item) => item.error === "token");
-  const joined = (mesh.found || []).filter((item) => item.ok);
-  text("token-id", mesh.token_id ? "token id " + mesh.token_id : "");
+  const joined = (mesh.found || []).filter((item) => item.ok && !item.limited);
+  const limited = limitedPeers();
+  text("token-id", "");
   const foundLine = document.getElementById("found-line");
-  if (bad.length) {
-    foundLine.textContent = "Found " + bad.map((item) => item.url).join(" and ") + ". The worker is running. Its cluster.token is not this PC's file. On the Mac, replace cluster.token with the file from D:\\liliai\\neuro-cluster and start the script again.";
-  } else if (joined.length) {
+  if (joined.length) {
     foundLine.textContent = "Joined " + joined.map((item) => item.url).join(" and ") + ".";
+  } else if (limited.length) {
+    foundLine.textContent = "Joined " + limited.map((item) => item.url).join(" and ") + ". Run the script once more on that computer to show its memory.";
   } else {
     foundLine.textContent = "";
   }

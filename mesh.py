@@ -284,15 +284,43 @@ def fetch_worker(url: str) -> dict:
     return body
 
 
-def pull_worker(url: str) -> dict:
+def fetch_public(url: str, path: str) -> dict:
+    request = urllib.request.Request(url.rstrip("/") + path)
+    with urllib.request.urlopen(request, timeout=0.8) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    if not isinstance(body, dict):
+        raise ValueError("Bad worker response")
+    return body
+
+
+def pull_legacy(url: str) -> dict:
     try:
         return {"url": url, "ok": True, "status": fetch_worker(url)}
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
-            return {"url": url, "ok": False, "error": "token"}
+            return {
+                "url": url,
+                "ok": True,
+                "limited": True,
+                "status": {"name": "Mac", "os": "", "ram": {}},
+            }
         return {"url": url, "ok": False, "error": f"http {exc.code}"}
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
         return {"url": url, "ok": False, "error": "no reply"}
+
+
+def pull_worker(url: str) -> dict:
+    try:
+        status = fetch_public(url, "/hello")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return pull_legacy(url)
+        return {"url": url, "ok": False, "error": f"http {exc.code}"}
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
+        return {"url": url, "ok": False, "error": "no reply"}
+    if status.get("app") != "neuroai-mesh":
+        return {"url": url, "ok": False, "error": "not a mesh worker"}
+    return {"url": url, "ok": True, "status": status}
 
 
 def ipv4_prefixes() -> tuple[list[str], set[str]]:
@@ -339,7 +367,7 @@ def probe_host(ip: str) -> dict | None:
 
 
 def remember_peer(item: dict) -> None:
-    if not item.get("ok"):
+    if not item.get("ok") or item.get("limited"):
         return
     status = item.get("status") or {}
     url = str(item.get("url") or "")
@@ -379,7 +407,20 @@ def scan_lan() -> list[dict]:
     if not hosts:
         return []
     with ThreadPoolExecutor(max_workers=48) as pool:
-        return [item for item in pool.map(probe_host, hosts) if item]
+        found = [item for item in pool.map(probe_host, hosts) if item and item.get("ok")]
+    kept: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in found:
+        status = item.get("status") or {}
+        if status.get("os") and not item.get("limited"):
+            key = (str(status.get("name") or ""), str(status.get("os")))
+        else:
+            key = ("url", str(item.get("url") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(item)
+    return kept
 
 
 def discovery_loop() -> None:
@@ -391,8 +432,8 @@ def discovery_loop() -> None:
                 remember_peer(item)
             with _found_lock:
                 _found = found
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"discovery failed: {exc}", flush=True)
         time.sleep(12)
 
 
@@ -518,6 +559,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if self.mode == "work":
+            if path == "/hello":
+                payload = local_status()
+                payload["app"] = "neuroai-mesh"
+                payload["port"] = WORKER_PORT
+                self.send_json(200, payload)
+                return
             if path != "/status":
                 self.send_json(404, {"error": "not found"})
                 return

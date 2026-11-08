@@ -32,33 +32,29 @@ You should see:
 
 ## 2. Add a Mac
 
-The folder name is `neuroai-mesh`. On the Mac the dashboard command is wrong. `mesh.py serve` belongs on Windows.
+On the Mac, once:
 
 ```bash
-cd ~/neuroai-mesh
-git pull
+git clone https://github.com/ori-liloss/neuroai-mesh.git
+cd neuroai-mesh
 bash platforms/start-mac.sh
 ```
 
-Before that, copy `cluster.token` from the Windows folder and put it next to `mesh.py` on the Mac. macOS has no `python` command. The script uses `python3`. If Python is missing: `brew install python`, then run the script again.
+The next time, only `bash platforms/start-mac.sh`. The script updates itself and starts the worker. The Windows page at http://127.0.0.1:8780 finds the machine. There is no file to copy and no address to paste.
 
-If `mesh.py serve` is already running in that terminal, press Ctrl+C, then run the script.
+`mesh.py serve` belongs on Windows. macOS has no `python` command. The script uses `python3`. If Python is missing: `brew install python`, then run the script again.
 
-The Windows page searches the private network and fills the Mac bay when the worker answers. The script prints every address and a token id. That id must match the token id on the Windows page.
-
-If the Mac bay says **Token**, the Mac is running and its `cluster.token` is a different file. Delete the Mac file, copy the Windows `cluster.token` over it, and run the script again. Do not send that file to the internet.
-
-**Waiting** means the page has not found a worker yet. **No reply** means a saved address is not answering.
+If an older worker is still running in that terminal, press Ctrl+C, then run the script.
 
 ## 3. Add a Linux machine
 
-Same folder and the same `cluster.token`.
-
 ```bash
+git clone https://github.com/ori-liloss/neuroai-mesh.git
+cd neuroai-mesh
 bash platforms/start-linux.sh
 ```
 
-Paste the printed `http://IP:8781` into the Linux bay.
+The Windows page at http://127.0.0.1:8780 finds the machine. Nothing to paste.
 
 ## 4. If the bay stays red
 
