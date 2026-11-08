@@ -905,12 +905,16 @@ def drill_round(index: int) -> dict:
     listed = tool_list("agent-logs/drill")
     secret = safe_write("cluster.token", "nope")
     numbered = first_tool("1. LIST workspace")
+    native = native_tool("<tool_call><function=grep><parameter=query>def drill_round</parameter></function></tool_call>")
+    searched = tool_grep("def drill_round")
     ok = (
         wrote.startswith("wrote ")
         and f"round {index}" in read
         and "round.txt" in listed
         and secret.startswith("blocked")
         and numbered == "LIST workspace"
+        and native == "GREP def drill_round"
+        and "agents.py" in searched
     )
     row = {"t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), "round": index, "ok": ok}
     log_path = LOG_DIR / "drill.jsonl"

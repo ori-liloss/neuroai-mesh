@@ -54,9 +54,21 @@ cd neuroai-mesh
 bash platforms/start-linux.sh
 ```
 
-The Windows page at http://127.0.0.1:8780 finds the machine. Nothing to paste.
+The Windows page finds the machine. Nothing to paste.
 
-## 4. If the bay stays red
+## 4. Add a Windows laptop
+
+On the Share page, add the laptop by name. It shows as waiting. On that laptop:
+
+```powershell
+git clone https://github.com/ori-liloss/neuroai-mesh.git
+cd neuroai-mesh
+powershell -File start-worker.ps1
+```
+
+Two laptops can be added the same way, next to the Mac mini. Each one that is actually running the worker checks the agent code on its own processor. The weight update stays on the NVIDIA PC. A saved name does no work until that computer is on the network.
+
+## 5. If the bay stays red
 
 On the Windows machine, in an Administrator PowerShell, allow the worker port on the private network only:
 
@@ -68,7 +80,7 @@ Do not open 8781, or the llama.cpp RPC port 50052, to the public internet. RPC h
 
 ## What a joined computer does
 
-It reports its memory. If `ggml-rpc-server` is installed on the Mac, the script listens on the Mac's LAN address at port 50052 and offers that RAM. The model already loaded on the Windows GPU does not move. The Mac joins the next time that server starts. Training stays on the CUDA machine. One training run is not split across the two computers. The page does not run shell commands on the Mac.
+It reports its memory and checks the agent code on its own processor. The weight update stays on the NVIDIA PC. If `ggml-rpc-server` is installed on the Mac, the script listens on the Mac's LAN address at port 50052 and offers that RAM. The model already loaded on the Windows GPU does not move. The Mac joins the next time that server starts. One training run is not split across the computers. The page does not run shell commands on the Mac.
 
 `bash platforms/build-mac-rpc.sh` builds that listener from llama.cpp commit `c0ab6e5c0`, the same commit as the Windows build in this project. The two builds have to match.
 

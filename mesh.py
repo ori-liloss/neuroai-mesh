@@ -516,19 +516,29 @@ def clip(value: object, limit: int = 80) -> str:
 
 def save_spec(raw: dict) -> dict:
     system = clip(raw.get("os"), 16)
-    if system not in {"mac", "linux"}:
-        raise ValueError("Choose mac or linux")
+    if system not in {"windows", "mac", "linux"}:
+        raise ValueError("Choose windows, mac, or linux")
+    name = clip(raw.get("name"), 40)
+    if not name:
+        raise ValueError("Name the computer")
+    kind = clip(raw.get("kind"), 16)
+    if kind not in {"laptop", "mini", "desktop", "penguin"}:
+        kind = {"windows": "laptop", "mac": "mini", "linux": "penguin"}[system]
     url = clip(raw.get("url"), 200)
     item = {
         "os": system,
-        "name": clip(raw.get("name"), 40) or system,
+        "kind": kind,
+        "name": name,
         "url": clean_url(url) if url else "",
         "cpu": clip(raw.get("cpu")),
         "ram_gb": clip(raw.get("ram_gb"), 16),
         "gpu": clip(raw.get("gpu")),
         "vram_gb": clip(raw.get("vram_gb"), 16),
+        "role": "agent-check",
     }
-    specs = [spec for spec in read_specs() if spec.get("os") != system]
+    specs = [spec for spec in read_specs() if spec.get("name") != name]
+    if len(specs) >= 6:
+        raise ValueError("Six computers are already saved")
     specs.append(item)
     write_specs(specs)
     if item["url"]:
@@ -789,7 +799,7 @@ def mesh_snapshot() -> dict:
         "limits": {
             "remote_shell": False,
             "joint_training": False,
-            "reason": "Extra machines add memory for one inference run through llama.cpp. Training stays on the CUDA machine. This console does not run remote commands.",
+            "reason": "Extra machines check the agent code on their own CPU and can lend memory to one inference run. One training run stays on the NVIDIA PC.",
         },
         "specs": read_specs(),
         "training": training_view(),
@@ -820,6 +830,33 @@ def lan_host() -> str:
     if host.startswith(("10.", "192.168.", "172.")):
         return host
     return ""
+
+
+def ask_check(url: str) -> dict:
+    request = urllib.request.Request(
+        url.rstrip("/") + "/check",
+        data=b'{"rounds":3}',
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 404}:
+            return {"url": url, "ok": False, "error": "That computer is running an older worker. Pull and start it again."}
+        return {"url": url, "ok": False, "error": f"http {exc.code}"}
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+        return {"url": url, "ok": False, "error": "no reply"}
+    if not isinstance(body, dict):
+        return {"url": url, "ok": False, "error": "bad reply"}
+    return {"url": url, "ok": bool(body.get("ok")), "passed": body.get("passed"), "rounds": body.get("rounds"), "host": body.get("host") or ""}
+
+
+def check_helpers() -> dict:
+    with _found_lock:
+        peers = [item for item in _found if item.get("ok") and item.get("url")]
+    return {"checked": [ask_check(str(item["url"])) for item in peers], "training": "unchanged"}
 
 
 def start_rpc() -> dict:
@@ -1118,6 +1155,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.mode == "work":
             # Listening for a shared run does not use the other computer's token.
             # Each machine keeps its own token, and this port stays on the LAN.
+            if path == "/check":
+                body = self.read_json()
+                try:
+                    rounds = int(body.get("rounds") or 3)
+                except (TypeError, ValueError):
+                    rounds = 3
+                rounds = max(1, min(rounds, 5))
+                from agents import drill_round
+
+                passed = 0
+                for index in range(1, rounds + 1):
+                    row = drill_round(index)
+                    passed += 1 if row.get("ok") else 0
+                self.send_json(200, {"ok": passed == rounds, "passed": passed, "rounds": rounds, "host": socket.gethostname()})
+                return
             if path == "/process/stop":
                 body = self.read_json()
                 try:
@@ -1208,6 +1260,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/specs":
                 self.send_json(200, save_spec(self.read_json()))
                 return
+            if path == "/api/helpers/check":
+                self.send_json(200, check_helpers())
+                return
             if path == "/api/nodes":
                 url = clean_url(str(self.read_json().get("url", "")))
                 nodes = read_nodes()
@@ -1261,6 +1316,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not found"})
             return
         query = parse_qs(urlparse(self.path).query)
+        name = (query.get("name") or [""])[0].strip()
+        if name:
+            write_specs([spec for spec in read_specs() if spec.get("name") != name])
+            self.send_json(200, mesh_snapshot())
+            return
         system = (query.get("os") or [""])[0]
         if system in {"mac", "linux"}:
             specs = read_specs()
