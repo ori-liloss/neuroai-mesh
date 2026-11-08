@@ -1317,6 +1317,12 @@ def main() -> None:
 
         code_main(" ".join(sys.argv[2:]).strip())
         return
+    if command == "drill":
+        from agents import drill_main
+
+        rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        drill_main(rounds)
+        return
     if command == "swarm":
         from agents import ensure_workers, seed
 
@@ -1327,7 +1333,7 @@ def main() -> None:
         print("pids " + " ".join(str(pid) for pid in result["pids"]), flush=True)
         return
     if command not in {"serve", "work"}:
-        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py code [TASK] | mesh.py agents [COUNT]")
+        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py code [TASK] | mesh.py agents [COUNT] | mesh.py drill [ROUNDS]")
     serve(command)
 
 

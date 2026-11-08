@@ -848,6 +848,42 @@ def code_main(initial: str = "") -> None:
         sys.stdout.flush()
 
 
+def drill_round(index: int) -> dict:
+    folder = LOG_DIR / "drill"
+    folder.mkdir(parents=True, exist_ok=True)
+    relative = f"agent-logs/drill/round.txt"
+    wrote = safe_write(relative, f"round {index}")
+    read = safe_read(relative)
+    listed = tool_list("agent-logs/drill")
+    secret = safe_write("cluster.token", "nope")
+    numbered = first_tool("1. LIST workspace")
+    ok = (
+        wrote.startswith("wrote ")
+        and f"round {index}" in read
+        and "round.txt" in listed
+        and secret.startswith("blocked")
+        and numbered == "LIST workspace"
+    )
+    row = {"t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), "round": index, "ok": ok}
+    log_path = LOG_DIR / "drill.jsonl"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+    if log_path.stat().st_size > 200000:
+        lines = log_path.read_text(encoding="utf-8").splitlines()[-100:]
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return row
+
+
+def drill_main(rounds: int = 10) -> None:
+    count = max(1, min(int(rounds), 50))
+    passed = 0
+    for index in range(1, count + 1):
+        row = drill_round(index)
+        passed += 1 if row["ok"] else 0
+        print(f"drill {index} {'ok' if row['ok'] else 'fail'}", flush=True)
+    print(f"drill passed {passed} of {count}", flush=True)
+
+
 def terminal(workers: int = 4) -> None:
     seeded = seed()
     started = ensure_workers(workers)
