@@ -18,7 +18,7 @@ On the Windows machine, in this folder:
 python -u mesh.py serve
 ```
 
-Or double-click `start-dashboard.ps1`.
+Or double-click `start-dashboard.cmd`. That starts the page without a PowerShell script.
 
 Open [http://127.0.0.1:8780](http://127.0.0.1:8780).
 
@@ -137,7 +137,7 @@ A hundred copies of the model do not fit on one 12 GB GPU. The queue can hold ma
 | `dashboard.html` | The console |
 | `platforms/start-mac.sh` | Mac worker |
 | `platforms/start-linux.sh` | Linux worker |
-| `start-dashboard.ps1` | Windows dashboard |
+| `start-dashboard.cmd` | Windows dashboard, no PowerShell script |
 | `start-worker.ps1` | Windows worker, for a second Windows PC |
 
 

@@ -834,11 +834,28 @@ def save_model(raw_path: str) -> dict:
     return item
 
 
+def pull_saved_workers() -> list[dict]:
+    rows: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in read_nodes():
+        pulled = pull_worker(str(item.get("url") or ""))
+        status = pulled.get("status") or {}
+        if pulled.get("ok") and status.get("os"):
+            key = (str(status.get("name") or ""), str(status.get("os") or ""))
+        else:
+            key = ("url", str(pulled.get("url") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(pulled)
+    return rows
+
+
 def mesh_snapshot() -> dict:
     local = local_status()
     now = time.time()
     if now - _node_cache["at"] >= 8:
-        _node_cache["rows"] = [pull_worker(item["url"]) for item in read_nodes()]
+        _node_cache["rows"] = pull_saved_workers()
         _node_cache["at"] = now
     nodes = [{"url": "local", "ok": True, "status": local}, *list(_node_cache["rows"])]
     with _found_lock:

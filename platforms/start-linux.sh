@@ -17,7 +17,7 @@ if command -v git >/dev/null 2>&1 && [ -d .git ]; then
 fi
 
 echo "This computer joins the Windows page by itself. Leave that page open."
-lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
 if [ -n "$lan_ip" ]; then
   echo "Address: $lan_ip"
 fi
