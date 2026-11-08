@@ -89,7 +89,7 @@ A Mac still joins with `bash platforms/start-mac.sh` even if its GPU name is mis
 neuro
 ```
 
-`neuro` opens NeuroAI Code from a normal CMD. It uses one local NeuroAI 9B. The worker can list, search, read, write, and run a command inside this repo. Closing the window leaves the workers running.
+`neuro` opens NeuroAI Code from the project folder, or from any folder after the command is on PATH. It uses one local model. The worker can list, search, read, write, run a command in this repo, and read its own saved session. Every finished task is appended on this computer under `agent-logs/`, which git does not upload. Closing the window leaves the workers running.
 
 A hundred copies of the model do not fit on one 12 GB GPU. The queue can hold many tasks. Four of them generate at once.
 

@@ -9,7 +9,7 @@
       --bg: #070b14;
       --panel: #10182a;
       --ink: #f4f1ea;
-      --muted: #a7b0c0;
+      --muted: #d5dbe6;
       --line: rgba(244, 241, 234, 0.14);
       --gold: #e0b15a;
       --ice: #8fd0ff;
@@ -18,6 +18,7 @@
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; background: radial-gradient(1200px 500px at 10% -10%, #1a2744, transparent 50%), var(--bg); color: var(--ink); font-family: "Segoe UI", sans-serif; }
     button, input, textarea { font: inherit; color: inherit; }
+    button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
     button { cursor: pointer; }
     .app { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
     aside { border-right: 1px solid var(--line); padding: 28px 18px; background: rgba(8, 12, 22, 0.72); }
@@ -61,6 +62,7 @@
     .who.on { color: var(--gold); }
     .who i { grid-row: 1 / span 2; }
     .who b, .who span { display: block; grid-column: 2; }
+    .who b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .who span { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 4px; }
     @keyframes glow { 50% { text-shadow: 0 0 22px rgba(240, 200, 75, 0.85); } }
     @keyframes flow { to { stroke-dashoffset: -32; } }

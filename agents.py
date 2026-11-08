@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -185,6 +186,7 @@ def claim(pid: int) -> sqlite3.Row | None:
 def finish(job_id: int, pid: int, result: str = "", error: str = "") -> None:
     now = time.time()
     status = "error" if error else "done"
+    title = ""
     with connect() as db:
         db.execute(
             "UPDATE jobs SET status=?, result=?, error=?, updated=? WHERE id=?",
@@ -194,6 +196,9 @@ def finish(job_id: int, pid: int, result: str = "", error: str = "") -> None:
             "UPDATE workers SET state='idle', job_id=NULL, heartbeat=? WHERE pid=?",
             (now, pid),
         )
+        row = db.execute("SELECT title FROM jobs WHERE id=?", (job_id,)).fetchone()
+        title = str(row["title"]) if row else ""
+    remember(job_id, status, title, error or result)
 
 
 def ask_model(prompt: str, max_tokens: int = 220) -> str:
@@ -370,11 +375,41 @@ TOOL_HELP = (
     "LIST relative/dir\n"
     "GREP text\n"
     "READ relative/path\n"
+    "SESSIONS\n"
     "MKDIR relative/path\n"
     "WRITE relative/path, then the file, then a line ENDWRITE\n"
     "RUN command\n"
     "When the task is done, answer in plain text and do not emit a tool."
 )
+
+
+def remember(job_id: int, status: str, title: str, text: str) -> None:
+    LOG_DIR.mkdir(exist_ok=True)
+    row = {
+        "t": time.strftime("%Y-%m-%d %H:%M", time.localtime()),
+        "id": job_id,
+        "status": status,
+        "title": title[:80],
+        "text": (text or "")[:800],
+    }
+    with (LOG_DIR / "session.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def recent_sessions(limit: int = 6) -> list[str]:
+    path = LOG_DIR / "session.jsonl"
+    if not path.is_file():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rows.append(f"{item.get('t', '')}  {item.get('id', '')}  {item.get('status', '')}  {item.get('title', '')}")
+    return rows[-limit:]
 
 
 def repo_dir(relative: str) -> Path | None:
@@ -449,7 +484,7 @@ def tool_run(command: str) -> str:
 def first_tool(answer: str) -> str:
     for line in answer.splitlines():
         stripped = line.strip()
-        if stripped.startswith(("LIST ", "GREP ", "READ ", "MKDIR ", "RUN ", "WRITE ")):
+        if stripped == "SESSIONS" or stripped.startswith(("LIST ", "GREP ", "READ ", "MKDIR ", "RUN ", "WRITE ", "SESSIONS ")):
             return stripped
     return ""
 
@@ -481,6 +516,8 @@ def run_agent(prompt: str) -> str:
             result = "\n".join(made) or "mkdir"
         elif tool.startswith("RUN "):
             result = tool_run(tool[4:])
+        elif tool == "SESSIONS" or tool.startswith("SESSIONS"):
+            result = "\n".join(recent_sessions(8)) or "no saved session yet"
         else:
             return answer[:4000]
         logs.append(tool + " -> " + (result.splitlines()[0] if result else "empty")[:140])
@@ -676,47 +713,69 @@ def wait_job(job_id: int, timeout: int = 180) -> str:
     return "The model did not answer in time."
 
 
+BRAIN = (
+    ("   .-~^~-.  ", "  (  .  .  ) ", "   `-._.-'  "),
+    ("   .-~^~-.  ", "  ( .    . ) ", "   `-._.-'  "),
+    ("   .-~^~-.  ", "  (  .  .  ) ", "    `-.-'   "),
+    ("   .-^~^-.  ", "  ( .    . ) ", "   `-._.-'  "),
+)
+
+
 def code_screen(snap: dict, typed: str, note: str) -> str:
-    orange = "\x1b[38;5;208m"
+    pink = "\x1b[38;2;255;92;146m"
+    soft = "\x1b[38;2;255;176;198m"
     reset = "\x1b[0m"
     workers = snap["workers"]
     counts = snap["counts"]
     generating = sum(1 for item in workers if item["state"] == "generating")
-    width = 78
+    width = max(78, min(shutil.get_terminal_size(fallback=(100, 30)).columns, 100))
     inner = width - 2
 
-    def row(text: str) -> str:
-        return orange + "│" + reset + fit(text, inner) + orange + "│" + reset
+    def row(text: str, color: str = "") -> str:
+        body = fit(text, inner)
+        if color:
+            body = color + body + reset
+        return pink + "│" + reset + body + pink + "│" + reset
 
-    jobs = list(reversed(snap["jobs"][:8]))
+    brain = BRAIN[int(time.time() * 3) % len(BRAIN)]
+    saved = recent_sessions(4)
+    left = ["", *brain, "", "NeuroAI Code"]
+    right = ["saved on this PC"] + (saved or ["nothing saved yet"])
+    while len(right) < len(left):
+        right.append("")
     lines = [
-        orange + "┌" + "─" * inner + "┐" + reset,
-        row("  NeuroAI Code"),
-        orange + "├" + "─" * inner + "┤" + reset,
-        row("  neuro opens this window. Tools: LIST GREP READ WRITE RUN."),
-        row(f"  free {snap.get('free_mib', 0)} MB   ·   127.0.0.1:8080"),
-        orange + "├" + "─" * inner + "┤" + reset,
+        pink + "┌" + "─" * inner + "┐" + reset,
+        row("  NeuroAI Code", soft),
+        pink + "├" + "─" * inner + "┤" + reset,
+    ]
+    half = 34
+    for index, part in enumerate(left):
+        other = right[index] if index < len(right) else ""
+        lines.append(row(fit(part.center(half), half) + "  " + other, soft if index and index < 4 else ""))
+    lines.append(pink + "├" + "─" * inner + "┤" + reset)
+    lines.append(
         row(
             f"  agents {len(workers)}   generating {generating}   "
-            f"queued {counts.get('queued', 0)}   done {counts.get('done', 0)}"
-        ),
-    ]
+            f"queued {counts.get('queued', 0)}   done {counts.get('done', 0)}   "
+            f"free {snap.get('free_mib', 0)} MB"
+        )
+    )
+    lines.append(row("  LIST  GREP  READ  WRITE  RUN  SESSIONS"))
+    jobs = list(reversed(snap["jobs"][:6]))
     if not jobs:
         lines.append(row("  waiting for a task"))
     for job in jobs:
         lines.append(row(f"  {job['id']:>3}  {str(job['status']):<8} {job['title']}"))
     if note:
-        lines.append(orange + "├" + "─" * inner + "┤" + reset)
+        lines.append(pink + "├" + "─" * inner + "┤" + reset)
         text = " ".join(note.split())
-        while text:
-            lines.append(row("  " + text[: inner - 4]))
+        while text and len(lines) < 22:
+            lines.append(row("  " + text[: inner - 4], soft))
             text = text[inner - 4 :]
-            if len(lines) > 18:
-                break
-    lines.append(orange + "├" + "─" * inner + "┤" + reset)
-    lines.append(row("  > " + typed))
-    lines.append(row("  exit closes this window. the workers keep running."))
-    lines.append(orange + "└" + "─" * inner + "┘" + reset)
+    lines.append(pink + "├" + "─" * inner + "┤" + reset)
+    lines.append(row("  > " + typed, soft))
+    lines.append(row("  exit closes this window. tasks stay in the local session."))
+    lines.append(pink + "└" + "─" * inner + "┘" + reset)
     return "\x1b[H\x1b[J" + "\n".join(lines) + "\n"
 
 
