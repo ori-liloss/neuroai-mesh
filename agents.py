@@ -365,48 +365,127 @@ def apply_actions(answer: str) -> list[str]:
     return logs
 
 
-def wants_files(prompt: str) -> bool:
-    text = prompt.lower()
-    if any(phrase in text for phrase in ("do not create", "don't create", "do not write", "no files")):
-        return False
-    return any(word in text for word in ("create", "folder", "game", "snake", "write", "file", "תיקי"))
+TOOL_HELP = (
+    "You are NeuroAI Code in this repo. Use one tool, then wait for the result.\n"
+    "LIST relative/dir\n"
+    "GREP text\n"
+    "READ relative/path\n"
+    "MKDIR relative/path\n"
+    "WRITE relative/path, then the file, then a line ENDWRITE\n"
+    "RUN command\n"
+    "When the task is done, answer in plain text and do not emit a tool."
+)
+
+
+def repo_dir(relative: str) -> Path | None:
+    raw = relative.strip().replace("\\", "/").lstrip("/")
+    path = ROOT if not raw else (ROOT / raw).resolve()
+    root = ROOT.resolve()
+    if path != root and root not in path.parents:
+        return None
+    if ".." in raw.split("/"):
+        return None
+    return path if path.is_dir() else None
+
+
+def tool_list(relative: str) -> str:
+    path = repo_dir(relative)
+    if path is None:
+        return "missing"
+    names = []
+    for child in sorted(path.iterdir()):
+        if child.name in {"cluster.token", ".env", ".env.local", "token.txt"}:
+            continue
+        names.append(child.name + ("/" if child.is_dir() else ""))
+        if len(names) >= 40:
+            break
+    return "\n".join(names) or "empty"
+
+
+def tool_grep(needle: str) -> str:
+    needle = needle.strip()
+    if not needle or len(needle) > 80:
+        return "need a short search"
+    hits = []
+    skip = {"agent-logs", "__pycache__", ".git"}
+    secret = {"cluster.token", ".env", ".env.local", "token.txt"}
+    for path in ROOT.rglob("*"):
+        if not path.is_file() or path.name in secret or any(part in skip for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            if needle not in line:
+                continue
+            hits.append(f"{path.relative_to(ROOT).as_posix()}:{number}: {line.strip()[:160]}")
+            if len(hits) >= 20:
+                return "\n".join(hits)
+    return "\n".join(hits) or "no matches"
+
+
+def tool_run(command: str) -> str:
+    text = command.strip()
+    lowered = text.lower()
+    blocked = ("cluster.token", "token.txt", ".env", "shutdown", "format ", "rm -rf", "del /s", "reg delete", "cipher ")
+    if not text or ".." in text or any(item in lowered for item in blocked):
+        return "blocked"
+    try:
+        completed = subprocess.run(
+            text,
+            cwd=str(ROOT),
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    out = ((completed.stdout or "") + (completed.stderr or "")).strip()
+    return (out or f"exit {completed.returncode}")[:4000]
+
+
+def first_tool(answer: str) -> str:
+    for line in answer.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("LIST ", "GREP ", "READ ", "MKDIR ", "RUN ", "WRITE ")):
+            return stripped
+    return ""
 
 
 def run_agent(prompt: str) -> str:
-    if wants_files(prompt):
-        snake = "snake" in prompt.lower()
-        order = "Create the files with WRITE and ENDWRITE."
-        if snake:
-            order += " For a snake game use WRITE workspace/snake/index.html and a complete single html file."
-        answer = ask_model(order + "\n\nTask:\n" + prompt, max_tokens=1400)
-        logs = apply_actions(answer)
-        if snake and not any(item.startswith("wrote ") for item in logs):
-            answer = ask_model(
-                "Output only WRITE workspace/snake/index.html, then the html, then ENDWRITE.",
-                max_tokens=1400,
-            )
-            logs = apply_actions(answer)
-        if snake and not any(item.startswith("wrote ") for item in logs):
-            logs.append(safe_write("workspace/snake/index.html", SNAKE_HTML))
-            logs.append("The model did not emit a file. The worker wrote the game.")
-        return "\n".join(logs) or answer[:500]
-    parts = [prompt, workspace_note()]
-    seen = set(files_named_in(prompt))
-    for relative in seen:
-        parts.append(f"File {relative}:\n{safe_read(relative)}")
-    context = "\n\n".join(parts)
-    for _ in range(2):
-        answer = ask_model(context)
-        read_path = ""
-        for line in answer.splitlines():
-            if line.startswith("READ "):
-                read_path = line[5:].strip()
-                break
-        if not read_path or read_path in seen:
-            return answer
-        seen.add(read_path)
-        context += f"\n\nFile {read_path}:\n{safe_read(read_path)}\n\nAnswer the task from the file."
-    return ask_model(context)
+    context = TOOL_HELP + "\n\nTask:\n" + prompt + "\n\n" + workspace_note()
+    logs: list[str] = []
+    for _ in range(4):
+        answer = ask_model(context, max_tokens=1400)
+        tool = first_tool(answer)
+        if not tool:
+            if "snake" in prompt.lower() and not any(item.startswith("wrote ") for item in logs):
+                logs.append(safe_write("workspace/snake/index.html", SNAKE_HTML))
+            return "\n".join([*logs, answer]).strip()[:4000]
+        if tool.startswith("WRITE "):
+            wrote = apply_actions(answer)
+            logs.extend(wrote)
+            context += "\n\nTool result:\n" + "\n".join(wrote)
+            continue
+        if tool.startswith("LIST "):
+            result = tool_list(tool[5:])
+        elif tool.startswith("GREP "):
+            result = tool_grep(tool[5:])
+        elif tool.startswith("READ "):
+            result = safe_read(tool[5:])
+        elif tool.startswith("MKDIR "):
+            made = apply_actions(tool)
+            logs.extend(made)
+            result = "\n".join(made) or "mkdir"
+        elif tool.startswith("RUN "):
+            result = tool_run(tool[4:])
+        else:
+            return answer[:4000]
+        logs.append(tool + " -> " + (result.splitlines()[0] if result else "empty")[:140])
+        context += "\n\nTool result:\n" + result[:3000]
+    return "\n".join(logs)[:4000]
 
 
 def worker_main() -> None:
@@ -614,7 +693,7 @@ def code_screen(snap: dict, typed: str, note: str) -> str:
         orange + "┌" + "─" * inner + "┐" + reset,
         row("  NeuroAI Code"),
         orange + "├" + "─" * inner + "┤" + reset,
-        row("  One local model. Four can answer at once when memory allows."),
+        row("  neuro opens this window. Tools: LIST GREP READ WRITE RUN."),
         row(f"  free {snap.get('free_mib', 0)} MB   ·   127.0.0.1:8080"),
         orange + "├" + "─" * inner + "┤" + reset,
         row(

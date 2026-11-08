@@ -41,4 +41,30 @@ if [ -n "$lan_ip" ]; then
   echo "Default route: $lan_ip"
 fi
 
+rpc=""
+for candidate in /opt/homebrew/bin/ggml-rpc-server "$HOME/llama.cpp/build/bin/ggml-rpc-server" "$HOME/llama.cpp/build/bin/rpc-server"; do
+  if [ -x "$candidate" ]; then
+    rpc=$candidate
+    break
+  fi
+done
+if [ -z "$rpc" ]; then
+  found=$(command -v ggml-rpc-server 2>/dev/null || true)
+  if [ -n "$found" ] && [ -x "$found" ]; then
+    rpc=$found
+  fi
+fi
+if [ -n "$rpc" ] && [ -n "$lan_ip" ]; then
+  if "$PY" -c "import socket,sys; s=socket.socket(); s.settimeout(0.4); r=s.connect_ex(('$lan_ip', 50052)); s.close(); sys.exit(0 if r==0 else 1)"; then
+    echo "Mac memory is already waiting on ${lan_ip}:50052."
+  else
+    "$rpc" --host "$lan_ip" --port 50052 >/tmp/neuroai-rpc.log 2>&1 &
+    echo "Mac memory is waiting on ${lan_ip}:50052."
+    echo "The model already loaded on Windows stays there. This Mac joins the next start."
+  fi
+else
+  echo "This Mac's RAM is visible on the Windows page."
+  echo "ggml-rpc-server is not installed here, so the running model cannot place weights on this Mac yet."
+fi
+
 exec "$PY" -u mesh.py work

@@ -68,9 +68,7 @@ Do not open 8781, or the llama.cpp RPC port 50052, to the public internet. RPC h
 
 ## What a joined computer does
 
-It reports its memory and can later hold part of one inference run. Training stays on the CUDA machine. The page does not run shell commands on the Mac or the Linux machine, and it does not train one adapter across Metal and CUDA.
-
-Weight split starts only after the chat server stops, because one GPU cannot serve chat and lend its memory at the same time.
+It reports its memory. If `ggml-rpc-server` is installed on the Mac, the script listens on the Mac's LAN address at port 50052 and offers that RAM. The model already loaded on the Windows GPU does not move. The Mac joins the next time that server starts. Training stays on the CUDA machine. The page does not run shell commands on the Mac.
 
 ## The page
 
@@ -88,10 +86,10 @@ A Mac still joins with `bash platforms/start-mac.sh` even if its GPU name is mis
 ## Agents, in CMD only
 
 ```powershell
-python -u mesh.py code
+neuro
 ```
 
-That window is NeuroAI Code. It uses one local NeuroAI 9B. Four workers answer at once. If a task names a file in this repo, the worker reads that file before it asks the model. Closing the window leaves the workers running.
+`neuro` opens NeuroAI Code from a normal CMD. It uses one local NeuroAI 9B. The worker can list, search, read, write, and run a command inside this repo. Closing the window leaves the workers running.
 
 A hundred copies of the model do not fit on one 12 GB GPU. The queue can hold many tasks. Four of them generate at once.
 

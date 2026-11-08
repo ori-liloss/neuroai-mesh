@@ -112,6 +112,7 @@
             <h2 id="pick-name">–</h2>
             <p class="figure" id="pick-temp">–°</p>
             <p class="muted" id="pick-meta">–</p>
+            <p class="muted" id="pool">–</p>
             <div class="bar"><i id="pick-bar"></i></div>
             <div id="pick-hogs"></div>
             <button class="quiet" id="stop-agents" type="button">Stop agents on this PC</button>
@@ -356,6 +357,13 @@ function paint() {
   text("pick-name", current ? current.name : "–");
   text("pick-k", list.length + " connected");
   text("map-foot", list.length < 2 ? "1 computer · the next one appears when it joins" : list.length + " computers · link live");
+  const offered = list.slice(1).map((item) => {
+    const ram = (item.status && item.status.ram) || {};
+    const free = ram.free_mib ? gb(ram.free_mib) + " GB free" : "RAM seen";
+    const waiting = item.status && item.status.rpc_listening ? " RPC is waiting for the next model start." : " Not inside the running model yet.";
+    return item.name + " offers " + free + "." + waiting;
+  });
+  text("pool", "The loaded model stays on this PC. " + (offered.join(" ") || "No other computer is connected."));
   const gpu = (((current && current.status && current.status.gpus) || [])[0]) || {};
   const temp = gpu.temperature_c ?? (current && current.status.temperature_c);
   const ram = (current && current.status && current.status.ram) || {};

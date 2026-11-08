@@ -704,6 +704,18 @@ def mesh_snapshot() -> dict:
     }
 
 
+def lan_host() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.168.7.1", 9))
+            host = sock.getsockname()[0]
+    except OSError:
+        return ""
+    if host.startswith(("10.", "192.168.", "172.")):
+        return host
+    return ""
+
+
 def start_rpc() -> dict:
     status = local_status()
     if status["chat_server"]:
@@ -713,8 +725,11 @@ def start_rpc() -> dict:
     binary = status["rpc_binary"]
     if not binary:
         raise RuntimeError("ggml-rpc-server was not found on this machine.")
+    host = lan_host()
+    if not host:
+        raise RuntimeError("RPC stays off. This machine has no private LAN address.")
     process = subprocess.Popen(
-        [binary, "--host", "0.0.0.0", "--port", str(RPC_PORT)],
+        [binary, "--host", host, "--port", str(RPC_PORT)],
         cwd=str(Path(binary).parent),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -878,12 +893,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"id": enqueue(title or prompt[:40], prompt)})
                 return
             if path == "/api/agents/swarm":
-                from agents import seed, spawn
+                from agents import ensure_workers, seed
 
                 body = self.read_json()
                 requested = int(body.get("count", 4) or 4)
                 seeded = seed()
-                self.send_json(200, {"seeded": seeded, **spawn(requested)})
+                self.send_json(200, {"seeded": seeded, **ensure_workers(requested)})
                 return
             if path == "/api/models":
                 body = self.read_json()
