@@ -1,4 +1,4 @@
-# NeuroAI Mesh 1.0
+# Neuro Mesh 1.0
 
 A local console for one Windows GPU machine plus Mac and Linux workers. The dashboard stays on the Windows machine. Chat goes to a llama.cpp server you start yourself. This repository does not contain model weights.
 
