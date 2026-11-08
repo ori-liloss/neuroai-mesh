@@ -56,6 +56,12 @@
     .bar i { display: block; height: 100%; width: 0; background: var(--cyan); transition: width 0.5s ease; }
     .stage { display: grid; grid-template-columns: minmax(0, 1fr); }
     .cluster { padding: 18px 22px 22px; display: grid; gap: 16px; align-content: start; }
+    .use { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .use article { border: 1px solid var(--line); background: var(--panel); padding: 12px 12px 10px; }
+    .use .n { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; color: var(--cyan); }
+    .use p, .legend { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
+    .use code, .legend code { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+    .legend { margin: 0; }
     .spine { display: flex; align-items: center; gap: 0; height: 28px; }
     .dot { width: 10px; height: 10px; border-radius: 99px; background: #3a4450; flex: none; }
     .dot.on { background: var(--cyan); }
@@ -165,7 +171,7 @@
     }
     @media (max-width: 680px) {
       .top, .sheet, .fields, .ori-facts { grid-template-columns: 1fr; }
-      .rack { grid-template-columns: 1fr; }
+      .use, .rack { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -190,6 +196,13 @@
   </header>
   <div class="stage">
     <section class="cluster">
+      <div class="use">
+        <article><div class="n">01 HOST</div><p>This Windows PC holds NeuroAI. Keep this page open.</p></article>
+        <article><div class="n">02 COPY</div><p>Copy the neuro-cluster folder to the other computer, including cluster.token.</p></article>
+        <article><div class="n">03 RUN</div><p>Mac or Linux, inside that folder: <code>bash platforms/start-mac.sh</code> or <code>bash platforms/start-linux.sh</code></p></article>
+        <article><div class="n">04 PASTE</div><p>Paste the printed <code>http://IP:8781</code> into that bay, with the CPU, RAM, and GPU.</p></article>
+      </div>
+      <p class="legend"><span class="on">Live</span> means the machine answered. <span class="wait">Waiting</span> means no address yet. <span class="down">No reply</span> means the worker is down or TCP 8781 is blocked on the private network.</p>
       <div class="spine" aria-hidden="true">
         <span class="dot on" id="dot-ori"></span>
         <span class="wire" id="wire-mac"></span>
@@ -320,7 +333,7 @@
     </section>
     <aside class="talk">
       <h2>Chat</h2>
-      <p class="hint">NeuroAI on the RTX 4070. Thinking is off so the answer gets the tokens.</p>
+      <p class="hint">NeuroAI stays loaded on the GPU. The card works while a reply is generating. Thinking is off so the answer gets the tokens.</p>
       <div id="log"></div>
       <form id="say">
         <textarea id="message" placeholder="Message NeuroAI"></textarea>
