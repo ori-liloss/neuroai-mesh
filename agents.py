@@ -456,6 +456,49 @@ def clean_tool_line(line: str) -> str:
     return text.lstrip(".) ").strip()
 
 
+def native_tool(answer: str) -> str:
+    # Qwen3.5 emits one <tool_call> block and nothing after it.
+    if "<function=" not in answer:
+        return ""
+    name = answer.split("<function=", 1)[1].split(">", 1)[0].strip().lower()
+    names = {
+        "list": "LIST",
+        "list_dir": "LIST",
+        "read": "READ",
+        "read_file": "READ",
+        "grep": "GREP",
+        "search": "GREP",
+        "write": "WRITE",
+        "write_file": "WRITE",
+        "mkdir": "MKDIR",
+        "run": "RUN",
+        "shell": "RUN",
+        "sessions": "SESSIONS",
+    }
+    command = names.get(name, "")
+    if not command:
+        return ""
+    if command == "SESSIONS":
+        return "SESSIONS"
+    rest = answer.split("<function=", 1)[1]
+    path = ""
+    body = ""
+    while "<parameter=" in rest:
+        rest = rest.split("<parameter=", 1)[1]
+        key, _, rest = rest.partition(">")
+        value, _, rest = rest.partition("</parameter>")
+        key = key.strip().lower()
+        if key in {"path", "file", "dir", "directory", "command", "cmd", "query", "text"} and not path:
+            path = value.strip().splitlines()[0].strip()
+        elif key in {"content", "contents", "body"}:
+            body = value.strip("\n")
+    if command == "WRITE":
+        return "WRITE " + (tool_path(path) or "blocked") + "\n" + body + "\nENDWRITE"
+    if not path:
+        return ""
+    return command + " " + path
+
+
 def first_tool(answer: str) -> str:
     for line in answer.splitlines():
         stripped = clean_tool_line(line)
@@ -472,13 +515,14 @@ def run_agent(prompt: str) -> str:
         if last:
             context += "\n\nLast result:\n" + last
         answer = visible_answer(ask_model(context, max_tokens=1000))
-        tool = first_tool(answer)
+        native = native_tool(answer)
+        tool = first_tool(answer) or (native.splitlines()[0] if native else "")
         if tool:
             print("tool " + tool.splitlines()[0][:120], flush=True)
         if not tool:
             return "\n".join([*logs, answer]).strip()[:4000]
         if tool.startswith("WRITE "):
-            wrote = apply_actions(answer)
+            wrote = apply_actions(native or answer)
             logs.extend(wrote)
             last = "\n".join(wrote)[:1800]
             continue

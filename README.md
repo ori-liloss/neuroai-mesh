@@ -40,7 +40,7 @@ cd neuroai-mesh
 bash platforms/start-mac.sh
 ```
 
-The next time, only `bash platforms/start-mac.sh`. The script updates itself and starts the worker. The Windows page at http://127.0.0.1:8780 finds the machine. There is no file to copy and no address to paste.
+The next time, only `bash platforms/start-mac.sh`. The script updates itself and starts the worker. The Windows page finds the machine. On the Mac, do not open 127.0.0.1. That address is the Mac itself. Open the Windows address shown on the Share page, which looks like http://192.168.7.14:8780. There is no file to copy and no address to paste into the worker.
 
 `mesh.py serve` belongs on Windows. macOS has no `python` command. The script uses `python3`. If Python is missing: `brew install python`, then run the script again.
 

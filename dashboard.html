@@ -171,6 +171,7 @@
           <div class="k">SHARE</div>
           <h2>Who holds the run</h2>
           <p class="muted">Each computer shows what it is doing. A joined computer holds part of the next run only after it is listening. One training run stays on the NVIDIA PC.</p>
+          <p class="muted" id="lan-open"></p>
           <div id="share-list"></div>
           <button class="go" id="share-run" type="button">Ask the other computers to listen</button>
           <button class="quiet" id="stop-model" type="button">Stop the loaded model</button>
@@ -490,6 +491,7 @@ function paint() {
   const ram = (current && current.status && current.status.ram) || {};
   const total = ram.total_mib || 0;
   const used = Math.max(0, total - (ram.free_mib || 0));
+  text("lan-open", mesh.lan ? "On the Mac, open " + mesh.lan + ". The address 127.0.0.1 on the Mac is the Mac itself, not this PC." : "");
   text("doing", current ? doing(current, picked) : "–");
   text("pick-temp", (temp == null || temp === "" ? "–" : temp) + "°");
   text("pick-meta", current ? memoryLine(current.status) + " · " + (gpu.name || (current.url === "local" ? "this PC" : current.url)) : "–");

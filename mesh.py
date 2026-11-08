@@ -794,6 +794,7 @@ def mesh_snapshot() -> dict:
         "specs": read_specs(),
         "training": training_view(),
         "models": known_models(),
+        "lan": ("http://" + lan_host() + ":" + str(DASHBOARD_PORT)) if lan_host() else "",
         "share": {
             "model_on_this_pc": bool(local.get("chat_server")),
             "training": "this PC only",
@@ -1282,8 +1283,10 @@ class Handler(BaseHTTPRequestHandler):
 def serve(mode: str) -> None:
     Handler.mode = mode
     if mode == "serve":
-        server = ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), Handler)
+        server = ThreadingHTTPServer(("0.0.0.0", DASHBOARD_PORT), Handler)
         print(f"Neuro dashboard http://127.0.0.1:{DASHBOARD_PORT}", flush=True)
+        if lan_host():
+            print(f"On the Mac open http://{lan_host()}:{DASHBOARD_PORT}", flush=True)
         print(f"token id {token_id()}", flush=True)
         start_discovery()
     else:
