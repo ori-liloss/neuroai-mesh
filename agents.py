@@ -354,18 +354,23 @@ def apply_actions(answer: str) -> list[str]:
     while index < len(lines):
         line = lines[index].strip()
         if line.startswith("MKDIR "):
-            raw = line[6:].strip().replace("\\", "/").lstrip("/")
+            raw = tool_path(line[6:])
             if raw and ".." not in raw.split("/") and raw not in {"cluster.token", ".env", ".env.local"}:
                 (ROOT / raw).mkdir(parents=True, exist_ok=True)
                 logs.append("mkdir " + raw)
+            else:
+                logs.append("blocked path")
         elif line.startswith("WRITE "):
-            raw = line[6:].strip()
+            raw = tool_path(line[6:])
             index += 1
             body = []
             while index < len(lines) and lines[index].strip() != "ENDWRITE":
                 body.append(lines[index])
                 index += 1
-            logs.append(safe_write(raw, "\n".join(body)))
+            if not raw:
+                logs.append("blocked path")
+            else:
+                logs.append(safe_write(raw, "\n".join(body)))
         index += 1
     return logs
 
@@ -377,7 +382,9 @@ TOOL_HELP = (
     "READ relative/path\n"
     "SESSIONS\n"
     "MKDIR relative/path\n"
-    "WRITE relative/path, then the file, then a line ENDWRITE\n"
+    "WRITE relative/path\n"
+    "the file contents\n"
+    "ENDWRITE\n"
     "RUN command\n"
     "When the task is done, answer in plain text and do not emit a tool."
 )
@@ -410,6 +417,14 @@ def recent_sessions(limit: int = 6) -> list[str]:
             continue
         rows.append(f"{item.get('t', '')}  {item.get('id', '')}  {item.get('status', '')}  {item.get('title', '')}")
     return rows[-limit:]
+
+
+def tool_path(text: str) -> str:
+    token = text.strip().split(" ", 1)[0] if text.strip() else ""
+    token = token.strip("`'\",").replace("\\", "/").lstrip("/")
+    if not token or any(mark in token for mark in (",", " ", "..")):
+        return ""
+    return token
 
 
 def repo_dir(relative: str) -> Path | None:
@@ -495,6 +510,8 @@ def run_agent(prompt: str) -> str:
     for _ in range(4):
         answer = ask_model(context, max_tokens=1400)
         tool = first_tool(answer)
+        if tool:
+            print("tool " + tool.splitlines()[0][:120], flush=True)
         if not tool:
             if "snake" in prompt.lower() and not any(item.startswith("wrote ") for item in logs):
                 logs.append(safe_write("workspace/snake/index.html", SNAKE_HTML))

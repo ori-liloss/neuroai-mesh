@@ -361,7 +361,7 @@ def training_view() -> dict:
         "history": list(reversed(history)),
         "served": served,
         "active_adapter": active,
-        "reason": "The GPU is serving the loaded model, so a second training run cannot use it at the same time. The dataset files are unchanged.",
+        "reason": "Training stays on this NVIDIA PC. A joined computer can hold part of the served model only after chat is stopped and that computer is listening on its own LAN address. One training run is not split across the machines. The dataset files are unchanged.",
         "datasets": dataset_index(),
     }
     _training_cache["at"] = now
@@ -701,6 +701,18 @@ def mesh_snapshot() -> dict:
         "specs": read_specs(),
         "training": training_view(),
         "models": known_models(),
+        "share": {
+            "model_on_this_pc": bool(local.get("chat_server")),
+            "training": "this PC only",
+            "peers": [
+                {
+                    "name": (item.get("status") or {}).get("name") or "",
+                    "listening": bool((item.get("status") or {}).get("rpc_listening")),
+                }
+                for item in found
+                if item.get("ok")
+            ],
+        },
     }
 
 

@@ -68,7 +68,9 @@ Do not open 8781, or the llama.cpp RPC port 50052, to the public internet. RPC h
 
 ## What a joined computer does
 
-It reports its memory. If `ggml-rpc-server` is installed on the Mac, the script listens on the Mac's LAN address at port 50052 and offers that RAM. The model already loaded on the Windows GPU does not move. The Mac joins the next time that server starts. Training stays on the CUDA machine. The page does not run shell commands on the Mac.
+It reports its memory. If `ggml-rpc-server` is installed on the Mac, the script listens on the Mac's LAN address at port 50052 and offers that RAM. The model already loaded on the Windows GPU does not move. The Mac joins the next time that server starts. Training stays on the CUDA machine. One training run is not split across the two computers. The page does not run shell commands on the Mac.
+
+`bash platforms/build-mac-rpc.sh` builds that listener from llama.cpp commit `c0ab6e5c0`, the same commit as the Windows build in this project. The two builds have to match.
 
 ## The page
 

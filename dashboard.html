@@ -377,13 +377,17 @@ function paint() {
   text("pick-name", current ? current.name : "–");
   text("pick-k", list.length + " connected");
   text("map-foot", list.length < 2 ? "1 computer · the next one appears when it joins" : list.length + " computers · link live");
-  const offered = list.slice(1).map((item) => {
-    const ram = (item.status && item.status.ram) || {};
-    const free = ram.free_mib ? gb(ram.free_mib) + " GB free" : "RAM seen";
-    const waiting = item.status && item.status.rpc_listening ? " RPC is waiting for the next model start." : " Not inside the running model yet.";
-    return item.name + " offers " + free + "." + waiting;
-  });
-  text("pool", "The loaded model stays on this PC. " + (offered.join(" ") || "No other computer is connected."));
+  const share = mesh.share || {};
+  const peers = share.peers || list.slice(1).map((item) => ({ name: item.name, listening: Boolean(item.status && item.status.rpc_listening) }));
+  const listening = peers.filter((item) => item.listening).map((item) => item.name);
+  const names = peers.map((item) => item.name).filter(Boolean);
+  let pool = "Training stays on this PC. ";
+  if (share.model_on_this_pc === false) pool += "Chat is not running. ";
+  else pool += "The model is on this PC. ";
+  if (listening.length) pool += listening.join(", ") + " can hold part of the next run.";
+  else if (names.length) pool += names.join(", ") + " joined, but is not listening for model memory yet.";
+  else pool += "No other computer is connected.";
+  text("pool", pool);
   const home = list[0] && list[0].status;
   text("g-model", home && home.chat_server ? "Model on this PC" : "Model is off");
   text("g-model-sub", home && home.chat_server ? "Chat is using this computer." : "Nothing is serving chat.");
