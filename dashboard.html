@@ -128,8 +128,11 @@
             <p class="muted" id="pool">–</p>
             <div class="bar"><i id="pick-bar"></i></div>
             <div id="pick-hogs"></div>
-            <button class="quiet" id="stop-agents" type="button">Stop agents on this PC</button>
+            <button class="go" id="share-run" type="button">Share the next run</button>
+            <button class="quiet" id="stop-model" type="button">Stop the loaded model</button>
+            <button class="quiet" id="stop-agents" type="button">Stop code workers</button>
             <p class="muted" id="stop-note"></p>
+            <p class="muted">A shop PlayStation or Xbox cannot share this run. Another computer joins by running the worker.</p>
           </article>
         </div>
       </section>
@@ -193,7 +196,7 @@ function lines(id, rows, empty) {
     const row = document.createElement("div");
     row.className = "row";
     const name = document.createElement("span");
-    name.textContent = item.name;
+    name.textContent = item.role === "model" ? item.name + " · holding the model" : item.name;
     const size = document.createElement("b");
     size.textContent = (item.mb != null ? item.mb + " MB" : "");
     row.append(name, size);
@@ -435,7 +438,26 @@ document.querySelectorAll("nav button").forEach((button) => { button.onclick = (
 document.getElementById("stop-agents").onclick = async () => {
   const response = await fetch("/api/agents/stop", { method: "POST" });
   const body = await response.json();
-  document.getElementById("stop-note").textContent = "Stopped " + ((body.stopped || []).length) + " agent workers.";
+  document.getElementById("stop-note").textContent = "Stopped " + ((body.stopped || []).length) + " code workers. The model is still loaded.";
+};
+document.getElementById("stop-model").onclick = async () => {
+  const response = await fetch("/api/model/stop", { method: "POST" });
+  const body = await response.json();
+  document.getElementById("stop-note").textContent = body.note || "Could not stop the model.";
+  refresh();
+};
+document.getElementById("share-run").onclick = async () => {
+  const response = await fetch("/api/share/offer", { method: "POST" });
+  const body = await response.json();
+  const peers = body.peers || [];
+  const ready = peers.filter((item) => item.ok).map((item) => item.name);
+  const blocked = peers.filter((item) => !item.ok);
+  let note = body.note || "";
+  if (!peers.length) note = "No other computer is connected. " + note;
+  else if (ready.length) note = ready.join(", ") + " is listening. " + note;
+  else note = blocked.map((item) => item.name + (item.detail ? ": " + item.detail : "")).join(" ") + " " + note;
+  document.getElementById("stop-note").textContent = note;
+  refresh();
 };
 document.getElementById("add-model").onsubmit = async (event) => {
   event.preventDefault();

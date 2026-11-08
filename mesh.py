@@ -780,6 +780,53 @@ def ask_local(message: str) -> dict:
     }
 
 
+def offer_share() -> dict:
+    local = local_status()
+    with _found_lock:
+        peers = [item for item in _found if item.get("ok") and item.get("url")]
+    results = []
+    for item in peers:
+        url = str(item["url"]).rstrip("/")
+        name = str((item.get("status") or {}).get("name") or url)
+        request = urllib.request.Request(
+            url + "/rpc/start",
+            data=b"{}",
+            method="POST",
+            headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            listening = bool(body.get("started") or body.get("already"))
+            results.append({"name": name, "ok": listening, "detail": "listening" if listening else "answered"})
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:180]
+            if "token" in detail.lower():
+                detail = "That computer is running an older worker. Pull and start it again."
+            results.append({"name": name, "ok": False, "detail": detail})
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+            results.append({"name": name, "ok": False, "detail": str(exc)[:180]})
+    return {
+        "moved": False,
+        "model_on_this_pc": bool(local.get("chat_server")),
+        "peers": results,
+        "note": "The loaded model stays on this PC. A computer that is listening joins the next start. Splitting a model that already fits this GPU makes the run slower.",
+    }
+
+
+def stop_model() -> dict:
+    if os.name == "nt":
+        done = subprocess.run(["taskkill", "/IM", "llama-server.exe", "/F"], capture_output=True, text=True)
+        stopped = done.returncode == 0
+    else:
+        done = subprocess.run(["pkill", "-x", "llama-server"], capture_output=True, text=True)
+        stopped = done.returncode == 0
+    return {
+        "stopped": stopped,
+        "note": "Stopped the loaded model on this PC. Code workers and other programs were left running.",
+    }
+
+
 def stop_rpc() -> dict:
     if not PID_PATH.exists():
         return {"stopped": False}
@@ -877,18 +924,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if self.mode == "work":
-            if not authorized(self.headers.get("Authorization")):
-                self.send_json(401, {"error": "token"})
-                return
-            try:
-                if path == "/rpc/start":
-                    self.send_json(200, start_rpc())
-                    return
-                if path == "/rpc/stop":
+            # Listening for a shared run does not use the other computer's token.
+            # Each machine keeps its own token, and this port stays on the LAN.
+            if path in {"/rpc/start", "/rpc/stop"}:
+                try:
+                    if path == "/rpc/start":
+                        self.send_json(200, start_rpc())
+                        return
                     self.send_json(200, stop_rpc())
                     return
-            except RuntimeError as exc:
-                self.send_json(409, {"error": str(exc)})
+                except RuntimeError as exc:
+                    self.send_json(409, {"error": str(exc)})
+                    return
+            if not authorized(self.headers.get("Authorization")):
+                self.send_json(401, {"error": "token"})
                 return
             self.send_json(404, {"error": "not found"})
             return
@@ -934,6 +983,12 @@ class Handler(BaseHTTPRequestHandler):
                 from agents import stop_workers
 
                 self.send_json(200, stop_workers())
+                return
+            if path == "/api/model/stop":
+                self.send_json(200, stop_model())
+                return
+            if path == "/api/share/offer":
+                self.send_json(200, offer_share())
                 return
             if path == "/api/chat":
                 message = str(self.read_json(64000).get("message", "")).strip()
