@@ -1,0 +1,515 @@
+"""Neuro Mesh: one dashboard for Windows, Linux, and Mac workers.
+
+Workers report memory and can start the local llama.cpp RPC server.
+They do not accept shell commands.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import hmac
+import json
+import os
+import platform
+import shutil
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+ROOT = Path(__file__).resolve().parent
+TOKEN_PATH = ROOT / "cluster.token"
+NODES_PATH = ROOT / "nodes.json"
+SPECS_PATH = ROOT / "specs.json"
+PID_PATH = ROOT / "rpc.pid"
+DASHBOARD = ROOT / "dashboard.html"
+RPC_PORT = 50052
+DASHBOARD_PORT = 8780
+WORKER_PORT = 8781
+
+
+def token() -> str:
+    if not TOKEN_PATH.exists():
+        TOKEN_PATH.write_text(os.urandom(24).hex(), encoding="utf-8")
+    return TOKEN_PATH.read_text(encoding="utf-8").strip()
+
+
+def authorized(header: str | None) -> bool:
+    expected = "Bearer " + token()
+    got = header or ""
+    return hmac.compare_digest(got, expected)
+
+
+def ram_mib() -> dict:
+    if os.name == "nt":
+        class Status(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = Status()
+        status.dwLength = ctypes.sizeof(Status)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        return {
+            "total_mib": int(status.ullTotalPhys // (1024 * 1024)),
+            "free_mib": int(status.ullAvailPhys // (1024 * 1024)),
+        }
+    page = os.sysconf("SC_PAGE_SIZE")
+    total = os.sysconf("SC_PHYS_PAGES") * page // (1024 * 1024)
+    free = os.sysconf("SC_AVPHYS_PAGES") * page // (1024 * 1024)
+    return {"total_mib": int(total), "free_mib": int(free)}
+
+
+def nvidia() -> list[dict]:
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.used,memory.total,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=8,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    cards = []
+    for line in out.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 4:
+            continue
+        cards.append(
+            {
+                "name": parts[0],
+                "memory_used_mib": int(float(parts[1])),
+                "memory_total_mib": int(float(parts[2])),
+                "temperature_c": int(float(parts[3])),
+            }
+        )
+    return cards
+
+
+def process_running(image: str) -> bool:
+    try:
+        if os.name == "nt":
+            out = subprocess.check_output(
+                ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
+                text=True,
+                timeout=8,
+                stderr=subprocess.DEVNULL,
+            )
+            return image.lower() in out.lower()
+        out = subprocess.check_output(["ps", "-ax", "-o", "comm="], text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return image in out
+
+
+def port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), 0.4):
+            return True
+    except OSError:
+        return False
+
+
+def rpc_binary() -> str | None:
+    override = os.environ.get("NEURO_RPC_BIN", "").strip()
+    if override and Path(override).exists():
+        return override
+    names = ["ggml-rpc-server.exe", "ggml-rpc-server"]
+    candidates = [
+        Path(r"D:\liliai\tools\llama-cpp-cuda\ggml-rpc-server.exe"),
+        ROOT / "ggml-rpc-server.exe",
+        ROOT / "ggml-rpc-server",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def local_status() -> dict:
+    cards = nvidia()
+    binary = rpc_binary()
+    chat = process_running("llama-server.exe") or process_running("llama-server")
+    return {
+        "name": socket.gethostname(),
+        "os": platform.system().lower(),
+        "machine": platform.machine(),
+        "ram": ram_mib(),
+        "gpus": cards,
+        "chat_server": chat,
+        "rpc_binary": binary,
+        "rpc_listening": port_open(RPC_PORT),
+        "temperature_c": cards[0]["temperature_c"] if cards else None,
+    }
+
+
+def read_nodes() -> list[dict]:
+    if not NODES_PATH.exists():
+        return []
+    try:
+        data = json.loads(NODES_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict) and item.get("url")]
+
+
+def write_nodes(nodes: list[dict]) -> None:
+    NODES_PATH.write_text(json.dumps(nodes, indent=2), encoding="utf-8")
+
+
+def read_specs() -> list[dict]:
+    if not SPECS_PATH.exists():
+        return []
+    try:
+        data = json.loads(SPECS_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def write_specs(specs: list[dict]) -> None:
+    SPECS_PATH.write_text(json.dumps(specs, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clip(value: object, limit: int = 80) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def save_spec(raw: dict) -> dict:
+    system = clip(raw.get("os"), 16)
+    if system not in {"mac", "linux"}:
+        raise ValueError("Choose mac or linux")
+    url = clip(raw.get("url"), 200)
+    item = {
+        "os": system,
+        "name": clip(raw.get("name"), 40) or system,
+        "url": clean_url(url) if url else "",
+        "cpu": clip(raw.get("cpu")),
+        "ram_gb": clip(raw.get("ram_gb"), 16),
+        "gpu": clip(raw.get("gpu")),
+        "vram_gb": clip(raw.get("vram_gb"), 16),
+    }
+    specs = [spec for spec in read_specs() if spec.get("os") != system]
+    specs.append(item)
+    write_specs(specs)
+    if item["url"]:
+        nodes = read_nodes()
+        if not any(node["url"] == item["url"] for node in nodes):
+            nodes.append({"url": item["url"]})
+            write_nodes(nodes)
+    return item
+
+
+def clean_url(value: str) -> str:
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
+        raise ValueError("Address must look like http://192.168.7.20:8781")
+    return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+
+
+def fetch_worker(url: str) -> dict:
+    request = urllib.request.Request(
+        url.rstrip("/") + "/status",
+        headers={"Authorization": "Bearer " + token()},
+    )
+    with urllib.request.urlopen(request, timeout=0.8) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    if not isinstance(body, dict):
+        raise ValueError("Bad worker response")
+    return body
+
+
+def mesh_snapshot() -> dict:
+    local = local_status()
+    nodes = [{"url": "local", "ok": True, "status": local}]
+    for item in read_nodes():
+        url = item["url"]
+        try:
+            nodes.append({"url": url, "ok": True, "status": fetch_worker(url)})
+        except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as exc:
+            nodes.append({"url": url, "ok": False, "error": str(exc)})
+    return {
+        "nodes": nodes,
+        "rpc_port": RPC_PORT,
+        "chat": "http://127.0.0.1:8080/v1",
+        "limits": {
+            "remote_shell": False,
+            "joint_training": False,
+            "reason": "Extra machines add memory for one inference run through llama.cpp. Training stays on the CUDA machine. This console does not run remote commands.",
+        },
+        "specs": read_specs(),
+    }
+
+
+def start_rpc() -> dict:
+    status = local_status()
+    if status["chat_server"]:
+        raise RuntimeError("The GPU is serving NeuroAI. Stop the chat server before splitting weights.")
+    if status["rpc_listening"]:
+        return {"started": False, "already": True, "port": RPC_PORT}
+    binary = status["rpc_binary"]
+    if not binary:
+        raise RuntimeError("ggml-rpc-server was not found on this machine.")
+    process = subprocess.Popen(
+        [binary, "--host", "0.0.0.0", "--port", str(RPC_PORT)],
+        cwd=str(Path(binary).parent),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    PID_PATH.write_text(str(process.pid), encoding="utf-8")
+    return {"started": True, "pid": process.pid, "port": RPC_PORT}
+
+
+def ask_local(message: str) -> dict:
+    payload = json.dumps(
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are NeuroAI 1.0, running locally on this machine. Answer in the user's language. Be direct and concrete.",
+                },
+                {"role": "user", "content": message},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 2048,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "http://127.0.0.1:8080/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=180) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    choice = body["choices"][0]["message"]
+    return {
+        "reply": choice.get("content") or "",
+        "reasoning": choice.get("reasoning_content") or "",
+        "tokens": body.get("usage") or {},
+    }
+
+
+def stop_rpc() -> dict:
+    if not PID_PATH.exists():
+        return {"stopped": False}
+    pid_text = PID_PATH.read_text(encoding="utf-8").strip()
+    PID_PATH.unlink(missing_ok=True)
+    if not pid_text.isdigit():
+        return {"stopped": False}
+    pid = int(pid_text)
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            return {"stopped": False}
+    return {"stopped": True, "pid": pid}
+
+
+class Handler(BaseHTTPRequestHandler):
+    mode = "serve"
+
+    def log_message(self, fmt: str, *args) -> None:
+        return
+
+    def send_json(self, code: int, payload: dict) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def read_json(self, limit: int = 10000) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0 or length > limit:
+            return {}
+        body = self.rfile.read(length)
+        data = json.loads(body.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if self.mode == "work":
+            if path != "/status":
+                self.send_json(404, {"error": "not found"})
+                return
+            if not authorized(self.headers.get("Authorization")):
+                self.send_json(401, {"error": "token"})
+                return
+            self.send_json(200, local_status())
+            return
+        if path in {"/", "/dashboard"}:
+            raw = DASHBOARD.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        if path == "/api/mesh":
+            self.send_json(200, mesh_snapshot())
+            return
+        if path == "/api/token":
+            self.send_json(200, {"token": token()})
+            return
+        if path.startswith("/platforms/"):
+            name = Path(path).name
+            if name not in {"start-mac.sh", "start-linux.sh"}:
+                self.send_json(404, {"error": "not found"})
+                return
+            raw = (ROOT / "platforms" / name).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        self.send_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if self.mode == "work":
+            if not authorized(self.headers.get("Authorization")):
+                self.send_json(401, {"error": "token"})
+                return
+            try:
+                if path == "/rpc/start":
+                    self.send_json(200, start_rpc())
+                    return
+                if path == "/rpc/stop":
+                    self.send_json(200, stop_rpc())
+                    return
+            except RuntimeError as exc:
+                self.send_json(409, {"error": str(exc)})
+                return
+            self.send_json(404, {"error": "not found"})
+            return
+        try:
+            if path == "/api/chat":
+                message = str(self.read_json(64000).get("message", "")).strip()
+                if not message:
+                    self.send_json(400, {"error": "Missing message"})
+                    return
+                self.send_json(200, ask_local(message))
+                return
+            if path == "/api/specs":
+                self.send_json(200, save_spec(self.read_json()))
+                return
+            if path == "/api/nodes":
+                url = clean_url(str(self.read_json().get("url", "")))
+                nodes = read_nodes()
+                if not any(item["url"] == url for item in nodes):
+                    nodes.append({"url": url})
+                    write_nodes(nodes)
+                self.send_json(200, mesh_snapshot())
+                return
+            if path == "/api/local/rpc/start":
+                self.send_json(200, start_rpc())
+                return
+            if path == "/api/local/rpc/stop":
+                self.send_json(200, stop_rpc())
+                return
+            if path.startswith("/api/remote/"):
+                nodes = {item["url"]: item for item in read_nodes()}
+                target = self.headers.get("X-Node-Url", "")
+                if target not in nodes:
+                    self.send_json(404, {"error": "Machine is not in the cluster"})
+                    return
+                action = path.rsplit("/", 1)[-1]
+                if action not in {"start", "stop"}:
+                    self.send_json(404, {"error": "not found"})
+                    return
+                request = urllib.request.Request(
+                    target.rstrip("/") + f"/rpc/{action}",
+                    data=b"{}",
+                    method="POST",
+                    headers={
+                        "Authorization": "Bearer " + token(),
+                        "Content-Type": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                self.send_json(200, payload if isinstance(payload, dict) else {"ok": True})
+                return
+        except RuntimeError as exc:
+            self.send_json(409, {"error": str(exc)})
+            return
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+            return
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            self.send_json(502, {"error": str(exc)})
+            return
+        self.send_json(404, {"error": "not found"})
+
+    def do_DELETE(self) -> None:
+        if self.mode != "serve":
+            self.send_json(404, {"error": "not found"})
+            return
+        query = parse_qs(urlparse(self.path).query)
+        system = (query.get("os") or [""])[0]
+        if system in {"mac", "linux"}:
+            specs = read_specs()
+            gone = {spec.get("url") for spec in specs if spec.get("os") == system and spec.get("url")}
+            write_specs([spec for spec in specs if spec.get("os") != system])
+            if gone:
+                write_nodes([item for item in read_nodes() if item.get("url") not in gone])
+            self.send_json(200, mesh_snapshot())
+            return
+        url = (query.get("url") or [""])[0]
+        try:
+            url = clean_url(url)
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+            return
+        write_nodes([item for item in read_nodes() if item["url"] != url])
+        self.send_json(200, mesh_snapshot())
+
+
+def serve(mode: str) -> None:
+    Handler.mode = mode
+    if mode == "serve":
+        server = ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), Handler)
+        print(f"Neuro Mesh dashboard http://127.0.0.1:{DASHBOARD_PORT}", flush=True)
+    else:
+        server = ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), Handler)
+        print(f"Neuro Mesh worker on port {WORKER_PORT}", flush=True)
+    token()
+    server.serve_forever()
+
+
+def main() -> None:
+    command = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    if command not in {"serve", "work"}:
+        raise SystemExit("use: mesh.py serve | mesh.py work")
+    serve(command)
+
+
+if __name__ == "__main__":
+    main()
