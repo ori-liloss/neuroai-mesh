@@ -72,17 +72,25 @@ It reports its memory and can later hold part of one inference run. Training sta
 
 Weight split starts only after the chat server stops, because one GPU cannot serve chat and lend its memory at the same time.
 
-## Agents, in CMD only
+## The page
 
-The website does not start agents and does not show this guide. On the Windows PC, in this folder:
+Open http://127.0.0.1:8780. It has three views:
+
+- **Machines** shows each computer, its temperature when the machine reports one, and the programs using the most memory. Stop agents frees the agent workers on this PC. It does not stop the model, and it does not close programs on the Mac.
+- **Try** is the chat. That is the served NeuroAI 9B.
+- **Training** shows the stopped run: step, loss, and why it is not running. The page does not resume it. The saved adapter does not load onto the 9B. Use Try to talk to the model that is actually loaded.
+
+A Mac still joins with `bash platforms/start-mac.sh` even if its GPU name is missing. The bay stays live. The chip name appears after that script is started again.
+
+## Agents, in CMD only
 
 ```powershell
 python -u mesh.py code
 ```
 
-That window is NeuroAI Code. It uses the one local NeuroAI 9B. Four workers generate at once. A task can ask to read a file in this repo. Closing the window leaves the workers running. `python -u mesh.py agents` is the status board, and Ctrl+C there stops the workers.
+That window is NeuroAI Code. It uses one local NeuroAI 9B. Four workers answer at once. If a task names a file in this repo, the worker reads that file before it asks the model. Closing the window leaves the workers running.
 
-A hundred copies of the model do not fit on one 12 GB GPU, so the command does not open a hundred processes. The queue can hold many tasks. Four of them generate at once.
+A hundred copies of the model do not fit on one 12 GB GPU. The queue can hold many tasks. Four of them generate at once.
 
 ## Files
 

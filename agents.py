@@ -201,7 +201,7 @@ def ask_model(prompt: str) -> str:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are NeuroAI Code, a local agent using one NeuroAI 9B. Be concrete and under 90 words. If you need one repo file, reply with only READ relative/path. Do not invent shell commands.",
+                    "content": "You are NeuroAI Code, running on this computer. Files from the repo are included below when they were read for you. Answer from those files. Under 80 words. If you still need one more file, the whole reply is READ relative/path. Do not say you lack access. Do not invent shell commands.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -235,10 +235,37 @@ def safe_read(relative: str) -> str:
     return path.read_text(encoding="utf-8", errors="replace")[:6000]
 
 
+def workspace_note() -> str:
+    names = []
+    for path in sorted(ROOT.iterdir()):
+        if path.name.startswith(".") or path.name in {"cluster.token", "agents.db", "nodes.json", "specs.json"}:
+            continue
+        names.append(path.name + ("/" if path.is_dir() else ""))
+    return "Repo files: " + ", ".join(names[:24])
+
+
+def files_named_in(prompt: str) -> list[str]:
+    found = []
+    for path in ROOT.rglob("*"):
+        if not path.is_file() or path.name in {"cluster.token", ".env", ".env.local", "token.txt"}:
+            continue
+        if "agent-logs" in path.parts or "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(ROOT).as_posix()
+        if relative in prompt or path.name in prompt:
+            found.append(relative)
+        if len(found) >= 2:
+            break
+    return found
+
+
 def run_agent(prompt: str) -> str:
-    context = prompt
-    seen: set[str] = set()
-    for _ in range(3):
+    parts = [prompt, workspace_note()]
+    seen = set(files_named_in(prompt))
+    for relative in seen:
+        parts.append(f"File {relative}:\n{safe_read(relative)}")
+    context = "\n\n".join(parts)
+    for _ in range(2):
         answer = ask_model(context)
         read_path = ""
         for line in answer.splitlines():
@@ -248,11 +275,7 @@ def run_agent(prompt: str) -> str:
         if not read_path or read_path in seen:
             return answer
         seen.add(read_path)
-        body = safe_read(read_path)
-        context = (
-            prompt
-            + f"\n\nFile {read_path}:\n{body}\n\nAnswer the task now. Do not request another READ."
-        )
+        context += f"\n\nFile {read_path}:\n{safe_read(read_path)}\n\nAnswer the task from the file."
     return ask_model(context)
 
 
@@ -437,32 +460,98 @@ def wait_job(job_id: int, timeout: int = 180) -> str:
     return "The model did not answer in time."
 
 
+def code_screen(snap: dict, typed: str, note: str) -> None:
+    orange = "\x1b[38;5;208m"
+    dim = "\x1b[38;5;245m"
+    reset = "\x1b[0m"
+    workers = snap["workers"]
+    counts = snap["counts"]
+    generating = sum(1 for item in workers if item["state"] == "generating")
+    width = 76
+    inner = width - 2
+
+    def row(text: str) -> str:
+        return orange + "│" + reset + fit(text, inner) + orange + "│" + reset
+
+    jobs = list(reversed(snap["jobs"][:4]))
+    lines = [
+        orange + "┌" + "─" * inner + "┐" + reset,
+        row("  NeuroAI Code"),
+        orange + "├" + "─" * 34 + "┬" + "─" * (inner - 35) + "┤" + reset,
+        row("  Welcome back." + " " * 20 + "One shared model"),
+        row("  NeuroAI 9B" + " " * 23 + "Four answers at once"),
+        row("  local  127.0.0.1:8080" + " " * 14 + "A task can read a repo file"),
+        row("  " + str(Path.home())[:32] + " " * 4 + "The model stays loaded once"),
+        orange + "├" + "─" * inner + "┤" + reset,
+        row(
+            f"  agents {len(workers)}   generating {generating}   "
+            f"queued {counts.get('queued', 0)}   done {counts.get('done', 0)}"
+        ),
+    ]
+    if not jobs:
+        lines.append(row("  waiting for a task"))
+    for job in jobs:
+        lines.append(row(f"  {job['id']:>3}  {str(job['status']):<8} {job['title']}"))
+    if note:
+        lines.append(row("  " + note))
+    lines.append(orange + "├" + "─" * inner + "┤" + reset)
+    lines.append(row("  > " + typed))
+    lines.append(row("  auto mode on  ·  one NeuroAI 9B  ·  exit closes this window only"))
+    lines.append(orange + "└" + "─" * inner + "┘" + reset)
+    sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
 def code_main(initial: str = "") -> None:
-    started = ensure_workers(4)
-    print("NeuroAI Code", flush=True)
-    print("Welcome back. One local NeuroAI 9B.", flush=True)
-    print("NeuroAI 9B  ·  local  ·  http://127.0.0.1:8080/v1", flush=True)
-    print(f"4 generate at once on one model. workers already up: {started.get('already', 0)}", flush=True)
-    print("Type a task. This window does not stop the other windows.", flush=True)
-
-    def once(text: str) -> None:
-        job_id = enqueue(text[:70], text)
-        print(f"\n> {text}\nqueued {job_id}", flush=True)
-        print(wait_job(job_id), flush=True)
-
-    if initial:
-        once(initial)
-    while True:
-        try:
-            text = input("\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nwindow closed. the workers keep running.", flush=True)
-            return
-        if text in {"exit", "quit"}:
-            print("window closed. the workers keep running.", flush=True)
-            return
-        if text:
-            once(text)
+    ensure_workers(4)
+    typed = ""
+    note = ""
+    pending = enqueue(initial[:70], initial) if initial else None
+    if os.name == "nt":
+        import msvcrt
+    else:
+        msvcrt = None
+    try:
+        while True:
+            snap = snapshot()
+            if pending:
+                row = job_row(pending)
+                if row and row["status"] in {"done", "error"}:
+                    note = str(row["result"] or row["error"] or "")[:70]
+                    pending = None
+            code_screen(snap, typed, note)
+            if msvcrt is None:
+                text = input("> ").strip()
+                if text in {"exit", "quit"}:
+                    break
+                if text:
+                    pending = enqueue(text[:70], text)
+                    note = ""
+                continue
+            time.sleep(0.25)
+            if not msvcrt.kbhit():
+                continue
+            char = msvcrt.getwch()
+            if char in {"\x03"}:
+                break
+            if char in {"\r", "\n"}:
+                text = typed.strip()
+                typed = ""
+                if text in {"exit", "quit"}:
+                    break
+                if text:
+                    pending = enqueue(text[:70], text)
+                    note = ""
+                continue
+            if char in {"\x08", "\x7f"}:
+                typed = typed[:-1]
+                continue
+            if char >= " ":
+                typed += char
+    except KeyboardInterrupt:
+        pass
+    sys.stdout.write("\x1b[0m\nwindow closed. the workers keep running.\n")
+    sys.stdout.flush()
 
 
 def terminal(workers: int = 4) -> None:

@@ -258,6 +258,94 @@ def rpc_binary() -> str | None:
     return None
 
 
+def heavy_processes() -> list[dict]:
+    rows: list[dict] = []
+    try:
+        if os.name == "nt":
+            out = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, timeout=8, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                parts = [part.strip().strip('"') for part in line.split('","')]
+                if len(parts) < 5:
+                    continue
+                name = parts[0].strip('"')
+                mem = parts[-1].replace(",", "").replace(" K", "").replace(" ", "")
+                if not mem.isdigit():
+                    continue
+                mb = int(mem) // 1024
+                if mb < 80:
+                    continue
+                role = "other"
+                lowered = name.lower()
+                if lowered.startswith("llama-server"):
+                    role = "model"
+                elif lowered.startswith("python"):
+                    role = "python"
+                rows.append({"name": name, "mb": mb, "role": role})
+        else:
+            out = subprocess.check_output(["ps", "-axo", "rss=,comm="], text=True, timeout=4)
+            for line in out.splitlines():
+                bits = line.strip().split(None, 1)
+                if len(bits) < 2 or not bits[0].isdigit():
+                    continue
+                mb = int(bits[0]) // 1024
+                if mb < 80:
+                    continue
+                name = bits[1].replace("\\", "/").split("/")[-1][:40]
+                rows.append({"name": name, "mb": mb, "role": "other"})
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    rows.sort(key=lambda item: item["mb"], reverse=True)
+    return rows[:6]
+
+
+_training_cache: dict = {"at": 0.0, "view": None}
+
+
+def training_view() -> dict:
+    now = time.time()
+    cached = _training_cache.get("view")
+    if cached and now - float(_training_cache.get("at") or 0) < 60:
+        return cached
+    data_root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data"))
+    versions_path = data_root / "versions.json"
+    active = ""
+    served = "NeuroAI 9B"
+    if versions_path.is_file():
+        try:
+            versions = json.loads(versions_path.read_text(encoding="utf-8"))
+            active = str(versions.get("activePeft") or "")
+        except (OSError, json.JSONDecodeError):
+            active = ""
+    state_path = data_root / "training" / "runs" / "neuro-ai-long-v1" / "checkpoint-6933" / "trainer_state.json"
+    step = 0
+    max_steps = 0
+    loss = None
+    if state_path.is_file():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            step = int(state.get("global_step") or 0)
+            max_steps = int(state.get("max_steps") or 0)
+            for row in reversed(state.get("log_history") or []):
+                if isinstance(row, dict) and row.get("loss") is not None:
+                    loss = round(float(row["loss"]), 4)
+                    break
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            step = 0
+    view = {
+        "running": False,
+        "run": "neuro-ai-long-v1",
+        "step": step,
+        "max_steps": max_steps,
+        "loss": loss,
+        "served": served,
+        "active_adapter": active,
+        "reason": "Training is stopped. The GPU is serving chat, and this page does not resume the old run. The saved adapter belongs to the older base, so it is not loaded onto the 9B.",
+    }
+    _training_cache["at"] = now
+    _training_cache["view"] = view
+    return view
+
+
 def local_status() -> dict:
     cards = machine_cards()
     binary = rpc_binary()
@@ -268,6 +356,7 @@ def local_status() -> dict:
         "machine": platform.machine(),
         "ram": ram_mib(),
         "gpus": cards,
+        "heavy": heavy_processes(),
         "chat_server": chat,
         "rpc_binary": binary,
         "rpc_listening": port_open(RPC_PORT),
@@ -529,6 +618,7 @@ def mesh_snapshot() -> dict:
             "reason": "Extra machines add memory for one inference run through llama.cpp. Training stays on the CUDA machine. This console does not run remote commands.",
         },
         "specs": read_specs(),
+        "training": training_view(),
     }
 
 
