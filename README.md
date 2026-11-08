@@ -32,15 +32,19 @@ You should see:
 
 ## 2. Add a Mac
 
-Copy this whole folder onto the Mac, including `cluster.token` beside `mesh.py`.
-
-On the Mac, inside the folder:
+The folder name is `neuroai-mesh`. On the Mac the dashboard command is wrong. `mesh.py serve` belongs on Windows.
 
 ```bash
+cd ~/neuroai-mesh
+git pull
 bash platforms/start-mac.sh
 ```
 
-The script prints an address like `http://192.168.1.20:8781`. On the Windows page, open the Mac bay and paste that address. Fill in the Mac's name, CPU, RAM, and GPU, then choose **Save bay**.
+Before that, copy `cluster.token` from the Windows folder and put it next to `mesh.py` on the Mac. macOS has no `python` command. The script uses `python3`. If Python is missing: `brew install python`, then run the script again.
+
+If `mesh.py serve` is already running in that terminal, press Ctrl+C, then run the script.
+
+The script prints `http://THE-MAC-IP:8781`. Paste that into the Mac bay on the Windows page, with the Mac's name, CPU, RAM, and GPU.
 
 The bay turns **Live** only when the Mac answers. **Waiting** means you have not saved an address. **No reply** means the script is not running, or Windows is blocking TCP 8781.
 
@@ -70,23 +74,15 @@ It reports its memory and can later hold part of one inference run. Training sta
 
 Weight split starts only after the chat server stops, because one GPU cannot serve chat and lend its memory at the same time.
 
-## Agents from CMD
+## Agents, in CMD only
 
-The model stays in one llama-server. Agents are extra Python processes. They share that model. Four can generate at the same time, because the server has four slots. More workers wait in line. A hundred model copies do not fit on one 12 GB GPU.
-
-One worker in this window:
+The website does not start agents. On the Windows PC, in this folder:
 
 ```powershell
-python -u mesh.py agent
+python -u mesh.py agents
 ```
 
-A detached pool, visible in Task Manager as `python.exe`:
-
-```powershell
-python -u mesh.py swarm 8
-```
-
-`swarm 100` starts only as many processes as free RAM allows, and never more than 24. The queue can hold as many tasks as you add. The page has **Start 8** and **Stop** next to the chat.
+That window is the agent console. It shares the one local model. Four workers generate at once. Ctrl+C stops them. A hundred copies of the model do not fit on one 12 GB GPU, so the command does not open a hundred processes.
 
 ## Files
 

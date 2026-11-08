@@ -129,10 +129,6 @@
     .fact { border-top: 1px solid var(--line); padding-top: 8px; }
     .fact span { display: block; color: var(--muted); font-size: 12px; }
     .fact b { font-family: var(--mono); font-weight: 550; }
-    .agents { border-bottom: 1px solid var(--line); }
-    .agents .plate-top, .agents .hint { padding: 12px 16px 0; }
-    #agent-jobs { margin: 8px 16px; padding-left: 18px; color: var(--muted); font-size: 12px; max-height: 150px; overflow: auto; }
-    #agent-jobs b { color: var(--ink); font-weight: 650; }
     .talk {
       min-height: 520px;
       display: grid;
@@ -203,7 +199,7 @@
       <div class="use">
         <article><div class="n">01 HOST</div><p>This Windows PC holds NeuroAI. Keep this page open.</p></article>
         <article><div class="n">02 COPY</div><p>Copy the neuro-cluster folder to the other computer, including cluster.token.</p></article>
-        <article><div class="n">03 RUN</div><p>Mac or Linux, inside that folder: <code>bash platforms/start-mac.sh</code> or <code>bash platforms/start-linux.sh</code></p></article>
+        <article><div class="n">03 RUN</div><p>On the Mac, do not run <code>mesh.py serve</code>. Inside the folder: <code>bash platforms/start-mac.sh</code></p></article>
         <article><div class="n">04 PASTE</div><p>Paste the printed <code>http://IP:8781</code> into that bay, with the CPU, RAM, and GPU.</p></article>
       </div>
       <p class="legend"><span class="on">Live</span> means the machine answered. <span class="wait">Waiting</span> means no address yet. <span class="down">No reply</span> means the worker is down or TCP 8781 is blocked on the private network.</p>
@@ -336,16 +332,6 @@
       </section>
     </section>
     <aside class="talk">
-      <div class="agents">
-        <div class="plate-top"><span>CMD AGENTS</span><span id="agent-count">0 workers</span></div>
-        <p class="hint" id="agent-line">One NeuroAI model. Four workers can generate at once.</p>
-        <p class="hint">The list is notes from the local model. The commands in the steps above are the ones to run.</p>
-        <div class="row" style="padding: 0 16px 8px">
-          <button class="go" id="agent-start" type="button">Start 8</button>
-          <button class="quiet" id="agent-stop" type="button">Stop</button>
-        </div>
-        <ol id="agent-jobs"></ol>
-      </div>
       <h2>Chat</h2>
       <p class="hint">NeuroAI stays loaded on the GPU. The card works while a reply is generating. Thinking is off so the answer gets the tokens.</p>
       <div id="log"></div>
@@ -525,39 +511,8 @@ document.getElementById("say").onsubmit = async (event) => {
   document.getElementById("send").disabled = false;
 };
 
-function esc(value) {
-  return String(value || "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[ch]));
-}
-
-async function paintAgents() {
-  const data = await (await fetch("/api/agents")).json();
-  const workers = data.workers || [];
-  const generating = workers.filter((item) => item.state === "generating").length;
-  document.getElementById("agent-count").textContent = workers.length + " workers";
-  document.getElementById("agent-line").textContent =
-    generating + " generating · " + (data.counts?.queued || 0) + " waiting · " +
-    (data.counts?.done || 0) + " done · " + data.slots + " GPU slots";
-  document.getElementById("agent-jobs").innerHTML = (data.jobs || []).map((job) =>
-    `<li><b>${esc(job.title)}</b> ${esc(job.status)}${job.result ? " — " + esc(String(job.result).slice(0, 90)) : ""}</li>`
-  ).join("");
-}
-
-document.getElementById("agent-start").onclick = async () => {
-  await fetch("/api/agents/swarm", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({count: 8}),
-  });
-  paintAgents();
-};
-document.getElementById("agent-stop").onclick = async () => {
-  await fetch("/api/agents/stop", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
-  paintAgents();
-};
-
 refresh();
-paintAgents();
-setInterval(() => { refresh(); paintAgents(); }, 4000);
+setInterval(refresh, 4000);
 </script>
 </body>
 </html>

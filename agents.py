@@ -60,8 +60,28 @@ def connect() -> sqlite3.Connection:
 
 def free_mib() -> int:
     if os.name != "nt":
-        page = os.sysconf("SC_PAGE_SIZE")
-        return int(os.sysconf("SC_AVPHYS_PAGES") * page // (1024 * 1024))
+        if sys.platform == "darwin":
+            try:
+                out = subprocess.check_output(["vm_stat"], text=True, timeout=3)
+            except (OSError, subprocess.SubprocessError):
+                return 0
+            page = 4096
+            pages = 0
+            for line in out.splitlines():
+                if "page size of" in line:
+                    for word in line.replace("(", " ").replace(")", " ").split():
+                        if word.isdigit():
+                            page = int(word)
+                if line.startswith("Pages free"):
+                    number = line.split(":")[-1].strip().strip(".")
+                    if number.isdigit():
+                        pages += int(number)
+            return pages * page // (1024 * 1024)
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+            return int(os.sysconf("SC_AVPHYS_PAGES") * page // (1024 * 1024))
+        except (ValueError, OSError, AttributeError):
+            return 0
 
     class Status(ctypes.Structure):
         _fields_ = [
@@ -305,3 +325,32 @@ def snapshot() -> dict:
         "jobs": jobs,
         "free_mib": free_mib(),
     }
+
+
+def terminal(workers: int = 4) -> None:
+    seeded = seed()
+    started = spawn(workers)
+    print("NEUROAI AGENTS", flush=True)
+    print("This window is the agent console. The website stays a cluster dashboard.", flush=True)
+    print(
+        f"started {started['started']} of {started['requested']}  slots {SLOTS}  seeded {seeded}",
+        flush=True,
+    )
+    print("Ctrl+C stops these workers.", flush=True)
+    try:
+        while True:
+            snap = snapshot()
+            counts = snap["counts"]
+            generating = sum(1 for item in snap["workers"] if item["state"] == "generating")
+            print(
+                f"workers {len(snap['workers'])}  generating {generating}  "
+                f"queued {counts.get('queued', 0)}  done {counts.get('done', 0)}",
+                flush=True,
+            )
+            for job in reversed(snap["jobs"][:8]):
+                print(f"  {job['id']:>3}  {str(job['status']):<10}  {job['title']}", flush=True)
+            print("", flush=True)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("stopping workers", flush=True)
+        stop_workers()

@@ -66,10 +66,41 @@ def ram_mib() -> dict:
             "total_mib": int(status.ullTotalPhys // (1024 * 1024)),
             "free_mib": int(status.ullAvailPhys // (1024 * 1024)),
         }
-    page = os.sysconf("SC_PAGE_SIZE")
-    total = os.sysconf("SC_PHYS_PAGES") * page // (1024 * 1024)
-    free = os.sysconf("SC_AVPHYS_PAGES") * page // (1024 * 1024)
-    return {"total_mib": int(total), "free_mib": int(free)}
+    if sys.platform == "darwin":
+        return darwin_ram()
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+        total = os.sysconf("SC_PHYS_PAGES") * page // (1024 * 1024)
+        free = os.sysconf("SC_AVPHYS_PAGES") * page // (1024 * 1024)
+        return {"total_mib": int(total), "free_mib": int(free)}
+    except (ValueError, OSError, AttributeError):
+        return {"total_mib": 0, "free_mib": 0}
+
+
+def darwin_ram() -> dict:
+    total = 0
+    try:
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, timeout=3)
+        total = int(out.strip()) // (1024 * 1024)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        total = 0
+    free_pages = 0
+    page = 4096
+    try:
+        out = subprocess.check_output(["vm_stat"], text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return {"total_mib": total, "free_mib": 0}
+    for line in out.splitlines():
+        if "page size of" in line:
+            for word in line.replace("(", " ").replace(")", " ").split():
+                if word.isdigit():
+                    page = int(word)
+        for label in ("Pages free", "Pages inactive", "Pages speculative"):
+            if line.startswith(label):
+                number = line.split(":")[-1].strip().strip(".")
+                if number.isdigit():
+                    free_pages += int(number)
+    return {"total_mib": total, "free_mib": free_pages * page // (1024 * 1024)}
 
 
 def nvidia() -> list[dict]:
@@ -336,6 +367,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         return
 
+    def handle_error(self, request, client_address) -> None:
+        err = sys.exc_info()[1]
+        print(f"request failed: {err}", flush=True)
+
     def send_json(self, code: int, payload: dict) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -540,6 +575,12 @@ def main() -> None:
 
         worker_main()
         return
+    if command == "agents":
+        from agents import terminal
+
+        requested = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+        terminal(requested)
+        return
     if command == "swarm":
         from agents import seed, spawn
 
@@ -550,7 +591,7 @@ def main() -> None:
         print("pids " + " ".join(str(pid) for pid in result["pids"]), flush=True)
         return
     if command not in {"serve", "work"}:
-        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py agent | mesh.py swarm COUNT")
+        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py agents [COUNT]")
     serve(command)
 
 
