@@ -212,7 +212,7 @@ def ask_model(prompt: str, max_tokens: int = 220) -> str:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.4,
-            "max_tokens": max(max_tokens, 800),
+            "max_tokens": max(64, min(int(max_tokens), 1200)),
             "chat_template_kwargs": {"enable_thinking": False},
         }
     ).encode("utf-8")
@@ -288,7 +288,7 @@ def apply_actions(answer: str) -> list[str]:
     lines = answer.splitlines()
     index = 0
     while index < len(lines):
-        line = lines[index].strip()
+        line = clean_tool_line(lines[index])
         if line.startswith("MKDIR "):
             raw = tool_path(line[6:])
             if raw and ".." not in raw.split("/") and raw not in {"cluster.token", ".env", ".env.local"}:
@@ -300,7 +300,7 @@ def apply_actions(answer: str) -> list[str]:
             raw = tool_path(line[6:])
             index += 1
             body = []
-            while index < len(lines) and lines[index].strip() != "ENDWRITE":
+            while index < len(lines) and clean_tool_line(lines[index]) != "ENDWRITE":
                 body.append(lines[index])
                 index += 1
             if not raw:
@@ -444,9 +444,17 @@ def tool_run(command: str) -> str:
     return (out or f"exit {completed.returncode}")[:4000]
 
 
+def clean_tool_line(line: str) -> str:
+    text = line.strip().strip("`").strip()
+    text = text.lstrip("-*•").strip()
+    if len(text) > 2 and text[0].isdigit() and text[1] in ".)":
+        text = text[2:].strip()
+    return text
+
+
 def first_tool(answer: str) -> str:
     for line in answer.splitlines():
-        stripped = line.strip()
+        stripped = clean_tool_line(line)
         if stripped == "SESSIONS" or stripped.startswith(("LIST ", "GREP ", "READ ", "MKDIR ", "RUN ", "WRITE ", "SESSIONS ")):
             return stripped
     return ""

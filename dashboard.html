@@ -46,6 +46,7 @@
     .bar.hot i { background: linear-gradient(90deg, #e0b15a, #ff5c7a); }
     .row, .set { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
     .row button { padding: 4px 10px; font-size: 11px; white-space: nowrap; }
+    #pick-hogs { max-height: 320px; overflow: auto; }
     .bay { display: grid; grid-template-columns: 230px minmax(0, 1fr) 280px; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
     .map { position: relative; min-height: 420px; height: 100%; background:
       radial-gradient(ellipse at 50% 58%, rgba(240, 200, 75, 0.14), transparent 46%),
@@ -133,7 +134,7 @@
             <button class="quiet" id="stop-model" type="button">Stop the loaded model</button>
             <button class="quiet" id="stop-agents" type="button">Stop code workers</button>
             <p class="muted" id="stop-note"></p>
-            <p class="muted">Stop process is on each heavy program that belongs to Neuro, here and on a joined computer. Other programs stay open.</p>
+            <p class="muted">Stop process sits next to every heavy program, on this PC and on a joined computer.</p>
             <p class="muted">A shop PlayStation or Xbox cannot share this run. Another computer joins by running the worker.</p>
           </article>
         </div>
@@ -202,22 +203,23 @@ function hogs(rows, url) {
     const size = document.createElement("b");
     size.textContent = item.mb != null ? item.mb + " MB" : "";
     row.append(name, size);
-    if (item.stoppable && item.pid) {
+    if (item.pid && item.stoppable !== false) {
       const button = document.createElement("button");
       button.className = "quiet";
       button.type = "button";
       button.textContent = "Stop process";
-      button.onclick = () => stopProcess(item.pid, url);
+      button.onclick = () => stopProcess(item.pid, item.name, url);
       row.append(button);
     }
     box.append(row);
   }
 }
-async function stopProcess(pid, url) {
+async function stopProcess(pid, name, url) {
+  if (!window.confirm("Stop " + name + "?")) return;
   const response = await fetch("/api/process/stop", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pid, url: url === "local" ? "" : url }),
+    body: JSON.stringify({ pid, name, url: url === "local" ? "" : url }),
   });
   const body = await response.json();
   document.getElementById("stop-note").textContent = body.note || body.error || "Could not stop that process.";

@@ -1,4 +1,4 @@
-"""Neuro Mesh: one dashboard for Windows, Linux, and Mac workers.
+"""Neuro: one dashboard for Windows, Linux, and Mac workers.
 
 Workers report memory and can start the local llama.cpp RPC server.
 They do not accept shell commands.
@@ -214,13 +214,22 @@ def nvidia() -> list[dict]:
     return cards
 
 
-STOPPABLE = {
-    "llama-server.exe",
-    "llama-server",
-    "ggml-rpc-server.exe",
-    "ggml-rpc-server",
-    "rpc-server.exe",
-    "rpc-server",
+# Stopping these turns the computer off or closes the login session.
+PROTECTED = {
+    "system",
+    "registry",
+    "secure system",
+    "memory compression",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "lsass.exe",
+    "winlogon.exe",
+    "fontdrvhost.exe",
+    "kernel_task",
+    "launchd",
+    "windowserver",
 }
 
 
@@ -283,7 +292,7 @@ def heavy_processes() -> list[dict]:
                 if not pid_text.isdigit() or not mem.isdigit():
                     continue
                 mb = int(mem) // 1024
-                if mb < 80:
+                if mb < 40:
                     continue
                 lowered = name.lower()
                 role = "other"
@@ -299,7 +308,7 @@ def heavy_processes() -> list[dict]:
                         "pid": int(pid_text),
                         "mb": mb,
                         "role": role,
-                        "stoppable": lowered in STOPPABLE,
+                        "stoppable": lowered not in PROTECTED,
                     }
                 )
         else:
@@ -309,7 +318,7 @@ def heavy_processes() -> list[dict]:
                 if len(bits) < 3 or not bits[0].isdigit() or not bits[1].isdigit():
                     continue
                 mb = int(bits[1]) // 1024
-                if mb < 80:
+                if mb < 40:
                     continue
                 name = bits[2].replace("\\", "/").split("/")[-1][:40]
                 lowered = name.lower()
@@ -320,13 +329,13 @@ def heavy_processes() -> list[dict]:
                         "pid": int(bits[0]),
                         "mb": mb,
                         "role": role,
-                        "stoppable": lowered in STOPPABLE,
+                        "stoppable": lowered not in PROTECTED,
                     }
                 )
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
     rows.sort(key=lambda item: item["mb"], reverse=True)
-    return rows[:6]
+    return rows[:24]
 
 
 def dataset_index() -> list[dict]:
@@ -531,7 +540,7 @@ def pull_worker(url: str) -> dict:
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
         return {"url": url, "ok": False, "error": "no reply"}
     if status.get("app") != "neuroai-mesh":
-        return {"url": url, "ok": False, "error": "not a mesh worker"}
+        return {"url": url, "ok": False, "error": "not a Neuro worker"}
     return {"url": url, "ok": True, "status": status}
 
 
@@ -869,13 +878,15 @@ def process_name(pid: int) -> str:
     return out.strip().replace("\\", "/").split("/")[-1]
 
 
-def stop_owned_process(pid: int) -> dict:
+def stop_owned_process(pid: int, expected: str = "") -> dict:
     name = process_name(pid)
-    if name.lower() not in STOPPABLE:
-        return {
-            "stopped": False,
-            "note": "Left that program running. Stop process only stops the loaded model or the share listener.",
-        }
+    if not name:
+        return {"stopped": False, "note": "That process is already gone."}
+    wanted = expected.strip()
+    if not wanted or name.lower() != wanted.lower():
+        return {"stopped": False, "note": "That process changed. Nothing was stopped."}
+    if name.lower() in PROTECTED:
+        return {"stopped": False, "note": name + " keeps the computer running, so it was left on."}
     if os.name == "nt":
         done = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
         stopped = done.returncode == 0
@@ -909,20 +920,20 @@ def peer_known(url: str) -> bool:
     return clean in known
 
 
-def stop_at(url: str, pid: int) -> dict:
+def stop_at(url: str, pid: int, name: str = "") -> dict:
     if pid <= 0:
         return {"stopped": False, "note": "Missing process."}
     if not url:
-        return stop_owned_process(pid)
+        return stop_owned_process(pid, name)
     try:
         clean = clean_url(url)
     except ValueError:
         return {"stopped": False, "note": "That address is not a joined computer."}
     if not peer_known(clean):
-        return {"stopped": False, "note": "That computer is not in this mesh."}
+        return {"stopped": False, "note": "That computer is not connected."}
     request = urllib.request.Request(
         clean + "/process/stop",
-        data=json.dumps({"pid": pid}).encode("utf-8"),
+        data=json.dumps({"pid": pid, "name": name}).encode("utf-8"),
         method="POST",
         headers={"Content-Type": "application/json"},
     )
@@ -1054,11 +1065,12 @@ class Handler(BaseHTTPRequestHandler):
             # Listening for a shared run does not use the other computer's token.
             # Each machine keeps its own token, and this port stays on the LAN.
             if path == "/process/stop":
+                body = self.read_json()
                 try:
-                    pid = int(self.read_json().get("pid") or 0)
+                    pid = int(body.get("pid") or 0)
                 except (TypeError, ValueError):
                     pid = 0
-                self.send_json(200, stop_owned_process(pid))
+                self.send_json(200, stop_owned_process(pid, str(body.get("name") or "")))
                 return
             if path in {"/rpc/start", "/rpc/stop"}:
                 try:
@@ -1127,7 +1139,7 @@ class Handler(BaseHTTPRequestHandler):
                     pid = int(body.get("pid") or 0)
                 except (TypeError, ValueError):
                     pid = 0
-                self.send_json(200, stop_at(str(body.get("url") or ""), pid))
+                self.send_json(200, stop_at(str(body.get("url") or ""), pid, str(body.get("name") or "")))
                 return
             if path == "/api/share/offer":
                 self.send_json(200, offer_share())
@@ -1218,12 +1230,12 @@ def serve(mode: str) -> None:
     Handler.mode = mode
     if mode == "serve":
         server = ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), Handler)
-        print(f"Neuro Mesh dashboard http://127.0.0.1:{DASHBOARD_PORT}", flush=True)
+        print(f"Neuro dashboard http://127.0.0.1:{DASHBOARD_PORT}", flush=True)
         print(f"token id {token_id()}", flush=True)
         start_discovery()
     else:
         server = ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), Handler)
-        print(f"Neuro Mesh worker on port {WORKER_PORT}", flush=True)
+        print(f"Neuro worker on port {WORKER_PORT}", flush=True)
         print(f"token id {token_id()}", flush=True)
     token()
     try:

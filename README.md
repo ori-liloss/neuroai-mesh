@@ -81,7 +81,7 @@ Open http://127.0.0.1:8780. It has three views:
 - **Try** is the chat with the loaded model.
 - **Training** shows the stopped run, the recent losses, and a start button. Training stays on the NVIDIA PC. The Mac does not join that step. The button does not start a run while chat is using the GPU, and it does not resume the stopped run.
 
-Neuro Code can write files under `workspace/`. A request to make a folder and a game is handled there. A heavy program that belongs to Neuro has a Stop process button on this PC and on a joined computer. Other programs stay open.
+Neuro Code can write files under `workspace/`. A request to make a folder and a game is handled there. Every heavy program has a Stop process button on this PC and on a joined computer.
 
 A Mac still joins with `bash platforms/start-mac.sh` even if its GPU name is missing. The bay stays live. The chip name appears after that script is started again.
 

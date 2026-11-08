@@ -1,5 +1,5 @@
 #!/bin/sh
-# NeuroAI Mesh worker for Linux. One command joins the Windows page.
+# Neuro worker for Linux. One command joins the Windows page.
 set -eu
 
 cd "$(dirname "$0")" || exit 1
