@@ -7,7 +7,7 @@
 # Run it from CMD:
 #   git clone https://github.com/ori-liloss/neuroai-mesh.git %USERPROFILE%\neuroai-mesh
 #   %USERPROFILE%\neuroai-mesh\platforms\windows-worker.cmd
-# Another main PC address:  set NEURO_MESH_URL=http://192.168.1.20:8780  before the command.
+# If the main PC is not found by itself:  set NEURO_MESH_URL=http://<main PC>:8780  before the command.
 # Files go to %LOCALAPPDATA%\Neuro. Nothing is installed system-wide.
 # Ctrl+C stops the worker and the model this script started. If the window is closed instead,
 # the model keeps running and the next run reuses it.
@@ -463,8 +463,8 @@ try {
   if ($env:NEURO_MESH_URL) {
     Write-Host "[5/5] Starting the Neuro worker. Main PC: $env:NEURO_MESH_URL"
   } else {
-    Write-Host '[5/5] Starting the Neuro worker. Main PC: the default in mesh.py.'
-    Write-Host '      On your network set it first, e.g.  set NEURO_MESH_URL=http://192.168.1.20:8780'
+    Write-Host '[5/5] Starting the Neuro worker. It looks for the main PC on this network.'
+    Write-Host '      If it is not found, set it first, e.g.  set NEURO_MESH_URL=http://192.168.1.20:8780'
   }
   Write-Host '      A pairing code (Pairing code: ### ###) appears in about 30 seconds.'
   Write-Host "      Approve it on the main PC's Neuro page. Keep the laptop plugged in. Ctrl+C stops everything."

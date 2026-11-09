@@ -75,9 +75,12 @@ No file copying. It works like pairing a Bluetooth device:
 Approval only works from the page on the main PC itself. The token is handed out once, only to
 the computer that asked, and only with the secret that computer generated.
 
-**Tell the worker where the main PC is.** Set `NEURO_MESH_URL` to the main PC's LAN address
-before starting the worker. The built-in default is the author's home address, so on your network
-you must set it:
+**How the worker finds the main PC.** In this order: `NEURO_MESH_URL` if set, then the address
+remembered in `mesh_url.txt`, then a search of the worker's own /24 network for a Neuro page on
+port 8780 (it is saved in `mesh_url.txt` once found). A worker that already holds a token only
+accepts a main PC that proves it holds the same token. If nothing is found it tries
+`127.0.0.1:8780` (this computer). Delete `mesh_url.txt` to search again. If the search cannot see
+the main PC (another subnet, client isolation on Wi-Fi), set the address yourself:
 
 ```bash
 # Mac / Linux / Steam Deck
@@ -103,7 +106,6 @@ the code by themselves: run `git pull` first when there is a new version.
 ```bat
 git clone https://github.com/ori-liloss/neuroai-mesh.git
 cd neuroai-mesh
-set NEURO_MESH_URL=http://192.168.1.20:8780
 python -u mesh.py work
 ```
 
@@ -135,14 +137,13 @@ started. Next time, and for updates:
 cd /d %USERPROFILE%\neuroai-mesh && git pull && platforms\windows-worker.cmd
 ```
 
-Another main PC address: run `set NEURO_MESH_URL=http://192.168.1.20:8780` first, in the same window.
+If the main PC is not found: run `set NEURO_MESH_URL=http://<main PC>:8780` first, in the same window.
 
 ### Mac
 
 ```bash
 git clone https://github.com/ori-liloss/neuroai-mesh.git
 cd neuroai-mesh
-export NEURO_MESH_URL=http://192.168.1.20:8780
 bash platforms/start-mac.sh
 ```
 
@@ -160,7 +161,6 @@ macOS has no `python`; the script uses `python3` (`brew install python` if missi
 ```bash
 git clone https://github.com/ori-liloss/neuroai-mesh.git
 cd neuroai-mesh
-export NEURO_MESH_URL=http://192.168.1.20:8780
 sh platforms/start-linux.sh
 ```
 
@@ -184,7 +184,7 @@ approve it on the main PC (section 3). Ctrl+C stops everything. Next time, and f
 cd ~/neuroai-mesh && git pull && sh platforms/steamdeck.sh
 ```
 
-Another main PC address: `NEURO_MESH_URL=http://192.168.1.20:8780 sh platforms/steamdeck.sh`.
+If the main PC is not found: `NEURO_MESH_URL=http://<main PC>:8780 sh platforms/steamdeck.sh`.
 
 **Step by step (what the script does):**
 
@@ -220,7 +220,7 @@ cd "$(dirname "$(find ~/llama -name llama-server -type f | head -1)")" && chmod 
 5. New tab (Ctrl+Shift+T):
 
 ```bash
-cd ~/neuroai-mesh && export NEURO_MESH_URL=http://192.168.1.20:8780 && systemd-inhibit --what=sleep:idle sh platforms/start-linux.sh
+cd ~/neuroai-mesh && systemd-inhibit --what=sleep:idle sh platforms/start-linux.sh
 ```
 
 6. A pairing code appears after about 30 seconds. Approve it on the main PC (section 3).
@@ -318,8 +318,34 @@ is held. Every job has a time limit (its lease), so a worker that disappears doe
 
 ## 8. Training
 
-The full trainer and the coding benchmark live in the author's own tree and are not in this
-repository yet. What this repository gives you is the data and a small experiment script.
+This repository has no trainer of its own. It gives you the data, a small experiment script, and a
+live view of the run you start with your own trainer (for example a Hugging Face `Trainer` script).
+
+**Show your run on the Training page.** Copy `training.example.json` to `training.json` next to
+`mesh.py` (gitignored) and set:
+
+```json
+{"log": "D:/models/logs/training.log", "run_dir": "D:/models/runs/my-run", "name": "my-run"}
+```
+
+- `log`: the file your trainer's output is written to (redirect stdout and stderr into it). The
+  page reads only the first 16 KB and the last 96 KB, so a log of any size is fine. It understands
+  tqdm progress bars (`120/14688 [10:05<20:31:00, 5.07s/it]`), `Trainer` dicts with `loss` and
+  `eval_loss`, a `Traceback`, the final `train_runtime` dict, and timestamped lines such as
+  `2026-01-01T10:00:00 Training. Run folder: D:/models/runs/my-run`.
+- `run_dir` (optional): the output folder. The newest `checkpoint-N/trainer_state.json` there fills
+  in the loss history and the total steps when the log tail lacks them.
+- Optional keys: `gpu_lock` (a file your trainer holds while it owns the GPU; default
+  `../train_local/gpu.lock`), `data_root` (default `../neuro-ai-data`), `process_match` (a piece of
+  the trainer's command line, used to tell a crashed run from a quiet one).
+
+Environment variables win over the file: `NEURO_TRAINING_LOG`, `NEURO_TRAINING_RUN_DIR`,
+`NEURO_GPU_LOCK`, `NEURO_AI_DATA`. Restart `mesh.py serve` after changing them.
+
+States: **Loading** (only model-loading bars so far), **Training** / **Evaluating**, **Finished**,
+**Error** (a traceback after the last progress), **Stopped** (the log stopped changing and no
+trainer is running), **Stopped · lock held** (no trainer, but the GPU lock file is still there).
+The page never starts or stops the trainer.
 
 **Data format** (`jobs export` output): one JSON object per line,
 `{"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}], ...}`.
@@ -334,7 +360,7 @@ python side_train.py --base /path/to/small-model --data coding-v1-verified.jsonl
 
 It refuses to start while a main training lock is held.
 
-**What the author uses for the real run** (a good starting point for yours):
+**Settings that worked for one home setup** (a starting point, not a rule):
 
 | | RTX 4070 12 GB | 128 GB unified memory (DGX Spark) |
 | --- | --- | --- |
@@ -346,12 +372,24 @@ It refuses to start while a main training lock is held.
 | Packing | **off** for Qwen3.5/3.8 (hybrid linear attention would mix conversations) | off |
 | Loss | assistant tokens only | same |
 
-Tips that cost the author days: a learning rate of 5e-6 is far too low for LoRA (use 1e-4 to
+Tips that save days: a learning rate of 5e-6 is far too low for LoRA (use 1e-4 to
 2e-4); save every few hundred steps, not once per epoch; check that no benchmark question is in
 the training data; a LoRA adapter only works on the exact base model it was trained on.
 
 **Order of work that pays off most:** clean verified data first → one training run → measure on a
 fixed benchmark (pass@1 and tokens per task) → a second round on verified answers with DPO/KTO.
+
+## Settings reference
+
+| Variable | Where | Meaning |
+| --- | --- | --- |
+| `NEURO_MESH_URL` | worker | The main PC's page, e.g. `http://192.168.1.20:8780`. Normally found by itself. |
+| `NEURO_JOBS=0` | worker | Take no data jobs. |
+| `NEURO_LOCAL_LLM` | worker | Port of the local model server (default 8080). |
+| `NEURO_LUAU` | worker | Path to the `luau` binary for `verify_luau`. |
+| `NEURO_RPC_BIN` | any | Path to `ggml-rpc-server` for memory sharing. |
+| `NEURO_TRAINING_LOG`, `NEURO_TRAINING_RUN_DIR` | main PC | Training log and run folder (or `training.json`). |
+| `NEURO_GPU_LOCK`, `NEURO_AI_DATA` | main PC | GPU lock file and data folder (defaults: `../train_local/gpu.lock`, `../neuro-ai-data`). |
 
 ## 9. Security model
 
@@ -379,6 +417,8 @@ fixed benchmark (pass@1 and tokens per task) → a second round on verified answ
 | Steam Deck falls asleep | Turn off suspend in Power Management, keep `systemd-inhibit` in the commands. |
 | `Access is denied` on a data folder (Windows) | The folder only allows SYSTEM. Run the step as a scheduled task as SYSTEM instead of changing permissions. |
 | Page says "Stopped · lock held" | `gpu.lock` exists but no trainer is running. Delete it only if its pid is not a live trainer. |
+| Training page says "No training log found" | Create `training.json` (section 8) or set `NEURO_TRAINING_LOG`, then restart `mesh.py serve`. |
+| Training state "Unknown" | The log or its folder cannot be read by the user that runs `mesh.py serve` (for example a trainer started as SYSTEM). Write the log somewhere that user can read. |
 
 ## 11. What helps and what does not
 
@@ -397,7 +437,6 @@ making and checking data instead.
 
 ## 12. Roadmap
 
-- Auto-discovery of the main PC, so `NEURO_MESH_URL` is not needed.
 - Publish the coding benchmark (61 tasks with hidden tests) and the trainer.
 - Real unit-test execution for generated code in an isolated sandbox.
 - A token and TLS option for traffic over untrusted networks.

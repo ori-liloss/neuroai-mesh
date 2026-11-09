@@ -1,0 +1,5 @@
+{
+  "log": "D:/models/logs/training.log",
+  "run_dir": "D:/models/runs/my-run",
+  "name": "my-run"
+}

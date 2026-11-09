@@ -71,8 +71,42 @@ DASHBOARD = ROOT / "dashboard.html"
 RPC_PORT = 50052
 DASHBOARD_PORT = 8780
 WORKER_PORT = 8781
-GPU_LOCK = Path(r"D:\liliai\train_local\gpu.lock")
 MAX_REPLY = 2 * 1024 * 1024
+
+# Optional, gitignored: where this PC's training run writes its log. See
+# training.example.json. Every key is optional; NEURO_* variables win.
+TRAINING_CONFIG = ROOT / "training.json"
+
+
+def training_config(path: Path | None = None) -> dict:
+    """Read training.json (small, local, owner-written). Missing or broken -> {}."""
+    target = path or TRAINING_CONFIG
+    try:
+        if target.stat().st_size > 64_000:
+            return {}
+        data = json.loads(target.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: str(value).strip() for key, value in data.items()
+            if key in {"log", "run_dir", "gpu_lock", "data_root", "name", "process_match"}
+            and isinstance(value, str) and value.strip()}
+
+
+def config_path(env: str, key: str, default: Path) -> Path:
+    raw = os.environ.get(env, "").strip() or training_config().get(key, "")
+    return Path(raw) if raw else default
+
+
+def data_root() -> Path:
+    """Training data folder. Default: a neuro-ai-data folder next to this repo."""
+    return config_path("NEURO_AI_DATA", "data_root", ROOT.parent / "neuro-ai-data")
+
+
+# The trainer holds this file while it owns the GPU. Default: train_local/gpu.lock
+# next to this repo folder.
+GPU_LOCK = config_path("NEURO_GPU_LOCK", "gpu_lock", ROOT.parent / "train_local" / "gpu.lock")
 
 # Never scanned and never allowed to talk to the dashboard or the worker:
 # link-local, the VirtualBox host-only net, and the 26.x VPN range.
@@ -940,6 +974,43 @@ PROTECTED = {
     "gnome-shell",
     "gnome-terminal-server",
     "sshd",
+    # Desktop sessions: stopping one ends the login, or the window the worker runs in.
+    "searchhost.exe",
+    "startmenuexperiencehost.exe",
+    "shellexperiencehost.exe",
+    "textinputhost.exe",
+    "runtimebroker.exe",
+    "ctfmon.exe",
+    "wudfhost.exe",
+    "controlcenter",
+    "coreaudiod",
+    "plasmashell",
+    "kwin_wayland",
+    "kwin_x11",
+    "kwin_wayland_wrapper",
+    "xwayland",
+    "ksmserver",
+    "kded5",
+    "kded6",
+    "konsole",
+    "gamescope",
+    "gamescope-wl",
+    "steamos-session",
+    "gnome-session-binary",
+    "mutter",
+    "xfwm4",
+    "xfce4-session",
+    "sddm",
+    "gdm",
+    "lightdm",
+    "pipewire",
+    "wireplumber",
+    "pulseaudio",
+    "dbus-daemon",
+    "xdg-desktop-portal",
+    "networkmanager",
+    "polkitd",
+    "systemd-logind",
 }
 
 
@@ -979,7 +1050,7 @@ def rpc_binary() -> str | None:
             return override
     names = ["ggml-rpc-server.exe", "ggml-rpc-server"]
     candidates = [
-        Path(r"D:\liliai\tools\llama-cpp-cuda\ggml-rpc-server.exe"),
+        ROOT.parent / "tools" / "llama-cpp-cuda" / "ggml-rpc-server.exe",
         ROOT / "ggml-rpc-server.exe",
         ROOT / "ggml-rpc-server",
     ]
@@ -1089,8 +1160,8 @@ def lock_held(lock: Path) -> bool:
 
 
 def dataset_index() -> list[dict]:
-    root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data")) / "training"
-    if lock_held(root.parent.parent / "train_local" / "gpu.lock"):
+    root = data_root() / "training"
+    if lock_held(GPU_LOCK):
         return [{"name": "held while training runs", "mb": 0}]
     rows: list[dict] = []
     try:
@@ -1110,12 +1181,16 @@ def dataset_index() -> list[dict]:
 
 
 _training_cache: dict = {"at": 0.0, "view": None}
+# A log that changed within this many seconds counts as a live run.
+TRAINING_FRESH_S = 300
+LOG_HEAD_BYTES = 16_000   # the runner's first lines (start time, run folder)
+LOG_TAIL_BYTES = 96_000   # the newest progress lines; the file itself keeps growing
 
 
-def newest_log(log_dir: Path, pattern: str = "neuro-ai-long-v1-") -> tuple[Path | None, float, bool]:
-    """Return (newest log, its mtime, readable). readable is False when the
-    folder exists but cannot be listed, so the caller can say "unknown"
-    instead of "stopped"."""
+def newest_log(log_dir: Path, pattern: str = "") -> tuple[Path | None, float, bool]:
+    """Return (newest *.log whose name starts with `pattern`, its mtime,
+    readable). readable is False when the folder exists but cannot be
+    listed, so the caller can say "unknown" instead of "stopped"."""
     newest: Path | None = None
     newest_at = 0.0
     try:
@@ -1136,100 +1211,351 @@ def newest_log(log_dir: Path, pattern: str = "neuro-ai-long-v1-") -> tuple[Path 
     return newest, newest_at, True
 
 
+def configured_log() -> tuple[Path | None, float, bool] | None:
+    """The log named by NEURO_TRAINING_LOG or training.json "log", as
+    (path or None, mtime, readable). None when neither is set."""
+    raw = os.environ.get("NEURO_TRAINING_LOG", "").strip() or training_config().get("log", "")
+    if not raw:
+        return None
+    path = Path(raw)
+    try:
+        return path, path.stat().st_mtime, True
+    except FileNotFoundError:
+        return None, 0.0, True
+    except OSError:
+        return None, 0.0, False
+
+
+def _decode_log(raw: bytes) -> str:
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in raw[:80]:
+        return raw.decode("utf-16-le", errors="replace").lstrip("﻿")
+    return raw.decode("utf-8", errors="replace").lstrip("﻿")
+
+
+def read_log(path: Path, head_bytes: int = LOG_HEAD_BYTES, tail_bytes: int = LOG_TAIL_BYTES) -> tuple[str, str]:
+    """(head, tail) of a growing log. Only these two slices are read, never
+    the whole file. A small file comes back whole as the tail."""
+    try:
+        with path.open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size <= head_bytes + tail_bytes:
+                return "", _decode_log(handle.read(head_bytes + tail_bytes))
+            head = handle.read(head_bytes)
+            start = size - tail_bytes
+            if start % 2:
+                start += 1  # keeps UTF-16 aligned; one lost byte of UTF-8 is harmless
+            handle.seek(start)
+            return _decode_log(head), _decode_log(handle.read(tail_bytes))
+    except OSError:
+        return "", ""
+
+
+_RUNNER = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\S*\s+(.*)$")
+# tqdm: "Loading weights:  2%|▏   | 14/760 [00:47<24:46,  1.99s/it]" or a bare "  4500/6933 [..]".
+_BAR = re.compile(
+    r"(?:(?P<pct>\d{1,3})%\|[^|]*\|)?\s*(?P<n>\d+)/(?P<total>\d+)\s*\["
+    r"(?P<elapsed>[0-9:]+)?(?:<(?P<eta>[0-9:?]+))?(?:,\s*(?P<rate>[0-9.]+)\s*(?P<unit>s/it|it/s))?"
+)
+_NUM = r"(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)"
+_LOSS = re.compile(r"[\"']loss[\"']\s*:\s*[\"']?" + _NUM)
+_EVAL_LOSS = re.compile(r"[\"']eval_loss[\"']\s*:\s*[\"']?" + _NUM)
+_EPOCH = re.compile(r"[\"']epoch[\"']\s*:\s*[\"']?" + _NUM)
+_LR = re.compile(r"[\"']learning_rate[\"']\s*:\s*[\"']?" + _NUM)
+_EXC = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit))\b:?(.*)$")
+_LOADING_DESC = re.compile(r"load|shard|weight|checkpoint|map|token|generat|split|download|pack", re.I)
+
+
+def clock_seconds(text: str | None) -> int | None:
+    """"20:31:00" -> 73860, "10:05" -> 605. "?" or junk -> None."""
+    if not text or "?" in text:
+        return None
+    try:
+        parts = [int(part) for part in text.split(":")]
+    except ValueError:
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return seconds
+
+
+def _num(pattern: re.Pattern, line: str) -> float | None:
+    found = pattern.search(line)
+    if not found:
+        return None
+    try:
+        return float(found.group(1))
+    except ValueError:
+        return None
+
+
+def parse_training_log(head: str, tail: str = "", max_steps_hint: int = 0) -> dict:
+    """Read a Hugging Face Trainer log (tqdm bars split by \\r, loss dicts,
+    eval dicts, timestamped runner lines, tracebacks). Pure, so it is tested."""
+    info: dict = {
+        "step": None, "max_steps": None, "loss": None, "history": [], "eval_loss": None, "eval_history": [],
+        "epoch": None, "learning_rate": None, "s_per_it": None, "eta_s": None, "elapsed_s": None,
+        "phase": None, "load": None, "run_dir": "", "started": "", "last_event": "", "last_event_at": "",
+        "error": "", "finished": False,
+    }
+    bars: list[tuple[int, str, re.Match]] = []
+    events: list[tuple[int, str, object]] = []
+    segments = [seg for seg in re.split(r"[\r\n]+", head + "\n" + tail) if seg.strip()]
+    for index, segment in enumerate(segments):
+        line = segment.strip()
+        runner = _RUNNER.match(line)
+        if runner:
+            stamp, message = runner.group(1), runner.group(2).strip()
+            if not info["started"]:
+                info["started"] = stamp
+            if "Run folder:" in message:
+                info["run_dir"] = message.split("Run folder:", 1)[1].strip()[:300]
+            events.append((index, "runner", (stamp, message)))
+            continue
+        matches = list(_BAR.finditer(segment))
+        if matches:
+            match = matches[-1]
+            desc = segment[: match.start()].strip().rstrip(":").strip()
+            if match.group("pct") is not None or match.group("elapsed") is not None or not desc:
+                bars.append((index, desc, match))
+        if "Traceback (most recent call last)" in line:
+            events.append((index, "traceback", None))
+        exc = _EXC.match(line)
+        if exc:
+            events.append((index, "exception", line[:240]))
+        if "'train_runtime'" in line or '"train_runtime"' in line:
+            events.append((index, "finished", None))
+        loss = _num(_LOSS, line)
+        if loss is not None:
+            events.append((index, "loss", (loss, _num(_EPOCH, line), _num(_LR, line))))
+        eval_loss = _num(_EVAL_LOSS, line)
+        if eval_loss is not None:
+            events.append((index, "eval", (eval_loss, _num(_EPOCH, line))))
+    # The train bar has no description and the largest total (or the known
+    # max_steps); an eval bar shares the log with a smaller total.
+    plain = [(i, m) for i, desc, m in bars if not desc]
+    totals = [int(m.group("total")) for _, m in plain if int(m.group("total")) > 0]
+    top = max(totals, default=0)
+    train_total = max_steps_hint if max_steps_hint and (max_steps_hint in totals or top < max_steps_hint // 10) else top
+    for index, desc, match in bars:
+        total = int(match.group("total"))
+        if total <= 0:
+            continue
+        if desc and _LOADING_DESC.search(desc):
+            events.append((index, "loadbar", (desc[:60], int(match.group("n")), total)))
+        elif not desc and total == train_total:
+            events.append((index, "train", match))
+        elif not desc:
+            events.append((index, "evalbar", match))
+    events.sort(key=lambda item: item[0])
+    in_traceback = False
+    for _, kind, data in events:
+        if kind == "runner":
+            stamp, message = data
+            info["last_event"], info["last_event_at"] = message[:200], stamp
+            lowered = message.lower()
+            if lowered.startswith("start") or "preflight" in lowered:
+                info.update(error="", finished=False, phase="loading")
+                in_traceback = False
+            elif re.search(r"\b(failed|crashed|exited with)\b", lowered):
+                info["error"] = message[:240]
+            elif re.search(r"\b(finished|training complete)\b", lowered):
+                info.update(finished=True, phase=None)
+        elif kind == "traceback":
+            in_traceback = True
+            info["error"] = info["error"] or "Traceback in the log"
+        elif kind == "exception" and in_traceback:
+            info["error"] = data
+        elif kind == "finished":
+            info.update(finished=True, phase=None)
+        elif kind == "loadbar":
+            label, n, total = data
+            info.update(phase="loading", load={"label": label, "step": n, "total": total}, error="", finished=False)
+            in_traceback = False
+        elif kind in {"train", "evalbar"}:
+            match = data
+            in_traceback = False
+            info["error"] = ""
+            info["finished"] = False
+            if kind == "evalbar":
+                info["phase"] = "evaluating"
+                continue
+            n, total = int(match.group("n")), int(match.group("total"))
+            info.update(step=n, max_steps=total, phase="training", load=None)
+            rate = match.group("rate")
+            if rate:
+                try:
+                    value = float(rate)
+                    info["s_per_it"] = round(value if match.group("unit") == "s/it" else (1 / value if value else 0), 3) or None
+                except ValueError:
+                    pass
+            info["elapsed_s"] = clock_seconds(match.group("elapsed"))
+            eta = clock_seconds(match.group("eta"))
+            if eta is None and info["s_per_it"]:
+                eta = int((total - n) * info["s_per_it"])
+            info["eta_s"] = eta
+        elif kind == "loss":
+            loss, epoch, rate = data
+            info["history"].append(round(loss, 4))
+            info["loss"] = round(loss, 4)
+            if epoch is not None:
+                info["epoch"] = round(epoch, 3)
+            if rate is not None:
+                info["learning_rate"] = rate
+        elif kind == "eval":
+            eval_loss, epoch = data
+            info["eval_history"].append(round(eval_loss, 4))
+            info["eval_loss"] = round(eval_loss, 4)
+            if info["phase"] == "evaluating":
+                info["phase"] = "training"
+    if info["step"] is not None and info["max_steps"] and info["step"] >= info["max_steps"] and not info["error"]:
+        info["finished"] = info["finished"] or info["phase"] == "training"
+    info["history"] = info["history"][-40:]
+    info["eval_history"] = info["eval_history"][-20:]
+    return info
+
+
 def parse_log_tail(tail: str) -> dict:
-    step = None
-    max_steps = None
-    loss = None
-    marks = [(int(a), int(b)) for a, b in re.findall(r"(\d+)/(\d+)", tail) if int(b) > 0]
-    if marks:
-        # An eval progress bar ("12/120") shares the log with the train bar.
-        # The train bar has the largest total, so only that one is used.
-        total = max(b for _, b in marks)
-        train = [a for a, b in marks if b == total and a <= b]
-        if train:
-            step = train[-1]
-            max_steps = total
-    losses = re.findall(r"'loss': '?([0-9]+(?:\.[0-9]+)?(?:[eE]-?[0-9]+)?)'?", tail)
-    if losses:
+    """Older, smaller view of parse_training_log: step, max_steps, loss."""
+    info = parse_training_log("", tail)
+    return {"step": info["step"], "max_steps": info["max_steps"], "loss": info["loss"]}
+
+
+def run_state(run_dir: Path) -> dict:
+    """Step, max_steps and loss history from the newest trainer_state.json in
+    a run folder (the folder itself, or its newest checkpoint-N)."""
+    candidates: list[tuple[int, Path]] = []
+    try:
+        if (run_dir / "trainer_state.json").is_file():
+            candidates.append((1 << 30, run_dir / "trainer_state.json"))
+        with os.scandir(run_dir) as entries:
+            for entry in entries:
+                match = re.fullmatch(r"checkpoint-(\d+)", entry.name)
+                if match and entry.is_dir():
+                    candidates.append((int(match.group(1)), Path(entry.path) / "trainer_state.json"))
+    except OSError:
+        return {}
+    for _, path in sorted(candidates, reverse=True):
         try:
-            loss = round(float(losses[-1]), 4)
-        except ValueError:
-            loss = None
-    return {"step": step, "max_steps": max_steps, "loss": loss}
+            if path.stat().st_size > 5_000_000:
+                continue
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(state, dict):
+            continue
+        history = []
+        for row in state.get("log_history") or []:
+            if isinstance(row, dict) and isinstance(row.get("loss"), (int, float)):
+                history.append(round(float(row["loss"]), 4))
+        try:
+            return {"step": int(state.get("global_step") or 0), "max_steps": int(state.get("max_steps") or 0),
+                    "history": history[-40:], "checkpoint": path.parent.name}
+        except (TypeError, ValueError):
+            continue
+    return {}
 
 
 TRAINER_PATTERN = re.compile(r"ml[\\/]+training[\\/]+train(?:_next)?\.py", re.I)
 
 
+def trainer_matches(command: str) -> bool:
+    if TRAINER_PATTERN.search(command):
+        return True
+    extra = training_config().get("process_match", "")
+    return bool(extra) and extra.lower() in command.lower()
+
+
 def trainer_alive() -> bool | None:
-    """True if a train.py / train_next.py process exists on this machine, False if none,
-    None if the process list could not be read."""
+    """True if a trainer process exists on this machine, False if none, None
+    if the process list (or a Python command line in it) could not be read:
+    a trainer started as another user or as SYSTEM hides its command line."""
     try:
         if os.name == "nt":
             out = subprocess.check_output(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command",
                  "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
-                 "ForEach-Object { $_.CommandLine }"],
+                 "ForEach-Object { 'P ' + $_.CommandLine }"],
                 text=True, timeout=10, errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         else:
             out = subprocess.check_output(["ps", "-axo", "command="], text=True, timeout=5, errors="replace")
     except (OSError, subprocess.SubprocessError):
         return None
-    return bool(TRAINER_PATTERN.search(out))
+    lines = out.splitlines()
+    if any(trainer_matches(line) for line in lines):
+        return True
+    if os.name == "nt" and any(line.strip() == "P" for line in lines):
+        return None
+    return False
 
 
-def live_training(data_root: Path) -> dict:
-    lock = data_root.parent / "train_local" / "gpu.lock"
-    running: bool | None = lock_held(lock)
+def live_training(data_root: Path, found: tuple[Path | None, float, bool] | None = None,
+                  max_steps_hint: int = 0) -> dict:
+    """Live state of the run from its log and the GPU lock. `found` is the
+    configured log; without one the newest log in <data root>/training/logs."""
+    held = lock_held(GPU_LOCK)
+    newest, newest_at, readable = found if found is not None else newest_log(data_root / "training" / "logs")
+    info = parse_training_log("", "", max_steps_hint)
+    age = None
+    if newest is not None:
+        head, tail = read_log(newest)
+        info = parse_training_log(head, tail, max_steps_hint)
+        age = max(0, int(time.time() - newest_at))
+    fresh = age is not None and age < TRAINING_FRESH_S
+    running: bool | None
     stale_lock = False
-    step = None
-    max_steps = None
-    loss = None
-    newest, newest_at, readable = newest_log(data_root / "training" / "logs")
-    if not readable and not running:
-        # The log folder could not be read and the lock says free. That is
-        # not proof the run stopped, so the page shows "unknown".
-        running = None
-    fresh = newest is not None and time.time() - newest_at < 180
-    if fresh and newest is not None:
+    quiet = False
+    if newest is not None and info["error"]:
+        running, state = False, "error"
+    elif newest is not None and info["finished"]:
+        running, state = False, "finished"
+    elif fresh:
         running = True
-        tail = ""
-        try:
-            size = newest.stat().st_size
-            start = max(0, size - 24000)
-            if start % 2:
-                start -= 1
-            with newest.open("rb") as handle:
-                handle.seek(start)
-                raw = handle.read()
-            if b"\x00" in raw[:80]:
-                tail = raw.decode("utf-16-le", errors="replace")
-            else:
-                tail = raw.decode("utf-8", errors="replace")
-        except OSError:
-            tail = ""
-        parsed = parse_log_tail(tail)
-        step, max_steps, loss = parsed["step"], parsed["max_steps"], parsed["loss"]
-    elif running and trainer_alive() is False:
-        # The lock is held but no trainer process exists: the run stopped or crashed and
-        # left its lock behind. The card stays reserved (lock_held stays True everywhere
-        # else), but the page must not claim training is going.
-        running = False
-        stale_lock = True
-    return {"running": running, "step": step, "max_steps": max_steps, "loss": loss, "log_readable": readable,
-            "stale_lock": stale_lock}
+        state = "loading" if info["phase"] == "loading" or info["step"] is None else "running"
+    elif held:
+        if trainer_alive() is False:
+            # The lock is held but no trainer process exists: the run stopped or crashed and
+            # left its lock behind. The card stays reserved (lock_held stays True everywhere
+            # else), but the page must not claim training is going.
+            running, state, stale_lock = False, "stopped_lock_held", True
+        else:
+            running, quiet = True, newest is not None
+            state = "loading" if newest is not None and info["phase"] == "loading" else "running"
+    elif newest is None:
+        # No log and a free lock. A folder that could not be read is not proof
+        # the run stopped, so the page shows "unknown".
+        running = False if readable else None
+        state = "stopped" if readable else "unknown"
+    else:
+        alive = trainer_alive()
+        running, quiet = alive is True, alive is True
+        state = "running" if alive else "stopped"
+    return {**info, "running": running, "state": state, "log_readable": readable, "stale_lock": stale_lock,
+            "quiet": quiet, "log": str(newest) if newest else "", "updated_s": age}
+
+
+def _ago_words(seconds: int | None) -> str:
+    if seconds is None:
+        return "an unknown time"
+    if seconds < 90:
+        return f"{seconds} s"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min"
+    if seconds < 172800:
+        return f"{round(seconds / 3600)} h"
+    return f"{round(seconds / 86400)} days"
 
 
 def training_view() -> dict:
     now = time.time()
     cached = _training_cache.get("view")
-    if cached and now - float(_training_cache.get("at") or 0) < 60:
+    if cached and now - float(_training_cache.get("at") or 0) < 10:
         return cached
-    data_root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data"))
-    versions_path = data_root / "versions.json"
+    config = training_config()
+    root = data_root()
+    versions_path = root / "versions.json"
     active = ""
-    served = "Neuro"
     if file_state(versions_path) == "busy":
         active = "The version list could not be read."
     elif file_state(versions_path) == "file":
@@ -1240,58 +1566,71 @@ def training_view() -> dict:
             active = str(versions.get("activePeft") or "")[:80] if isinstance(versions, dict) else ""
         except (OSError, ValueError):
             active = "The version list could not be read."
-    state_path = data_root / "training" / "runs" / "neuro-ai-long-v1" / "checkpoint-6933" / "trainer_state.json"
-    step = 0
-    max_steps = 0
-    loss = None
-    history: list[float] = []
-    if state_path.is_file():
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            if not isinstance(state, dict):
-                raise ValueError("trainer_state.json is not an object")
-            step = int(state.get("global_step") or 0)
-            max_steps = int(state.get("max_steps") or 0)
-            for row in reversed(state.get("log_history") or []):
-                if isinstance(row, dict) and row.get("loss") is not None:
-                    value = round(float(row["loss"]), 4)
-                    if loss is None:
-                        loss = value
-                    history.append(value)
-                    if len(history) >= 8:
-                        break
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            step = 0
-    live = live_training(data_root)
-    if live["step"]:
-        step = live["step"]
-    if live["max_steps"]:
-        max_steps = live["max_steps"]
-    if live["loss"] is not None:
-        loss = live["loss"]
-    if live.get("stale_lock"):
-        reason = ("No training process is running on this PC, but the GPU lock file is still there. "
-                  "The run stopped or crashed. The card stays reserved until the lock is checked and "
-                  "removed by hand from an administrator window. Nothing was restarted.")
-    elif live["running"] is None:
-        reason = "The training log folder cannot be read by this page, so it cannot tell whether the run is going. Nothing was stopped. Training stays on this NVIDIA PC."
-    elif live["running"]:
-        reason = "Resumed on this NVIDIA PC from the saved checkpoint. The run continues on this computer. One training run is not split across computers. The dataset files are unchanged."
+    found = configured_log()
+    run_dir_raw = os.environ.get("NEURO_TRAINING_RUN_DIR", "").strip() or config.get("run_dir", "")
+    saved = run_state(Path(run_dir_raw)) if run_dir_raw else {}
+    live = live_training(root, found, int(saved.get("max_steps") or 0))
+    if not run_dir_raw and live.get("run_dir"):
+        run_dir_raw = live["run_dir"]
+        saved = run_state(Path(run_dir_raw))
+    step = live["step"] if live["step"] is not None else saved.get("step") or 0
+    max_steps = live["max_steps"] or saved.get("max_steps") or 0
+    history = live["history"] if len(live["history"]) >= 2 else (saved.get("history") or live["history"])
+    loss = live["loss"] if live["loss"] is not None else (history[-1] if history else None)
+    name = config.get("name") or (Path(run_dir_raw).name if run_dir_raw else "")
+    state = live["state"]
+    if state == "stopped_lock_held":
+        reason = ("No trainer process is running, but the GPU lock file is still there: the run stopped "
+                  "or crashed. Check the lock and remove it by hand. Nothing was restarted.")
+    elif state == "error":
+        reason = "The log ends with an error (below). Nothing was restarted."
+    elif state == "finished":
+        reason = "The run finished. Its checkpoints are in the run folder."
+    elif state == "loading":
+        reason = "Loading the model and the data. Steps start after that."
+    elif state == "running" and live["quiet"]:
+        reason = (f"The trainer is still there, but the log has not changed for {_ago_words(live['updated_s'])} "
+                  "(saving a checkpoint, or stuck).")
+    elif state == "running":
+        reason = "Training on this PC. One run is not split across computers."
+    elif state == "unknown":
+        reason = ("The training log cannot be read by this page, so the state is unknown. "
+                  "Point NEURO_TRAINING_LOG or training.json at a log this page can read.")
+    elif not live["log"]:
+        reason = ("No training log found. To show a run here, copy training.example.json to training.json "
+                  "next to mesh.py and set \"log\" to the run's log file, or set NEURO_TRAINING_LOG.")
     else:
-        reason = "Training stays on this NVIDIA PC. A joined computer can hold part of the served model only after chat is stopped and that computer is listening on its own LAN address. One training run is not split across the machines. The dataset files are unchanged."
+        reason = f"Not training. The log last changed {_ago_words(live['updated_s'])} ago."
     view = {
         # True, False, or None when the log folder cannot be read.
         "running": live["running"] if live["running"] is None else bool(live["running"]),
-        "state": "stopped_lock_held" if live.get("stale_lock") else
-                 "unknown" if live["running"] is None else "running" if live["running"] else "stopped",
-        "stale_lock": bool(live.get("stale_lock")),
-        "log_readable": bool(live.get("log_readable", True)),
-        "run": "neuro-ai-long-v1",
+        "state": state,
+        "phase": live["phase"],
+        "stale_lock": bool(live["stale_lock"]),
+        "log_readable": bool(live["log_readable"]),
+        "configured": found is not None,
+        "run": name[:80],
+        "run_dir": run_dir_raw[:300],
+        "log": live["log"][:300],
+        "updated_s": live["updated_s"],
+        "quiet": bool(live["quiet"]),
         "step": step,
         "max_steps": max_steps,
         "loss": loss,
-        "history": list(reversed(history)),
-        "served": served,
+        "history": history,
+        "eval_loss": live["eval_loss"],
+        "eval_history": live["eval_history"],
+        "epoch": live["epoch"],
+        "learning_rate": live["learning_rate"],
+        "s_per_it": live["s_per_it"],
+        "eta_s": live["eta_s"] if state in {"running", "loading"} else None,
+        "elapsed_s": live["elapsed_s"],
+        "load": live["load"] if state == "loading" else None,
+        "started": live["started"],
+        "last_event": live["last_event"],
+        "error": str(live["error"])[:240] if state == "error" else "",
+        "checkpoint": saved.get("checkpoint") or "",
+        "served": "Neuro",
         "active_adapter": active,
         "reason": reason,
         "datasets": dataset_index(),
@@ -1310,7 +1649,7 @@ def luau_binary() -> str | None:
         if state == "file":
             return override
     for candidate in (
-        Path(r"D:\liliai\tools\luau\luau.exe"),
+        ROOT.parent / "tools" / "luau" / "luau.exe",
         ROOT / "tools" / "luau.exe",
         ROOT / "tools" / "luau",
         ROOT / "luau.exe",
@@ -1580,7 +1919,7 @@ def save_spec(raw: dict) -> dict:
 def clean_url(value: str) -> str:
     parsed = urlparse(value.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
-        raise ValueError("Address must look like http://192.168.7.20:8781")
+        raise ValueError("Address must look like http://192.168.1.20:8781")
     return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
 
 
@@ -1918,10 +2257,32 @@ def start_discovery() -> None:
     threading.Thread(target=discovery_loop, name="neuro-discovery", daemon=True).start()
 
 
+_served_cache: dict = {"at": 0.0, "ids": set()}
+
+
+def served_model_ids(ttl: float = 15.0) -> set[str]:
+    """File names the chat server on 127.0.0.1:8080 says it serves (/v1/models)."""
+    now = time.time()
+    if now - float(_served_cache["at"]) < ttl:
+        return set(_served_cache["ids"])
+    ids: set[str] = set()
+    try:
+        with _DIRECT.open("http://127.0.0.1:8080/v1/models", timeout=1.5) as response:
+            body = read_reply(response)
+        rows = body.get("data") if isinstance(body, dict) else None
+        for row in rows if isinstance(rows, list) else []:
+            if isinstance(row, dict) and row.get("id"):
+                ids.add(str(row["id"]).replace("\\", "/").split("/")[-1].lower()[:200])
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+    _served_cache.update({"at": now, "ids": ids})
+    return set(ids)
+
+
 def known_models() -> list[dict]:
     models = []
-    data_root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data"))
-    folder = data_root / "models" / "gguf"
+    served = served_model_ids()
+    folder = data_root() / "models" / "gguf"
     paths: list[Path] = []
     try:
         if folder.is_dir():
@@ -1957,7 +2318,7 @@ def known_models() -> list[dict]:
                 "name": path.stem,
                 "path": str(path),
                 "mb": size // (1024 * 1024),
-                "loaded": "qwen3.5-9b" in path.name.lower() and "q5" in path.name.lower(),
+                "loaded": path.name.lower() in served or path.stem.lower() in served,
             }
         )
         if len(models) >= 8:
@@ -2094,13 +2455,19 @@ def mesh_snapshot() -> dict:
 
 
 def lan_host() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("192.168.7.1", 9))
-            host = sock.getsockname()[0]
-    except OSError:
-        return ""
-    return host if private_lan(host) else ""
+    """This computer's private LAN address. A UDP connect sends no packet; it
+    only asks the OS which interface would carry the route. The default route
+    (TEST-NET address) comes first, then the usual private ranges."""
+    for probe in ("192.0.2.1", "192.168.0.1", "192.168.1.1", "10.0.0.1", "172.16.0.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect((probe, 9))
+                host = sock.getsockname()[0]
+        except OSError:
+            continue
+        if private_lan(host):
+            return host
+    return ""
 
 
 def ask_check(url: str) -> dict:
@@ -3382,11 +3749,13 @@ def expand_samples(kind: str, raw: object) -> list[object]:
 
 
 def training_roots() -> list[Path]:
-    roots = [Path(r"D:\liliai\neuro-ai-data\training")]
+    # The default folder is always refused, also when NEURO_AI_DATA or
+    # training.json points somewhere else.
+    roots = [ROOT.parent / "neuro-ai-data" / "training", data_root() / "training"]
     env = os.environ.get("NEURO_AI_DATA", "").strip()
     if env:
         roots.append(Path(env) / "training")
-    return roots
+    return list(dict.fromkeys(roots))
 
 
 def pairs_target(name: str, jobs_folder: Path) -> Path:
@@ -4178,12 +4547,14 @@ class JobAuthError(Exception):
 # --- finding the main PC (serve) without NEURO_MESH_URL ---------------------
 # Order: NEURO_MESH_URL, then the address remembered in mesh_url.txt, then a
 # sweep of this computer's own private /24 for a serve that says so on GET
-# /hello, then the old default. Finding a serve grants nothing: pairing still
+# /hello, then this computer itself. Finding a serve grants nothing: pairing still
 # needs the code approved on that main PC's page, and a worker that already
 # holds a cluster.token only takes a found serve that proves it holds the
 # same token (HMAC of a fresh nonce), so the token is never sent to a device
 # that merely answers /hello.
-DEFAULT_MESH_URL = "http://192.168.7.14:8780"
+# Last fallback only: this computer itself (a main PC may also run a worker).
+# Set NEURO_MESH_URL when discovery cannot see the main PC.
+DEFAULT_MESH_URL = "http://127.0.0.1:8780"
 MESH_URL_PATH = ROOT / "mesh_url.txt"
 _mesh_url_lock = threading.Lock()
 _mesh_url_cache: dict = {"url": None}
@@ -4314,7 +4685,7 @@ def find_mesh_url(discover=discover_serves, prove=serve_proof_ok, say=print) -> 
             say(f"  {item['url']} ({item.get('name') or 'no name'})")
         say("Set NEURO_MESH_URL to the one this computer should work for, then start the worker again.")
         return ""
-    say(f"No main PC answered. Trying the default {DEFAULT_MESH_URL}; set NEURO_MESH_URL if yours is elsewhere.")
+    say(f"No main PC answered. Trying {DEFAULT_MESH_URL} (this computer); set NEURO_MESH_URL=http://<main PC>:{DASHBOARD_PORT} if yours is elsewhere.")
     return lan_url(DEFAULT_MESH_URL)
 
 
@@ -4876,7 +5247,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(
                     409,
                     {
-                        "error": "Training is already running from the saved checkpoint. No dataset file was changed." if view.get("running") else "Training did not start. This page cannot read the training log, so it does not start a second run. No dataset file was changed." if view.get("running") is None else "Training did not start because the loaded model is using the GPU. No dataset file was changed. " + str(len(view.get("datasets") or [])) + " dataset files are listed on this page.",
+                        "error": "A training run is already going. No dataset file was changed." if view.get("running") else "The training state is unknown, so no second run is started. No dataset file was changed." if view.get("running") is None else "This page does not start training. Start your trainer yourself; its log appears on the Training page once training.json points at it. No dataset file was changed.",
                         "datasets": view.get("datasets") or [],
                     },
                 )

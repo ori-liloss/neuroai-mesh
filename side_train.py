@@ -1,8 +1,8 @@
-"""Small-model LoRA experiments for a side machine (for example the RTX 3050 laptop).
+"""Small-model LoRA experiments for a side machine (for example a laptop GPU).
 
 The big run stays on the main NVIDIA PC. This script answers cheap questions before the big run
 spends days of GPU time: which learning rate, which data mix, does a new batch of verified rows
-help or hurt. Results transfer roughly, not exactly, to the 7B.
+help or hurt. Results transfer roughly, not exactly, to the big model.
 
 Data: a JSONL file of {"messages": [{"role": ..., "content": ...}, ...]} rows, e.g. the verified
 rows exported by `mesh.py jobs export`. A fixed slice is held out for eval.
@@ -23,8 +23,10 @@ import random
 import stat
 import sys
 
-MAIN_LOCK = Path(r"D:\liliai\train_local\gpu.lock")
-LIVE = Path(r"D:\liliai\neuro-ai-data\training")
+# Same defaults as mesh.py: folders next to this repo, or NEURO_GPU_LOCK / NEURO_AI_DATA.
+_HERE = Path(__file__).resolve().parent
+MAIN_LOCK = Path(os.environ.get("NEURO_GPU_LOCK") or (_HERE.parent / "train_local" / "gpu.lock"))
+LIVE = Path(os.environ.get("NEURO_AI_DATA") or (_HERE.parent / "neuro-ai-data")) / "training"
 
 
 def busy(path):

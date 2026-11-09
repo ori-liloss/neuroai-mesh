@@ -7,7 +7,7 @@
 # Run it in Desktop mode, from Konsole:
 #   git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuroai-mesh && sh ~/neuroai-mesh/platforms/steamdeck.sh
 # Next time:  sh ~/neuroai-mesh/platforms/steamdeck.sh
-# Another main PC address:  NEURO_MESH_URL=http://192.168.1.20:8780 sh ~/neuroai-mesh/platforms/steamdeck.sh
+# If the main PC is not found by itself:  NEURO_MESH_URL=http://<main PC>:8780 sh ~/neuroai-mesh/platforms/steamdeck.sh
 # Ctrl+C stops the worker and the model it started. Nothing is installed system-wide.
 set -eu
 
@@ -22,8 +22,7 @@ for tool in python3 curl tar; do
   command -v "$tool" >/dev/null 2>&1 || { echo "$tool was not found. Install it first."; exit 1; }
 done
 
-NEURO_MESH_URL=${NEURO_MESH_URL:-http://192.168.7.14:8780}
-export NEURO_MESH_URL
+# No NEURO_MESH_URL: mesh.py finds the main PC on this network and remembers it in mesh_url.txt.
 LLAMA_DIR="$HOME/llama"
 MODEL_DIR="$HOME/models"
 MODEL="$MODEL_DIR/Qwen3.5-4B-UD-Q4_K_XL.gguf"
@@ -153,7 +152,7 @@ for release in releases if isinstance(releases, list) else []:
 }
 get_luau || echo "      luau download skipped. The worker runs without verify_luau jobs."
 
-echo "[4/4] Starting the Neuro worker. Main PC: $NEURO_MESH_URL"
+echo "[4/4] Starting the Neuro worker. Main PC: ${NEURO_MESH_URL:-found on this network}"
 echo "      A pairing code (Pairing code: ### ###) appears in about 30 seconds."
 echo "      Approve it on the main PC's Neuro page. Ctrl+C stops everything."
 python3 -u mesh.py work
