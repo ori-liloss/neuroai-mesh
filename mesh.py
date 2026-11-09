@@ -172,10 +172,167 @@ _found: list[dict] = []
 _heavy_cache = {"at": 0.0, "rows": []}
 
 
-def authorized(header: str | None) -> bool:
-    expected = "Bearer " + token()
-    got = header or ""
+def authorized(header: str | None, secret: str | None = None) -> bool:
+    """Constant-time check of an `Authorization: Bearer <cluster.token>`
+    header. Compared as bytes: compare_digest refuses non-ASCII str, and a
+    header is whatever the client sent."""
+    secret = token() if secret is None else secret
+    if not secret:
+        return False
+    expected = ("Bearer " + secret).encode("utf-8")
+    got = (header or "").encode("utf-8", errors="replace")
     return hmac.compare_digest(got, expected)
+
+
+NO_TOKEN_NOTE = (
+    "This computer has no cluster.token, so it refuses remote controls. "
+    "Copy cluster.token from the main PC into this worker's folder, next to mesh.py."
+)
+
+
+def saved_token() -> str:
+    """This computer's cluster.token, or "" when there is none. Unlike
+    token() it never makes a new one: a worker must hold the main PC's
+    token, and a random one made here would only fail later as a mismatch."""
+    if file_state(TOKEN_PATH) == "missing":
+        return ""
+    try:
+        return token()
+    except (RuntimeError, OSError, UnicodeDecodeError):
+        return ""
+
+
+# --- proof before the token leaves this PC ---------------------------------
+# Any device on the LAN can answer /hello. Before serve sends cluster.token
+# to a computer, that computer must prove it already holds the same token:
+# serve sends a fresh random nonce, the worker answers
+# HMAC-SHA256(token, "neuro-proof:" + nonce + "|" + its own ip:port). The
+# address is the local end of the TCP connection as the worker sees it, so a
+# rogue device cannot relay a real worker's answer as its own. A good proof
+# is cached per URL for a few minutes.
+PROOF_SECONDS = 300.0
+PROOF_RATE = (30, 60.0)  # answers per client address per window (seconds)
+_NONCE = re.compile(r"^[0-9a-f]{32,128}$")
+_HEX64_PROOF = re.compile(r"^[0-9a-f]{64}$")
+_proof_lock = threading.Lock()
+_proofs: dict[str, float] = {}
+_proof_hits: dict[str, list[float]] = {}
+PROOF_MISSING_NOTE = "That computer has no cluster.token, so this PC did not send its token. Copy cluster.token there by hand."
+PROOF_MISMATCH_NOTE = "That computer has no matching cluster.token, so this PC did not send its token. Copy cluster.token there by hand."
+PROOF_OLD_NOTE = "That computer is running an older worker, so this PC did not send its token. Pull and start it again."
+
+
+class WorkerProofError(RuntimeError):
+    """The worker did not prove it holds this PC's token. No token was sent.
+    `answered` is False when the computer did not answer at all."""
+
+    def __init__(self, note: str, answered: bool = True) -> None:
+        super().__init__(note)
+        self.answered = answered
+
+
+def proof_digest(secret: str, nonce: str, address: str) -> str:
+    message = b"neuro-proof:" + nonce.encode("ascii") + b"|" + address.encode("ascii")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def proof_ok(secret: str, nonce: str, address: str, answer: object) -> bool:
+    if not secret or not isinstance(answer, str) or not _HEX64_PROOF.match(answer):
+        return False
+    return hmac.compare_digest(proof_digest(secret, nonce, address).encode("ascii"), answer.encode("ascii"))
+
+
+def proof_rate_ok(client: str, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    limit, window = PROOF_RATE
+    with _proof_lock:
+        hits = [at for at in _proof_hits.get(client, []) if now - at < window]
+        allowed = len(hits) < limit
+        if allowed:
+            hits.append(now)
+        _proof_hits[client] = hits
+        if len(_proof_hits) > 1024:
+            for key in [key for key, value in _proof_hits.items() if not value]:
+                _proof_hits.pop(key, None)
+    return allowed
+
+
+def forget_proof(url: str) -> None:
+    with _proof_lock:
+        _proofs.pop(url, None)
+
+
+def prove_worker(base: str) -> None:
+    """Raise WorkerProofError unless the worker at `base` (a clean_url)
+    proves it holds this PC's cluster.token. Never sends the token."""
+    with _proof_lock:
+        if _proofs.get(base, 0.0) > time.time():
+            return
+    parsed = urlparse(base)
+    try:
+        address = f"{socket.gethostbyname(parsed.hostname or '')}:{parsed.port}"
+    except OSError as exc:
+        raise WorkerProofError("That computer's address could not be resolved, so this PC did not send its token.", answered=False) from exc
+    nonce = secrets.token_hex(16)
+    request = urllib.request.Request(base + "/hello/proof?nonce=" + nonce)
+    try:
+        with _DIRECT.open(request, timeout=4) as response:
+            body = read_reply(response)
+    except urllib.error.HTTPError as exc:
+        raise WorkerProofError(PROOF_OLD_NOTE if exc.code == 404 else PROOF_MISMATCH_NOTE) from None
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        raise WorkerProofError("That computer did not answer the token check, so this PC did not send its token.", answered=False) from exc
+    if not isinstance(body, dict):
+        raise WorkerProofError(PROOF_MISMATCH_NOTE)
+    if body.get("has_token") is False:
+        raise WorkerProofError(PROOF_MISSING_NOTE)
+    if not proof_ok(token(), nonce, address, body.get("proof")):
+        raise WorkerProofError(PROOF_MISMATCH_NOTE)
+    with _proof_lock:
+        _proofs[base] = time.time() + PROOF_SECONDS
+
+
+def worker_call(url: str, path: str, body: dict | None = None, timeout: float = 5.0) -> object:
+    """serve -> worker request that carries cluster.token. The token is only
+    added here, after the worker proved it holds the same token; the page
+    never sees it. POST with a JSON body, or GET when body is None. Raises
+    WorkerProofError (nothing sent), HTTPError, URLError, OSError, ValueError."""
+    base = clean_url(url)
+    prove_worker(base)
+    headers = {"Authorization": "Bearer " + token()}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        base + path,
+        data=None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="GET" if body is None else "POST",
+        headers=headers,
+    )
+    try:
+        # No proxy and no redirect: the request carries the cluster token.
+        with _DIRECT.open(request, timeout=timeout) as response:
+            if response.status == 204:
+                return {}
+            return read_reply(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            forget_proof(base)
+        raise
+
+
+def worker_refusal(exc: urllib.error.HTTPError) -> str:
+    """Plain words for a worker that refused a control request."""
+    detail = error_detail(exc)
+    if exc.code == 404:
+        return "That computer is running an older worker. Pull and start it again."
+    if exc.code == 401:
+        return (
+            "That computer did not accept this PC's cluster.token. Copy cluster.token from this PC "
+            "into its folder (or pull and restart an older worker)."
+        )
+    if exc.code == 403 and "cluster.token" in detail:
+        return "That computer has no cluster.token yet. Copy cluster.token from this PC into its folder."
+    return detail or f"http {exc.code}"
 
 
 def ram_mib() -> dict:
@@ -984,12 +1141,7 @@ def clean_url(value: str) -> str:
 
 
 def fetch_worker(url: str) -> dict:
-    request = urllib.request.Request(
-        url.rstrip("/") + "/status",
-        headers={"Authorization": "Bearer " + token()},
-    )
-    with open_limited(request, 4) as response:
-        body = read_reply(response)
+    body = worker_call(url, "/status", None, 4)
     if not isinstance(body, dict):
         raise ValueError("Bad worker response")
     return body
@@ -1014,6 +1166,13 @@ def fetch_public(url: str, path: str) -> dict:
 def pull_legacy(url: str) -> dict:
     try:
         return {"url": url, "ok": True, "status": fetch_worker(url)}
+    except WorkerProofError as exc:
+        if not exc.answered:
+            return {"url": url, "ok": False, "error": "no reply"}
+        # It answered but did not prove the token: shown by address only,
+        # and this PC's token was not sent to it.
+        host = urlparse(url).hostname or url
+        return {"url": url, "ok": True, "limited": True, "status": {"name": "worker at " + host, "os": "", "ram": {}}}
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             # An old worker with its own token. It is running, but it says
@@ -1501,19 +1660,12 @@ def lan_host() -> str:
 
 
 def ask_check(url: str) -> dict:
-    request = urllib.request.Request(
-        url.rstrip("/") + "/check",
-        data=b'{"rounds":3}',
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            body = read_reply(response)
+        body = worker_call(url, "/check", {"rounds": 3}, 20)
+    except WorkerProofError as exc:
+        return {"url": url, "ok": False, "error": str(exc)}
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 404}:
-            return {"url": url, "ok": False, "error": "That computer is running an older worker. Pull and start it again."}
-        return {"url": url, "ok": False, "error": f"http {exc.code}"}
+        return {"url": url, "ok": False, "error": worker_refusal(exc)}
     except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
         return {"url": url, "ok": False, "error": "no reply"}
     if not isinstance(body, dict):
@@ -1616,23 +1768,15 @@ def offer_share() -> dict:
     for item in peers:
         url = str(item["url"]).rstrip("/")
         name = str((item.get("status") or {}).get("name") or url)
-        request = urllib.request.Request(
-            url + "/rpc/start",
-            data=b"{}",
-            method="POST",
-            headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"},
-        )
         try:
-            with open_limited(request, 8) as response:
-                body = read_reply(response)
+            body = worker_call(url, "/rpc/start", {}, 8)
             body = body if isinstance(body, dict) else {}
             listening = bool(body.get("started") or body.get("already"))
             results.append({"name": name, "ok": listening, "detail": "listening" if listening else "answered"})
+        except WorkerProofError as exc:
+            results.append({"name": name, "ok": False, "detail": str(exc)})
         except urllib.error.HTTPError as exc:
-            detail = error_detail(exc)
-            if "token" in detail.lower():
-                detail = "That computer is running an older worker. Pull and start it again."
-            results.append({"name": name, "ok": False, "detail": detail})
+            results.append({"name": name, "ok": False, "detail": worker_refusal(exc)})
         except (OSError, urllib.error.URLError, ValueError) as exc:
             results.append({"name": name, "ok": False, "detail": str(exc)[:180]})
     return {
@@ -1748,22 +1892,14 @@ def stop_at(url: str, pid: int, name: str = "") -> dict:
         return {"stopped": False, "note": "That address is not a joined computer."}
     if not peer_known(clean):
         return {"stopped": False, "note": "That computer is not connected."}
-    request = urllib.request.Request(
-        clean + "/process/stop",
-        data=json.dumps({"pid": pid, "name": name}).encode("utf-8"),
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            body = read_reply(response)
+        body = worker_call(clean, "/process/stop", {"pid": pid, "name": name}, 20)
         if isinstance(body, dict):
             return {"stopped": bool(body.get("stopped")), "note": clip(body.get("note") or "", 240)}
+    except WorkerProofError as exc:
+        return {"stopped": False, "note": str(exc)}
     except urllib.error.HTTPError as exc:
-        detail = error_detail(exc)
-        if exc.code in {404, 401} or "token" in detail.lower():
-            return {"stopped": False, "note": "That computer is running an older worker. Pull and start it again."}
-        return {"stopped": False, "note": detail or "Could not stop that process."}
+        return {"stopped": False, "note": worker_refusal(exc) or "Could not stop that process."}
     except (OSError, urllib.error.URLError, ValueError):
         return {"stopped": False, "note": "That computer did not answer."}
     return {"stopped": False, "note": "Could not stop that process."}
@@ -3407,7 +3543,9 @@ def run_job(job: dict) -> tuple[bool, dict]:
 
 
 class JobAuthError(Exception):
-    pass
+    def __init__(self, missing: bool = False) -> None:
+        super().__init__("no cluster.token" if missing else "token mismatch")
+        self.missing = missing
 
 
 def mesh_url() -> str:
@@ -3432,11 +3570,16 @@ def machine_busy() -> str:
 
 
 def _mesh_post(base: str, path: str, body: dict, timeout: float) -> tuple[int, object]:
+    # saved_token, not token: a worker without the main PC's token must not
+    # make up its own one.
+    secret = saved_token()
+    if not secret:
+        raise JobAuthError(missing=True)
     request = urllib.request.Request(
         base + path,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
-        headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"},
+        headers={"Authorization": "Bearer " + secret, "Content-Type": "application/json"},
     )
     try:
         with _DIRECT.open(request, timeout=timeout) as response:
@@ -3466,6 +3609,7 @@ def job_loop() -> None:
             _job_state["paused"] = busy
             if kinds and not busy:
                 code, job = _mesh_post(base, "/jobs/next", {"node": node, "kinds": kinds}, 10)
+                _job_state["told"] = ""
                 if code == 200 and isinstance(job, dict) and job.get("kind") in kinds and job.get("id") and job.get("lease"):
                     _job_state["current"] = str(job["kind"])
                     ok, output = run_job(job)
@@ -3481,12 +3625,19 @@ def job_loop() -> None:
                     _job_state["done" if ok else "failed"] = int(_job_state.get("done" if ok else "failed") or 0) + 1
                     _job_state["current"] = ""
                     wait = 1.0
-        except JobAuthError:
-            # Never print the token. Only say that it does not match.
-            if _job_state.get("paused") != "token":
-                print("Jobs paused: this computer's cluster.token is not the main PC's token.", flush=True)
-            _job_state["paused"] = "token"
-            wait = 600.0
+        except JobAuthError as exc:
+            # Never print the token. Only say that it is missing or does not match.
+            state = "no token" if exc.missing else "token"
+            if _job_state.get("told") != state:
+                _job_state["told"] = state
+                print(
+                    "Jobs paused: this computer has no cluster.token. Copy it from the main PC."
+                    if exc.missing
+                    else "Jobs paused: this computer's cluster.token is not the main PC's token.",
+                    flush=True,
+                )
+            _job_state["paused"] = state
+            wait = 60.0 if exc.missing else 600.0
         except (OSError, urllib.error.URLError, ValueError):
             wait = 30.0
         except Exception as exc:
@@ -3495,6 +3646,41 @@ def job_loop() -> None:
         finally:
             _job_state["current"] = ""
         time.sleep(wait)
+
+
+def read_job_file(kind_arg: str, path: str) -> tuple[list[tuple[str, dict]], list[str]]:
+    """Parse and check a `jobs add` file without queueing anything or
+    contacting serve. Returns ([(kind, raw row)], ["line N: why", ...])."""
+    kind = kind_arg
+    need_verify = kind == "generate-verify"
+    if need_verify:
+        kind = "generate"
+    if kind not in JOB_KINDS:
+        raise SystemExit("Unknown kind. Use generate-verify or one of " + ", ".join(JOB_KINDS))
+    rows: list[tuple[str, dict]] = []
+    errors: list[str] = []
+    planned = 0
+    try:
+        handle = open(path, "r", encoding="utf-8-sig")
+    except OSError as exc:
+        raise SystemExit(f"Cannot read {path}: {exc.strerror}")
+    with handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            if planned >= 100000:
+                errors.append(f"line {number}: stopped at 100000 jobs")
+                break
+            try:
+                raw = json.loads(line)
+                if need_verify and not (isinstance(raw, dict) and isinstance(raw.get("verify"), dict)):
+                    raise JobError("generate-verify rows need a verify object")
+                validate_job(kind, raw)
+                rows.append((kind, raw))
+                planned += len(expand_samples(kind, raw))
+            except ValueError as exc:
+                errors.append(f"line {number}: {exc}")
+    return rows, errors
 
 
 def jobs_main(args: list[str]) -> None:
@@ -3507,36 +3693,8 @@ def jobs_main(args: list[str]) -> None:
     queue = JobQueue()
     command = args[0]
     if command == "add" and len(args) == 3:
-        kind = args[1]
-        need_verify = kind == "generate-verify"
-        if need_verify:
-            kind = "generate"
-        if kind not in JOB_KINDS:
-            raise SystemExit("Unknown kind. Use generate-verify or one of " + ", ".join(JOB_KINDS))
-        rows: list[tuple[str, dict]] = []
-        errors: list[str] = []
-        planned = 0
-        try:
-            handle = open(args[2], "r", encoding="utf-8-sig")
-        except OSError as exc:
-            raise SystemExit(f"Cannot read {args[2]}: {exc.strerror}")
-        with handle:
-            for number, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                if planned >= 100000:
-                    errors.append(f"line {number}: stopped at 100000 jobs")
-                    break
-                try:
-                    raw = json.loads(line)
-                    if need_verify and not (isinstance(raw, dict) and isinstance(raw.get("verify"), dict)):
-                        raise JobError("generate-verify rows need a verify object")
-                    validate_job(kind, raw)
-                    rows.append((kind, raw))
-                    planned += len(expand_samples(kind, raw))
-                except ValueError as exc:
-                    errors.append(f"line {number}: {exc}")
-        needed = {kind for kind, _ in rows} | {raw["verify"].get("kind") for _, raw in rows if isinstance(raw.get("verify"), dict)}
+        rows, errors = read_job_file(args[1], args[2])
+        needed ={kind for kind, _ in rows} | {raw["verify"].get("kind") for _, raw in rows if isinstance(raw.get("verify"), dict)}
         known = serve_job_kinds()
         if known is not None and not needed <= known:
             missing = ", ".join(sorted(str(item) for item in needed - known))
@@ -3644,6 +3802,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def worker_token_ok(self) -> bool:
+        """Worker side: the request must carry `Authorization: Bearer
+        <cluster.token>`. Sends the refusal and returns False otherwise. A
+        worker with no cluster.token refuses with a clear message and does
+        not make one up."""
+        secret = saved_token()
+        if not secret:
+            self.send_json(403, {"error": NO_TOKEN_NOTE})
+            return False
+        if not authorized(self.headers.get("Authorization"), secret):
+            self.send_json(401, {"error": "token"})
+            return False
+        return True
+
     def read_json(self, limit: int = 10000) -> dict:
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -3666,11 +3838,28 @@ class Handler(BaseHTTPRequestHandler):
                 payload["port"] = WORKER_PORT
                 self.send_json(200, payload)
                 return
+            if path == "/hello/proof":
+                # Read-only. Answers an HMAC of serve's nonce; never the token
+                # or a plain hash of it.
+                if not proof_rate_ok(str(self.client_address[0])):
+                    self.send_json(429, {"error": "Too many token checks. Try again in a minute."})
+                    return
+                nonce = (parse_qs(urlparse(self.path).query).get("nonce") or [""])[0]
+                if not _NONCE.match(nonce):
+                    self.send_json(400, {"error": "Send nonce as 32 to 128 lowercase hex characters."})
+                    return
+                secret = saved_token()
+                if not secret:
+                    self.send_json(200, {"app": "neuroai-mesh", "has_token": False, "note": NO_TOKEN_NOTE})
+                    return
+                local = self.connection.getsockname()
+                address = f"{local[0]}:{local[1]}"
+                self.send_json(200, {"app": "neuroai-mesh", "has_token": True, "proof": proof_digest(secret, nonce, address)})
+                return
             if path != "/status":
                 self.send_json(404, {"error": "not found"})
                 return
-            if not authorized(self.headers.get("Authorization")):
-                self.send_json(401, {"error": "token"})
+            if not self.worker_token_ok():
                 return
             self.send_json(200, local_status())
             return
@@ -3729,8 +3918,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if self.mode == "work":
-            # Listening for a shared run does not use the other computer's token.
-            # Each machine keeps its own token, and this port stays on the LAN.
+            # Every POST on the worker changes or starts something (agent
+            # check, process stop, RPC start/stop), so all of them need the
+            # main PC's token on top of the LAN-only and Origin checks. Only
+            # `mesh.py serve` sends it; the page never has it.
+            if not self.worker_token_ok():
+                return
             if path == "/check":
                 body = self.read_json()
                 try:
@@ -3772,9 +3965,6 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     self.send_json(409, {"error": "ggml-rpc-server could not be started on this machine."})
                     return
-            if not authorized(self.headers.get("Authorization")):
-                self.send_json(401, {"error": "token"})
-                return
             self.send_json(404, {"error": "not found"})
             return
         if path in {"/jobs/next", "/jobs/result"}:
@@ -3891,17 +4081,14 @@ class Handler(BaseHTTPRequestHandler):
                 if action not in {"start", "stop"}:
                     self.send_json(404, {"error": "not found"})
                     return
-                request = urllib.request.Request(
-                    target.rstrip("/") + f"/rpc/{action}",
-                    data=b"{}",
-                    method="POST",
-                    headers={
-                        "Authorization": "Bearer " + token(),
-                        "Content-Type": "application/json",
-                    },
-                )
-                with open_limited(request, 5) as response:
-                    payload = read_reply(response)
+                try:
+                    payload = worker_call(target, f"/rpc/{action}", {}, 5)
+                except WorkerProofError as exc:
+                    self.send_json(409, {"error": str(exc)})
+                    return
+                except urllib.error.HTTPError as exc:
+                    self.send_json(502, {"error": worker_refusal(exc)})
+                    return
                 self.send_json(200, payload if isinstance(payload, dict) else {"ok": True})
                 return
         except RuntimeError as exc:
@@ -3958,10 +4145,15 @@ def serve(mode: str) -> None:
     else:
         server = ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), Handler)
         print(f"Neuro worker on port {WORKER_PORT}", flush=True)
-        print(f"token id {token_id()}", flush=True)
+        # A worker never makes its own token: it must use the main PC's.
+        if saved_token():
+            print(f"token id {token_id()}", flush=True)
+        else:
+            print(NO_TOKEN_NOTE, flush=True)
         if os.environ.get("NEURO_JOBS", "1").strip() != "0":
             threading.Thread(target=job_loop, name="neuro-jobs", daemon=True).start()
-    token()
+    if mode == "serve":
+        token()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

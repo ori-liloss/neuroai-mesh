@@ -114,12 +114,16 @@ python mesh.py jobs export verified.jsonl
 
 A `prompts.jsonl` row looks like `{"prompt": "What is 6*7?", "verify": {"kind": "verify_math", "expected": "42"}, "max_tokens": 512}`. When a generated reply comes back, the matching verify job is queued by itself. `export` writes only replies that passed into `jobs/verified.jsonl`, as chat rows for the next training run. Other kinds: `python mesh.py jobs add verify_math rows.jsonl` with rows like `{"answer": "...", "expected": "42"}`, `dedup_hash` with `{"texts": ["...", "..."]}`.
 
+A ready coding set is in `seeds/coding-v1.jsonl`: 321 prompts (JavaScript, TypeScript, HTML/CSS, SQLite, Python, Luau; about 10% in Hebrew), each with its code verifier and `"samples": 4`.
+Queue it on the main PC with `python mesh.py jobs add generate-verify seeds/coding-v1.jsonl` (1284 generate jobs); workers with a local model pick them up once they hold `cluster.token`.
+Check progress with `python mesh.py jobs status`, then `python mesh.py jobs export coding-v1-verified.jsonl` keeps one verified answer per prompt.
+
 The **Jobs** page shows queued, leased, done and failed counts per kind and per computer, and the Machines page shows which kinds each computer can run.
 
 ### Each worker, once
 
 1. `git pull`, then stop and start `mesh.py work` again (Mac: `bash platforms/start-mac.sh`).
-2. Copy `cluster.token` from the main PC into the worker's folder by hand (USB stick or a private copy). The job endpoints need the main PC's token; the page never sends it. Without it the worker says "Jobs paused" and keeps working as before.
+2. Copy `cluster.token` from the main PC into the worker's folder by hand (USB stick or a private copy). The job endpoints need the main PC's token; the page never sends it. The worker's control routes (Stop, RPC start/stop, agent check) also need it, and `mesh.py serve` adds it for the page, but only after that computer answers a fresh challenge (`/hello/proof`) proving it already holds the same token; a computer that cannot prove it never receives the token. Without it the worker says "Jobs paused", refuses those controls with a clear message, and still answers `/hello`.
 3. If the main PC is not `192.168.7.14`, set `NEURO_MESH_URL=http://<main PC>:8780` before starting the worker. `NEURO_JOBS=0` turns jobs off.
 
 A worker takes no job while its CPU is above 75 %, it has under 1 GB free memory, or the GPU lock is held.

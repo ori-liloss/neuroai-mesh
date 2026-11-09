@@ -11,12 +11,12 @@ import http.client
 import json
 import locale
 import os
-import stat
 import random
 import re
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -24,16 +24,67 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import NamedTuple
 
-ROOT = Path(__file__).resolve().parent
-HOME = ROOT
-DB_PATH = ROOT / "agents.db"
-STOP_PATH = ROOT / "agents.stop"
-LOG_DIR = ROOT / "agent-logs"
-WORKER_SCRIPT = ROOT / "mesh.py"
+# Where this copy lives. The same file runs in two places:
+# - inside neuro-cluster (mesh.py next to it, the other computers): the repo is this folder.
+# - in neuro-agents on the main PC: the repo is the sibling neuro-cluster folder when it has
+#   mesh.py, while the queue, logs and workspace stay in this folder.
+# HOME holds agents.db, agent-logs, workspace and the stop files. ROOT is the repo the tools see.
+HOME = Path(__file__).resolve().parent
+
+
+def _mesh_state(folder: Path) -> str:
+    """'file' when folder/mesh.py is a regular file, 'missing' when absent, 'unknown' otherwise."""
+    try:
+        info = (folder / "mesh.py").stat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unknown"
+    return "file" if stat.S_ISREG(info.st_mode) else "missing"
+
+
+# An unreadable mesh.py here still counts as inside the cluster: the narrower tree is the safe pick.
+IN_CLUSTER = _mesh_state(HOME) != "missing"
+if IN_CLUSTER:
+    ROOT = HOME
+else:
+    ROOT = HOME.parent / "neuro-cluster"
+    if _mesh_state(ROOT) == "missing":
+        ROOT = HOME
+DB_PATH = HOME / "agents.db"
+STOP_PATH = HOME / "agents.stop"
+LOG_DIR = HOME / "agent-logs"
+# Workers start this same file ("agents.py agent"), so a worker always runs the code and the
+# queue of the copy that started it. mesh.py on the main PC imports ../neuro-agents first, so
+# "mesh.py agent" there would run the other copy against the other agents.db.
+WORKER_SCRIPT = Path(__file__).resolve()
+
+
+def stop_requested(path: Path) -> bool:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def regular_file(path: Path) -> bool:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return stat.S_ISREG(info.st_mode)
 
 
 def tree_for(raw: str) -> Path:
+    if raw in {"agent-logs", "workspace"} or raw.startswith("agent-logs/") or raw.startswith("workspace/"):
+        return HOME
     return ROOT
 
 
@@ -43,7 +94,20 @@ HEALTH_URL = CHAT_URL.split("/v1/", 1)[0].rstrip("/") + "/health"
 # FileNotFoundError on this file means the GPU is free. Anything else means training owns it.
 GPU_LOCK = Path(os.environ.get("NEURO_GPU_LOCK") or (HOME.parent / "train_local" / "gpu.lock"))
 REQUEST_TIMEOUT = 180
-CONTEXT_CHARS = int(os.environ.get("NEURO_CONTEXT_CHARS") or 9000)
+# The server has 16384 tokens of context shared by 4 slots (--kv-unified). About 40000 characters
+# is roughly 10-12k tokens. ContextFull from the server still halves this for one retry.
+DEFAULT_CONTEXT_CHARS = 40000
+
+
+def _env_chars(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name) or default)
+    except ValueError:
+        return default
+    return max(4000, min(value, 200000))
+
+
+CONTEXT_CHARS = _env_chars("NEURO_CONTEXT_CHARS", DEFAULT_CONTEXT_CHARS)
 TOOL_CHARS = 2400
 MAX_TURNS = 6
 REAP_AFTER = 180
@@ -232,10 +296,12 @@ def worker_cap(requested: int) -> int:
 
 def enqueue(title: str, prompt: str) -> int:
     now = time.time()
+    # The task kind rides on the first line of the prompt. No schema change; run_agent strips it.
+    stamped = stamp_kind(prompt)
     with connect() as db:
         cursor = db.execute(
             "INSERT INTO jobs (title, prompt, status, created, updated) VALUES (?, ?, 'queued', ?, ?)",
-            (title.strip()[:80] or "task", prompt.strip()[:4000], now, now),
+            (title.strip()[:80] or "task", stamped, now, now),
         )
         return int(cursor.lastrowid)
 
@@ -368,7 +434,7 @@ def keep_alive(pid: int, done: threading.Event) -> None:
 def model_state(timeout: float = 2.0) -> tuple[bool, str]:
     try:
         with _OPENER.open(HEALTH_URL, timeout=timeout) as response:
-            response.read()
+            response.read(4_000)
         return True, ""
     except urllib.error.HTTPError as exc:
         if exc.code == 503:
@@ -384,7 +450,7 @@ def model_state(timeout: float = 2.0) -> tuple[bool, str]:
 
 def _http_detail(exc: urllib.error.HTTPError) -> str:
     try:
-        raw = exc.read().decode("utf-8", errors="replace")
+        raw = exc.read(4_000).decode("utf-8", errors="replace")
     except (OSError, ValueError):
         return ""
     finally:
@@ -401,27 +467,38 @@ def _http_detail(exc: urllib.error.HTTPError) -> str:
     return raw[:300]
 
 
-def chat(messages: list[dict], max_tokens: int = 1000, *, think: bool = False, stop: list[str] | None = None) -> dict:
+def chat(
+    messages: list[dict],
+    max_tokens: int = 1000,
+    *,
+    think: bool = False,
+    stop: list[str] | None = None,
+    _open=None,
+    _sleep=None,
+) -> dict:
     payload = {
         "messages": messages,
         "temperature": 0.6 if think else 0.4,
         "max_tokens": max(64, min(int(max_tokens), 4096)),
-        # Thinking stays off unless the user asked for Deep mode.
+        # Thinking follows the task kind (KIND_BUDGET) or Deep mode.
         "chat_template_kwargs": {"enable_thinking": bool(think)},
         "cache_prompt": True,
     }
     if stop:
         payload["stop"] = list(stop)
     data = json.dumps(payload).encode("utf-8")
+    opener = _open or _OPENER.open
+    pause = _sleep or time.sleep
     delays = (0, 2, 5, 10)
     problem = ""
     body = None
+    hard = 0
     for attempt, delay in enumerate(delays):
         if delay:
-            time.sleep(delay + random.random())
+            pause(delay + random.random())
         request = urllib.request.Request(CHAT_URL, data=data, headers={"Content-Type": "application/json"})
         try:
-            with _OPENER.open(request, timeout=REQUEST_TIMEOUT) as response:
+            with opener(request, timeout=REQUEST_TIMEOUT) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = _http_detail(exc)
@@ -430,7 +507,14 @@ def chat(messages: list[dict], max_tokens: int = 1000, *, think: bool = False, s
             if exc.code == 503:
                 problem = "loading"
                 continue
-            if exc.code in {408, 429, 500, 502, 504}:
+            if exc.code in {500, 502, 504}:
+                # A hard server error may have spent a whole generation. Retry it once only.
+                problem = f"error {exc.code}"
+                hard += 1
+                if hard >= 2:
+                    break
+                continue
+            if exc.code in {408, 429}:
                 problem = f"error {exc.code}"
                 continue
             raise RuntimeError(f"Neuro's model refused the request ({exc.code}). {detail}".strip()) from exc
@@ -679,23 +763,194 @@ def visible_answer(answer: str) -> str:
     return text.strip()
 
 
-TOOL_HELP = (
-    "You are Neuro Code in this repo. Emit one tool and stop. No sentence before it or after it.\n"
-    "LIST relative/dir\n"
-    "GREP text\n"
-    "READ relative/path\n"
-    "READ relative/path 120-180\n"
-    "SESSIONS\n"
-    "MKDIR relative/path\n"
-    "WRITE relative/path\n"
-    "the file contents\n"
-    "ENDWRITE\n"
-    "RUN command\n"
-    "WRITE under workspace/ is allowed. Do not say you cannot create a file there.\n"
-    "Stop when the tool line is done. Do not explain the tool.\n"
-    "A tool result comes back inside <tool_response>. Read it, then one tool or a plain answer.\n"
-    "When the task is done, answer in plain text and do not emit a tool."
+class Budget(NamedTuple):
+    think: bool  # thinking on or off
+    max_tokens: int  # per generation
+    max_turns: int  # generations per job
+    write: bool  # WRITE and MKDIR allowed
+    run: bool  # RUN allowed
+    verify: bool  # after a WRITE, ask once for a checking RUN before "done"
+    fixes: int  # repair turns for a tool call that could not be read
+
+
+# The router picks one of these once per job. Safety checks below still apply to every kind.
+KIND_BUDGET: dict[str, Budget] = {
+    "quick": Budget(False, 500, 3, False, False, False, 1),
+    "research": Budget(False, 1200, 6, False, True, False, 2),
+    "review": Budget(True, 2560, 6, False, True, False, 2),
+    "code": Budget(True, 3072, 10, True, True, True, 2),
+}
+DEEP_TOKENS = 4096  # /deep forces thinking on with this budget
+DEFAULT_KIND = "research"
+# The model's own syntax. The parser in first_tool / apply_actions expects exactly these lines.
+TOOL_SYNTAX = (
+    ("LIST", "LIST relative/dir"),
+    ("GREP", "GREP text"),
+    ("READ", "READ relative/path\nREAD relative/path 120-180"),
+    ("SESSIONS", "SESSIONS"),
+    ("MKDIR", "MKDIR relative/path"),
+    ("WRITE", "WRITE relative/path\nthe file contents\nENDWRITE"),
+    ("RUN", "RUN command"),
 )
+KIND_NOTES = {
+    "quick": "Keep it short. Use a tool only when the answer needs the repo.",
+    "research": "Look with GREP and READ before you answer. Name the files you used.",
+    "review": "Find bugs and risks. Give the file and line for each one. Do not fix them.",
+    "code": "Look first, then WRITE, then RUN a compile or a test before you say it is done.",
+}
+
+
+def kind_tools(kind: str) -> frozenset[str]:
+    budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
+    names = {"LIST", "GREP", "READ", "SESSIONS"}
+    if budget.write:
+        names |= {"MKDIR", "WRITE"}
+    if budget.run:
+        names.add("RUN")
+    return frozenset(names)
+
+
+def tool_help(kind: str) -> str:
+    allowed = kind_tools(kind)
+    budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
+    lines = ["Work in this repo. Emit one tool and stop. No sentence before it or after it."]
+    lines += [syntax for name, syntax in TOOL_SYNTAX if name in allowed]
+    if budget.write:
+        lines.append("WRITE under workspace/ is allowed. Do not say you cannot create a file there.")
+    else:
+        lines.append("This task does not change files.")
+    lines.append(KIND_NOTES.get(kind, ""))
+    lines += [
+        "Stop when the tool line is done. Do not explain the tool.",
+        "A tool result comes back inside <tool_response>. Read it, then one tool or a plain answer.",
+        "When the task is done, answer in plain text and do not emit a tool.",
+    ]
+    return "\n".join(line for line in lines if line)
+
+
+# Built once: the system message is the same for every job of a kind, so the server cache reuses it.
+KIND_TOOLS = {kind: tool_help(kind) for kind in KIND_BUDGET}
+TOOL_HELP = KIND_TOOLS["code"]
+
+
+def agent_system(kind: str) -> str:
+    return SYSTEM + "\n" + KIND_TOOLS.get(kind, KIND_TOOLS["quick"])
+
+
+_HE_PREFIX = r"(?<!\w)[ובהלשמכ]{0,2}"
+
+
+def _en(*words: str) -> re.Pattern:
+    return re.compile(r"\b(?:" + "|".join(words) + r")\b")
+
+
+def _he(*forms: str) -> re.Pattern:
+    # Hebrew glues ו/ב/ה/ל/ש/מ/כ to the front of a word. The end must still be a word end,
+    # so קוד matches הקוד but not קודם.
+    return re.compile(_HE_PREFIX + "(?:" + "|".join(forms) + r")(?!\w)")
+
+
+# Asking for a change: a coding task even with no file named.
+CODE_STRONG = (
+    _en(r"fix(?:es|ed|ing)?", r"implement\w*", r"refactor\w*", r"patch(?:es|ed|ing)?", r"debug\w*",
+        r"rewrite|rewrites|rewriting|rewrote", r"rename[sd]?", r"scaffold\w*"),
+    _he("תקן", "תקני", "תקנו", "תתקן", "תתקני", "תיקון", "תקון", "תוסיף", "תוסיפי", "תוסיפו",
+        "הוסף", "הוסיפי", "הוסיפו", "הוסיף", "תממש", "תממשי", "לממש", "שכתב", "תשכתב", "דבג", "תדבג",
+        "ערוך", "תערוך", "ערכי"),
+)
+# Words that make a change only when code or a file is in the task.
+CODE_WEAK = (
+    _en(r"write|writes|writing", r"add|adds|adding", r"create|creates|creating", r"make", r"change|changes",
+        r"update|updates", r"edit|edits", r"modify", r"remove", r"delete", r"insert", r"replace", r"generate",
+        r"build"),
+    _he("כתוב", "כתבי", "כתבו", "תכתוב", "תכתבי", "צור", "תיצור", "ליצור", "צרו", "תשנה", "תשני", "למחוק",
+        "תמחק", "מחק"),
+)
+CODE_NOUN = (
+    _en(r"code|codebase", r"bugs?|buggy", r"files?", r"functions?", r"methods?", r"class(?:es)?", r"modules?",
+        r"scripts?", r"repo|repository", r"tests?|unittest|pytest", r"compile[sr]?|compiling", r"errors?",
+        r"traceback", r"exceptions?", r"crash\w*", r"endpoints?", r"api", r"regex", r"variables?",
+        r"folders?", r"director(?:y|ies)", r"python|javascript|typescript|html|css|sql|json|yaml",
+        r"workspace", r"readme", r"database|db", r"server", r"config"),
+    _he("קוד", "קודים", "באג", "באגים", "קובץ", "קבצים", "פונקציה", "פונקציות", "סקריפט", "סקריפטים",
+        "שגיאה", "שגיאות", "טסט", "טסטים", "תיקייה", "תיקיה", "ריפו", "שרת", "מסד"),
+)
+REVIEW = (
+    _en(r"review\w*", r"audit\w*", r"security", r"secure", r"vulnerab\w*", r"critique", r"inspect\w*",
+        r"(?:find|look for|spot|hunt for|any)\s+(?:the\s+)?bugs?", r"code smells?"),
+    _he("סקירה", "סקירת", "סקור", "תסקור", "תסקרי", "ביקורת", "אבטחה", "פרצה", "פרצות", "חולשה", "חולשות"),
+)
+# Checking words are a review when they point at code, a lookup otherwise.
+CHECK = (
+    _en(r"check|checks", r"verify", r"validate"),
+    _he("בדוק", "בדקי", "בדקו", "תבדוק", "תבדקי"),
+)
+RESEARCH = (
+    _en(r"where", r"explain\w*", r"find", r"search\w*", r"grep", r"locate", r"trace", r"investigate",
+        r"analy[sz]e", r"compare", r"how (?:does|do|is|are)", r"which file", r"look (?:up|into|at)",
+        r"show me", r"list", r"read", r"summari[sz]e", r"describe"),
+    _he("איפה", "היכן", "הסבר", "הסבירי", "הסבירו", "תסביר", "תסבירי", "הסביר", "חפש", "חפשי", "תחפש",
+        "מצא", "מצאי", "תמצא", "נתח", "תנתח", "השווה", "תשווה", "תאר", "תסכם", "סכם"),
+)
+# "do not change files", "בלי לשנות" — a refused action is not a request.
+NEGATED = re.compile(
+    r"\b(?:do not|don't|dont|never|without|no need to|not)\s+(?:\w+\s+){0,2}?\w+"
+    r"|(?<!\w)(?:אל|בלי|לא|אין צורך)\s+\S+"
+)
+CODE_SIGN = re.compile(
+    r"[\w-]\.(?:py|pyw|js|mjs|ts|tsx|jsx|json|md|txt|ps1|cmd|bat|sh|html?|css|toml|ya?ml|ini|cfg|log|go|rs"
+    r"|java|c|cpp|h|hpp|cs|sql|db)\b"
+    r"|\w[/\\]\w|\w\(\)|`|\b[a-z0-9]+_[a-z0-9_]+\b|\b[a-z]+[A-Z]\w*|\b[A-Z]{3,}\b|\bdef |\bimport |=>|\{|\}"
+)
+
+
+def _hit(groups: tuple[re.Pattern, ...], text: str) -> bool:
+    return any(pattern.search(text) for pattern in groups)
+
+
+def classify_task(prompt: str) -> str:
+    """quick | research | review | code. When unsure: research. Files or code never mean quick."""
+    text = (prompt or "").strip()
+    if not text:
+        return DEFAULT_KIND
+    lowered = text.lower()
+    asked = NEGATED.sub(" ", lowered)
+    coded = bool(CODE_SIGN.search(text)) or _hit(CODE_NOUN, lowered)
+    if _hit(CODE_STRONG, asked) or (coded and _hit(CODE_WEAK, asked)):
+        return "code"
+    if _hit(REVIEW, lowered) or (coded and _hit(CHECK, lowered)):
+        return "review"
+    if coded or _hit(RESEARCH, lowered) or _hit(CHECK, lowered):
+        return "research"
+    if len(text) <= 160 and text.count("\n") <= 1:
+        return "quick"
+    return DEFAULT_KIND
+
+
+KIND_MARK = re.compile(r"\s*\[kind:([A-Za-z_-]{1,16})\][ \t]*(?:\r?\n|$)")
+
+
+def split_kind(prompt: str) -> tuple[str | None, str]:
+    """Take a leading [kind:x] line off a stored prompt. The tag is not trusted yet."""
+    text = prompt or ""
+    match = KIND_MARK.match(text)
+    if not match:
+        return None, text
+    return match.group(1).lower(), text[match.end() :]
+
+
+def job_kind(prompt: str) -> tuple[str, str]:
+    """The kind for a job, and the prompt with the tag removed. A bad tag is classified again."""
+    tag, rest = split_kind(prompt)
+    if tag in KIND_BUDGET:
+        return tag, rest
+    return classify_task(deep_request(rest)[1]), rest
+
+
+def stamp_kind(prompt: str) -> str:
+    kind, rest = job_kind(prompt)
+    head = f"[kind:{kind}]\n"
+    return head + rest.strip()[: 4000 - len(head)]
 
 
 def remember(job_id: int, status: str, title: str, text: str) -> None:
@@ -1121,20 +1376,31 @@ def first_tool(answer: str) -> str:
 
 
 def fit_context(messages: list[dict], budget: int = CONTEXT_CHARS) -> None:
-    """Keep the system prompt, the task and the newest call. Shrink or drop older turns."""
+    """Fit the chat in budget characters.
+
+    messages[0] (system) and messages[1] (the task) are never touched, and the newest call and
+    its result stay whole. First the oldest tool results are emptied, then old calls are clipped,
+    and only then the oldest assistant+tool pairs are dropped.
+    """
 
     def size() -> int:
         return sum(len(str(item.get("content") or "")) for item in messages)
 
-    index = 2
-    while size() > budget and index < len(messages) - 2:
+    removed = "<tool_response>\n[older result removed to save room]\n</tool_response>"
+    for index in range(2, len(messages) - 2):
+        if size() <= budget:
+            return
         item = messages[index]
         content = str(item.get("content") or "")
-        if item.get("role") == "user" and content.startswith("<tool_response>"):
-            item["content"] = "<tool_response>\n[older result removed to save room]\n</tool_response>"
-        elif item.get("role") == "assistant" and len(content) > 300:
+        if item.get("role") == "user" and content.startswith("<tool_response>") and content != removed:
+            item["content"] = removed
+    for index in range(2, len(messages) - 2):
+        if size() <= budget:
+            return
+        item = messages[index]
+        content = str(item.get("content") or "")
+        if item.get("role") == "assistant" and len(content) > 300:
             item["content"] = clip(content, 300)
-        index += 1
     while size() > budget and len(messages) > 4:
         del messages[2:4]
 
@@ -1156,7 +1422,14 @@ def plain_answer(answer: str) -> str:
     return text.strip()
 
 
-def run_tool(command: str, source: str, cut: bool) -> tuple[str, list[str]]:
+def run_tool(command: str, source: str, cut: bool, *, kind: str = "code") -> tuple[str, list[str]]:
+    # Gates by task kind come first. They only add blocks; every check below still runs.
+    budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
+    head = command.strip().split(None, 1)[0].upper() if command.strip() else ""
+    if head in {"WRITE", "MKDIR"} and not budget.write:
+        return "blocked: this task cannot change files. Use LIST, GREP or READ, or answer in plain text.", []
+    if head == "RUN" and not budget.run:
+        return "blocked: this task cannot RUN commands. Use LIST, GREP or READ, or answer in plain text.", []
     if command.startswith("WRITE "):
         wrote = apply_actions(source, require_end=cut)
         return "\n".join(wrote) or "nothing written", wrote
@@ -1176,12 +1449,12 @@ def run_tool(command: str, source: str, cut: bool) -> tuple[str, list[str]]:
     return "unknown tool", []
 
 
-def ask_fitted(messages: list[dict], deep: bool) -> dict:
+def ask_fitted(messages: list[dict], think: bool = False, max_tokens: int = 1200) -> dict:
     budget = CONTEXT_CHARS
     for attempt in range(2):
         fit_context(messages, budget)
         try:
-            return chat(messages, max_tokens=2048 if deep else 1200, think=deep, stop=STOPS)
+            return chat(messages, max_tokens=max_tokens, think=think, stop=STOPS)
         except ContextFull:
             if attempt:
                 raise RuntimeError("The task is too long for Neuro's memory. Make it shorter.") from None
@@ -1191,24 +1464,59 @@ def ask_fitted(messages: list[dict], deep: bool) -> dict:
     raise RuntimeError("The task is too long for Neuro's memory. Make it shorter.")
 
 
-def run_agent(prompt: str) -> str:
+# On the last turn these still run once. Their result goes into the answer instead of being lost.
+FINAL_TOOLS = frozenset({"RUN", "READ", "GREP", "LIST", "SESSIONS"})
+# A RUN that checks written work: a compiler, a test runner, or running the program.
+VERIFY_RUN = re.compile(
+    r"\b(?:py_compile|compileall|pytest|unittest|tests?|tsc|mypy|ruff|flake8|pylint|lint|build|check|cargo|go"
+    r"|npm|npx|node|deno|python3?|py|make|dotnet|javac|java|gcc|clang|rustc|bash|sh|powershell|pwsh)\b",
+    re.IGNORECASE,
+)
+VERIFY_NUDGE = (
+    "Not done yet: you wrote a file but did not RUN a compile or a test. "
+    "Send one RUN that checks it, for example RUN python -m py_compile path, "
+    "or answer in plain text with the reason no check applies."
+)
+
+
+def _say_line(line: str) -> None:
+    print(line, flush=True)
+
+
+def run_agent(prompt: str, *, ask=None, say=None) -> str:
+    """One job. ask(messages, think, max_tokens) is the model call; drills pass a fake one."""
+    ask = ask or ask_fitted
+    say = say or _say_line
+    kind, prompt = job_kind(prompt)
     deep, prompt = deep_request(prompt)
-    first = TOOL_HELP + "\n\nTask:\n" + prompt + "\n\n" + workspace_note()
-    # One growing chat: the server reuses the cached prefix, and the model sees its own calls.
-    messages: list[dict] = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": first}]
+    budget = KIND_BUDGET[kind]
+    think, max_tokens, max_turns = budget.think, budget.max_tokens, budget.max_turns
+    if deep:
+        think, max_tokens = True, max(max_tokens, DEEP_TOKENS)
+    # Stable first (cached by the server for every job of this kind), the task and live files after.
+    first = "Task:\n" + prompt + "\n\n" + workspace_note()
+    messages: list[dict] = [{"role": "system", "content": agent_system(kind)}, {"role": "user", "content": first}]
     logs: list[str] = []
     fixes = 0
-    for turn in range(MAX_TURNS):
-        final_turn = turn == MAX_TURNS - 1
+    nudged = False
+    wrote = False
+    verified = False
+    for turn in range(max_turns):
+        final_turn = turn == max_turns - 1
         if final_turn and len(messages) > 2:
             messages[-1]["content"] = str(messages[-1]["content"]) + "\n" + LAST_STEP
-        reply = ask_fitted(messages, deep)
+        reply = ask(messages, think, max_tokens)
         # Only the visible answer is used. Thinking is never stored or sent back.
         answer = visible_answer(reply["content"])
         cut = reply["finish"] == "length"
         command, call = pick_tool(answer, reply["tool_calls"])
         if not command:
-            if looks_like_call(answer) and not final_turn and fixes < 2:
+            if not answer and cut and think and not final_turn and fixes < budget.fixes:
+                # Every token went to thinking. Ask again with thinking off.
+                fixes += 1
+                think = False
+                continue
+            if looks_like_call(answer) and not final_turn and fixes < budget.fixes:
                 fixes += 1
                 if cut:
                     note = "The tool call was cut off at the length limit, so nothing ran. Send a shorter call."
@@ -1217,19 +1525,32 @@ def run_agent(prompt: str) -> str:
                 messages.append({"role": "assistant", "content": clip(answer, 600)})
                 messages.append({"role": "user", "content": tool_response(note)})
                 continue
+            if budget.verify and wrote and not verified and not nudged and not final_turn:
+                # One nudge only. The next plain answer is accepted as it is.
+                nudged = True
+                messages.append({"role": "assistant", "content": clip(plain_answer(answer), 600)})
+                messages.append({"role": "user", "content": tool_response(VERIFY_NUDGE)})
+                continue
             return "\n".join([*logs, plain_answer(answer)]).strip()[:4000]
-        if final_turn:
+        head = command.split(None, 1)[0].upper()
+        if final_turn and head not in FINAL_TOOLS:
             break
-        print("tool " + command.splitlines()[0][:120], flush=True)
+        say("tool " + command.splitlines()[0][:120])
         source = command if "\n" in command else answer
         try:
-            result, made = run_tool(command, source, cut)
+            result, made = run_tool(command, source, cut, kind=kind)
         except Exception as exc:  # a tool failure is a result for the model, not a dead job
             result, made = f"error: {exc}", []
         if made:
             logs.extend(made)
         else:
             logs.append(command.splitlines()[0] + " -> " + (result.splitlines()[0] if result else "empty")[:140])
+        if any(item.startswith("wrote ") for item in made):
+            wrote, verified = True, False
+        elif head == "RUN" and wrote and not result.startswith("blocked") and VERIFY_RUN.search(command[4:]):
+            verified = True
+        if final_turn:
+            return "\n".join([*logs, "last tool result:", clip(result, 1500)]).strip()[:4000]
         messages.append({"role": "assistant", "content": clip(call, 1500)})
         messages.append({"role": "user", "content": tool_response(result)})
     return "\n".join(logs)[:4000]
@@ -1243,7 +1564,7 @@ def worker_main() -> None:
     said = ""
     state = ""
     beat_at = 0.0
-    while not STOP_PATH.exists():
+    while not stop_requested(STOP_PATH):
         try:
             if not has_queued():
                 if state != "idle" or time.time() - beat_at > 30:
@@ -1641,6 +1962,241 @@ def code_main(initial: str = "") -> None:
         sys.stdout.flush()
 
 
+ROUTER_CASES = (
+    ("fix agents.py enqueue", "code"),
+    ("add a retry to chat()", "code"),
+    ("write a script that prints hello", "code"),
+    ("refactor the queue", "code"),
+    ("תקן את הבאג בקובץ agents.py", "code"),
+    ("תוסיף בדיקה לפונקציה", "code"),
+    ("כתוב סקריפט שמדפיס שלום", "code"),
+    ("review agents.py for security problems", "review"),
+    ("find bugs in tool_run", "review"),
+    ("סקירה של הקוד ב-mesh.py", "review"),
+    ("בדוק את הקוד של התור", "review"),
+    ("where is cluster.token read?", "research"),
+    ("איפה מוגדר SLOTS?", "research"),
+    ("הסבר איך עובד התור", "research"),
+    ("explain how claim works", "research"),
+    ("do not change any files, just explain the queue", "research"),
+    ("what is in the file list", "research"),
+    ("מה יש בקובץ הזה", "research"),
+    ("", "research"),
+    ("say hello", "quick"),
+    ("prefix the title with a star", "quick"),
+    ("what is the address format", "quick"),
+    ("קודם תגיד שלום", "quick"),
+    ("word " * 60, "research"),
+)
+
+
+def _scripted(replies: list[str]):
+    """A fake model for drills: returns replies in order and records each call."""
+    seen: list[dict] = []
+
+    def ask(messages: list[dict], think: bool, max_tokens: int) -> dict:
+        seen.append(
+            {
+                "think": think,
+                "max_tokens": max_tokens,
+                "system": messages[0]["content"],
+                "task": messages[1]["content"],
+                "last": str(messages[-1]["content"]),
+                "count": len(messages),
+            }
+        )
+        text = replies[min(len(seen) - 1, len(replies) - 1)]
+        return {"content": text, "tool_calls": [], "finish": "stop"}
+
+    return ask, seen
+
+
+def _fake_opener(codes: list[int]):
+    import io
+
+    calls: list[int] = []
+
+    def opener(request, timeout=0):
+        code = codes[min(len(calls), len(codes) - 1)]
+        calls.append(code)
+        if code == 200:
+            return io.BytesIO(b'{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}')
+        raise urllib.error.HTTPError(CHAT_URL, code, "drill", {}, io.BytesIO(b"{}"))
+
+    return opener, calls
+
+
+def router_drill(round_file: str, round_text: str) -> dict:
+    """Router, kind gates, verify nudge, final-turn tool, retries and fit_context. No model, no DB."""
+    pid = os.getpid()
+    quiet = lambda _line: None  # noqa: E731
+    checks: dict[str, bool] = {}
+    missed = [(text, want, classify_task(text)) for text, want in ROUTER_CASES if classify_task(text) != want]
+    checks["router"] = not missed
+    checks["router_kinds"] = set(KIND_BUDGET) == {"quick", "research", "review", "code"} and all(
+        classify_task(text) in KIND_BUDGET for text, _ in ROUTER_CASES
+    )
+    stamped = stamp_kind("fix agents.py enqueue")
+    checks["stamp"] = (
+        stamped == "[kind:code]\nfix agents.py enqueue"
+        and job_kind(stamped) == ("code", "fix agents.py enqueue")
+        and stamp_kind(stamped) == stamped
+        and job_kind("[kind:bogus]\nsay hello") == ("quick", "say hello")
+        and job_kind("[kind:quick]\n/deep say hi") == ("quick", "/deep say hi")
+        and job_kind("say hello") == ("quick", "say hello")
+    )
+    # Per-kind tool help lists only the tools that kind may use, in the parser's exact syntax.
+    checks["kind_help"] = (
+        "WRITE" not in KIND_TOOLS["quick"] and "RUN " not in KIND_TOOLS["quick"]
+        and "MKDIR" not in KIND_TOOLS["research"] and "WRITE" not in KIND_TOOLS["review"]
+        and "RUN command" in KIND_TOOLS["research"]
+        and "WRITE relative/path\nthe file contents\nENDWRITE" in KIND_TOOLS["code"]
+        and "READ relative/path 120-180" in KIND_TOOLS["quick"]
+        and all(first_tool(line) for line in ("LIST relative/dir", "GREP text", "READ relative/path", "SESSIONS", "MKDIR relative/path", "RUN command"))
+    )
+    # Gates by kind. They add to the safety checks and never replace them.
+    gate_file = f"workspace/agent-check/drill-gate-{pid}.txt"
+    gate_dir = f"workspace/agent-check/drill-gate-dir-{pid}"
+    write_gate = run_tool(f"WRITE {gate_file}\nnope\nENDWRITE", f"WRITE {gate_file}\nnope\nENDWRITE", False, kind="quick")
+    mkdir_gate = run_tool(f"MKDIR {gate_dir}", f"MKDIR {gate_dir}", False, kind="review")
+    checks["gate_write"] = write_gate[0].startswith("blocked") and write_gate[1] == [] and safe_read(gate_file) == "missing"
+    checks["gate_mkdir"] = mkdir_gate[0].startswith("blocked") and repo_dir(gate_dir) is None
+    checks["gate_run_quick"] = run_tool("RUN echo gate-no", "RUN echo gate-no", False, kind="quick")[0].startswith("blocked")
+    checks["gate_unknown"] = run_tool("RUN echo gate-no", "RUN echo gate-no", False, kind="bogus")[0].startswith("blocked")
+    checks["gate_run_research"] = "gate-ok" in run_tool("RUN echo gate-ok", "RUN echo gate-ok", False, kind="research")[0]
+    checks["gate_run_safety"] = (
+        run_tool("RUN rm -rf /", "RUN rm -rf /", False, kind="code")[0] == "blocked"
+        and run_tool("RUN taskkill /IM python.exe /F", "", False, kind="code")[0] == "blocked"
+        and run_tool("RUN type cluster.token", "", False, kind="research")[0] == "blocked"
+    )
+    ok_file = f"workspace/agent-check/drill-gate-ok-{pid}.txt"
+    code_write = run_tool(f"WRITE {ok_file}\nyes\nENDWRITE", f"WRITE {ok_file}\nyes\nENDWRITE", False, kind="code")
+    checks["gate_write_code"] = code_write[1] == [f"wrote {ok_file}"] and "yes" in safe_read(ok_file)
+    checks["gate_secret_code"] = run_tool("WRITE cluster.token\nx\nENDWRITE", "WRITE cluster.token\nx\nENDWRITE", False, kind="code")[0].startswith("blocked")
+    # Budgets reach the model call, and the system prompt stays the same across jobs of a kind.
+    ask, seen = _scripted(["hello"])
+    quick_out = run_agent("[kind:quick]\nsay hello", ask=ask, say=quiet)
+    ask_deep, seen_deep = _scripted(["hi"])
+    run_agent("[kind:quick]\n/deep say hi", ask=ask_deep, say=quiet)
+    ask_a, seen_a = _scripted(["fine"])
+    ask_b, seen_b = _scripted(["fine"])
+    run_agent("[kind:code]\nfix the first thing", ask=ask_a, say=quiet)
+    run_agent("[kind:code]\nfix another thing", ask=ask_b, say=quiet)
+    checks["budget"] = (
+        quick_out == "hello"
+        and seen[0]["think"] is False and seen[0]["max_tokens"] == KIND_BUDGET["quick"].max_tokens
+        and seen_deep[0]["think"] is True and seen_deep[0]["max_tokens"] == DEEP_TOKENS
+        and seen_a[0]["think"] is KIND_BUDGET["code"].think and seen_a[0]["max_tokens"] == KIND_BUDGET["code"].max_tokens
+    )
+    checks["cache_layout"] = (
+        seen_a[0]["system"] == seen_b[0]["system"] == agent_system("code")
+        and "fix the first thing" not in seen_a[0]["system"]
+        and seen_a[0]["task"].startswith("Task:\nfix the first thing\n\nRepo files:")
+        and "[kind:" not in seen_a[0]["task"]
+        and seen[0]["system"] == agent_system("quick") != agent_system("code")
+    )
+    # Verify nudge: WRITE, then "done" with no RUN, gets exactly one nudge.
+    verify_file = f"workspace/agent-check/drill-verify-{pid}.txt"
+    write_call = f"WRITE {verify_file}\nok\nENDWRITE"
+    ask, seen = _scripted([write_call, "Done.", "RUN echo check verify-ok", "Done and checked."])
+    out = run_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
+    checks["verify_nudge"] = (
+        len(seen) == 4 and "did not RUN a compile" in seen[2]["last"]
+        and out.endswith("Done and checked.") and f"wrote {verify_file}" in out
+    )
+    ask, seen = _scripted([write_call, "Done.", "Still done.", "never asked"])
+    out = run_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
+    checks["verify_once"] = len(seen) == 3 and out.endswith("Still done.")
+    ask, seen = _scripted([write_call, "RUN echo check verify-ok", "Done."])
+    out = run_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
+    checks["verify_skip"] = len(seen) == 3 and out.endswith("Done.") and all("did not RUN" not in item["last"] for item in seen)
+    ask, seen = _scripted([write_call, "Done."])
+    run_agent("[kind:research]\nlook at a drill file", ask=ask, say=quiet)
+    checks["verify_code_only"] = len(seen) == 2
+    # A gated WRITE inside a job is blocked and reported to the model.
+    gated_file = f"workspace/agent-check/drill-gate-job-{pid}.txt"
+    ask, seen = _scripted([f"WRITE {gated_file}\nno\nENDWRITE", "ok"])
+    out = run_agent("[kind:research]\nlook around", ask=ask, say=quiet)
+    checks["gate_job"] = safe_read(gated_file) == "missing" and "cannot change files" in seen[1]["last"] and out.endswith("ok")
+    # Final turn: a cheap read still runs once and its result is kept.
+    ask, seen = _scripted(["LIST agent-logs/drill", "LIST agent-logs/drill", f"READ {round_file}"])
+    out = run_agent("[kind:quick]\nsay hello", ask=ask, say=quiet)
+    checks["final_tool"] = len(seen) == 3 and LAST_STEP in seen[2]["last"] and "last tool result:" in out and round_text in out
+    turns = KIND_BUDGET["research"].max_turns
+    ask, seen = _scripted(["LIST agent-logs/drill"] * (turns - 1) + ["RUN rm -rf /"])
+    out = run_agent("[kind:research]\nsay hello", ask=ask, say=quiet)
+    checks["final_tool_run"] = len(seen) == turns and out.endswith("last tool result:\nblocked") and "RUN rm -rf / -> blocked" in out
+    # Malformed calls: one repair turn for quick, two otherwise.
+    bad = '<tool_call>{"name": "read_file", "arguments": {"path": '
+    ask_q, seen_q = _scripted([bad])
+    ask_r, seen_r = _scripted([bad])
+    run_agent("[kind:quick]\nsay hello", ask=ask_q, say=quiet)
+    run_agent("[kind:research]\nsay hello", ask=ask_r, say=quiet)
+    checks["fixes"] = len(seen_q) == 2 and len(seen_r) == 3
+    # Retries: hard 500 once, 503 still ends in ModelWait.
+    no_sleep = lambda _s: None  # noqa: E731
+    opener, calls = _fake_opener([500, 500, 500, 500])
+    try:
+        chat([{"role": "user", "content": "x"}], _open=opener, _sleep=no_sleep)
+        hard_ok = False
+    except ModelWait:
+        hard_ok = False
+    except RuntimeError:
+        hard_ok = len(calls) == 2
+    opener, calls = _fake_opener([502, 200])
+    retry_ok = chat([{"role": "user", "content": "x"}], _open=opener, _sleep=no_sleep)["content"] == "ok" and len(calls) == 2
+    opener, calls = _fake_opener([503])
+    try:
+        chat([{"role": "user", "content": "x"}], _open=opener, _sleep=no_sleep)
+        wait_ok = False
+    except ModelWait:
+        wait_ok = True
+    checks["retry_hard"] = hard_ok
+    checks["retry_once_ok"] = retry_ok
+    checks["retry_503"] = wait_ok
+    # fit_context: oldest tool results go first, then pairs. System and task never change.
+    def history() -> list[dict]:
+        items = [{"role": "system", "content": "S" * 500}, {"role": "user", "content": "T" * 5000}]
+        for number in range(8):
+            items.append({"role": "assistant", "content": "READ a " + "c" * 1000})
+            items.append({"role": "user", "content": tool_response(f"r{number} " + "y" * 2300)})
+        return items
+
+    def total(items: list[dict]) -> int:
+        return sum(len(str(item["content"])) for item in items)
+
+    soft = history()
+    fit_context(soft, 25000)
+    removed = [item for item in soft[3::2] if "older result removed" in item["content"]]
+    checks["fit_order"] = (
+        len(soft) == 18 and total(soft) <= 25000
+        and soft[0]["content"] == "S" * 500 and soft[1]["content"] == "T" * 5000
+        and "older result removed" in soft[3]["content"] and 0 < len(removed) < 7
+        and all(len(item["content"]) == 1007 for item in soft[2::2])
+        and "r7 " in soft[-1]["content"]
+    )
+    hard_fit = history()
+    fit_context(hard_fit, 10000)
+    checks["fit_pairs"] = (
+        4 <= len(hard_fit) < 18 and total(hard_fit) <= 10000
+        and hard_fit[0]["content"] == "S" * 500 and hard_fit[1]["content"] == "T" * 5000
+        and hard_fit[2]["role"] == "assistant" and "r7 " in hard_fit[-1]["content"]
+    )
+    checks["fit_budget"] = DEFAULT_CONTEXT_CHARS == 40000 and (
+        CONTEXT_CHARS == 40000 or bool(os.environ.get("NEURO_CONTEXT_CHARS"))
+    )
+    for leftover in (ok_file, verify_file):
+        found = inside(leftover)
+        if found:
+            try:
+                found[1].unlink(missing_ok=True)
+            except OSError:
+                pass
+    if missed:
+        print("router missed: " + "; ".join(f"{text[:40]!r} want {want} got {got}" for text, want, got in missed), flush=True)
+    return checks
+
+
 def drill_round(index: int) -> dict:
     """Check the tool layer with no model and no server. Safe to run while training."""
     folder = LOG_DIR / "drill"
@@ -1677,7 +2233,7 @@ def drill_round(index: int) -> dict:
     checks = {
         "write": wrote.startswith("wrote "),
         "read": f"round {index}" in read,
-        "list": name in listed or (folder / name).is_file(),
+        "list": name in listed or regular_file(folder / name),
         "secret": safe_write("cluster.token", "nope").startswith("blocked"),
         "secret_case": safe_read("CLUSTER.TOKEN") == "unreadable",
         "secret_stream": safe_read("cluster.token::$DATA") == "unreadable",
@@ -1705,6 +2261,10 @@ def drill_round(index: int) -> dict:
         "empty_path": native_tool(xml_write) == "",
         "deep": deep_request("/deep why?") == (True, "why?") and deep_request("deep learning basics")[0] is False,
     }
+    try:
+        checks.update(router_drill(relative, f"round {index}"))
+    except Exception as exc:  # a broken drill is a failed check, not a dead fleet loop
+        checks["router_drill_" + type(exc).__name__] = False
     try:
         (folder / name).unlink(missing_ok=True)
     except OSError:
@@ -1742,6 +2302,203 @@ def terminal(workers: int = 4) -> None:
         stop_workers()
 
 
+WATCH_ROLES = ("train", "lock", "night", "mesh", "peers", "drill", "review", "brain")
+WATCH_STOP = HOME / "watch.stop"
+PEER_URLS = (
+    "http://192.168.7.169:8781",
+    "http://192.168.7.31:8781",
+    "http://192.168.7.247:8781",
+)
+
+
+def matching_pids(fragment: str) -> list[int]:
+    """PIDs whose command line contains fragment. A failed listing is not 'none'."""
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like $env:WATCH_MATCH } | ForEach-Object { $_.ProcessId }",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=40,
+        env={**os.environ, "WATCH_MATCH": f"*{fragment}*"},
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise OSError("process list failed")
+    found = []
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            found.append(int(line))
+    return found
+
+
+def watch_report(role: str) -> str:
+    if role == "train":
+        try:
+            found = matching_pids(r"ml\training\train.py")
+        except (OSError, subprocess.TimeoutExpired):
+            return "could not list processes. resume not attempted"
+        if not found:
+            return "train.py missing. resume not attempted"
+        return "train alive pid " + " ".join(str(pid) for pid in found[:4])
+    if role == "lock":
+        try:
+            os.stat(GPU_LOCK)
+        except FileNotFoundError:
+            return "gpu lock missing"
+        except OSError:
+            return "gpu lock unreadable, treated as busy. resume not attempted"
+        return "gpu lock present, treated as busy. resume not attempted"
+    if role == "night":
+        try:
+            found = matching_pids("night-loop.ps1")
+        except (OSError, subprocess.TimeoutExpired):
+            return "could not list the night loop"
+        tail = ""
+        try:
+            lines = (LOG_DIR / "night-loop.txt").read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = lines[-1][:180] if lines else "empty"
+        except OSError:
+            tail = "log unreadable"
+        state = "alive pid " + str(found[0]) if found else "missing"
+        return f"night loop {state}. last {tail}"
+    if role == "mesh":
+        try:
+            found = matching_pids("mesh.py serve")
+        except (OSError, subprocess.TimeoutExpired):
+            return "could not list mesh"
+        return "mesh serve alive pid " + str(found[0]) if found else "mesh serve missing"
+    if role == "peers":
+        parts = []
+        for url in PEER_URLS:
+            try:
+                request = urllib.request.Request(url + "/hello", method="GET")
+                with _OPENER.open(request, timeout=4) as response:
+                    response.read(80)
+                    parts.append(f"{url} {response.status}")
+            except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException):
+                parts.append(f"{url} no reply")
+        return "glance " + " | ".join(parts)
+    if role == "drill":
+        try:
+            lines = (LOG_DIR / "night-loop.txt").read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return "night log unreadable"
+        picked = [line for line in lines if "drill" in line or "check " in line]
+        return (picked[-1] if picked else "no drill line")[:180]
+    if role == "review":
+        try:
+            raw = (LOG_DIR / "review-cursor.txt").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return "review cursor unreadable"
+        return "review cursor " + (raw[:20] if raw.isdigit() else "unreadable")
+    if role == "brain":
+        try:
+            found = matching_pids(r"brain\server.py")
+        except (OSError, subprocess.TimeoutExpired):
+            return "could not list the brain server"
+        return "brain server alive pid " + str(found[0]) if found else "brain server missing"
+    return "unknown role"
+
+
+def watch_main(role: str, index: int) -> None:
+    if role not in WATCH_ROLES:
+        raise SystemExit("unknown watch role")
+    time.sleep(max(0, min(index, 8)) * 8)
+    while not stop_requested(WATCH_STOP):
+        try:
+            detail = watch_report(role)
+        except Exception as exc:
+            detail = "watch error " + type(exc).__name__
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        line = f"{stamp} watch {role}: {detail}"
+        append_capped(LOG_DIR / "watch-notes.txt", line, limit=200000, keep=400)
+        append_capped(LOG_DIR / "training-notes.txt", line, limit=400000, keep=800)
+        print(line, flush=True)
+        time.sleep(300)
+
+
+def spawn_watchers() -> dict:
+    already: list[int] = []
+    for role in WATCH_ROLES:
+        try:
+            already.extend(matching_pids(f"agents.py watch {role}"))
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    if already:
+        return {"started": 0, "already": already}
+    LOG_DIR.mkdir(exist_ok=True)
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    pids = []
+    for index, role in enumerate(WATCH_ROLES):
+        handle = (LOG_DIR / f"watch-{role}.log").open("a", encoding="utf-8")
+        process = subprocess.Popen(
+            [sys.executable, "-u", str(WORKER_SCRIPT), "watch", role, str(index)],
+            cwd=str(HOME),
+            stdout=handle,
+            stderr=handle,
+            creationflags=flags,
+        )
+        handle.close()
+        pids.append(process.pid)
+    return {"started": len(pids), "pids": pids, "roles": list(WATCH_ROLES)}
+
+
+def fleet_main() -> None:
+    """CPU drills on this PC and on the other computers. No model and no weight training."""
+    cores = os.cpu_count() or 4
+    local_rounds = max(4, min(cores - 4, 12))
+    while not stop_requested(HOME / "fleet.stop"):
+        local_ok = 0
+        for index in range(local_rounds):
+            if drill_round(index + 1).get("ok"):
+                local_ok += 1
+        peer_bits = []
+        for url in PEER_URLS:
+            try:
+                request = urllib.request.Request(url + "/hello", method="GET")
+                with _OPENER.open(request, timeout=5) as response:
+                    raw = response.read(12_000)
+                data = json.loads(raw.decode("utf-8", "replace"))
+                caps = data.get("capabilities") if isinstance(data, dict) and isinstance(data.get("capabilities"), dict) else {}
+                peer_cores = int(caps.get("cpu_cores") or 0)
+                host = str(data.get("name") or data.get("host") or url)[:80] if isinstance(data, dict) else url
+            except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException, ValueError, TypeError):
+                peer_bits.append(url + " no reply")
+                continue
+            width = max(1, min(peer_cores or 2, 4))
+            def one_check(target: str = url) -> str:
+                try:
+                    body = json.dumps({"rounds": 5}).encode("utf-8")
+                    call = urllib.request.Request(target + "/check", data=body, method="POST")
+                    call.add_header("Content-Type", "application/json")
+                    with _OPENER.open(call, timeout=60) as response:
+                        payload = json.loads(response.read(4_000).decode("utf-8", "replace"))
+                    if not isinstance(payload, dict):
+                        return "bad"
+                    return str(payload.get("passed")) + "/" + str(payload.get("rounds"))
+                except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException, ValueError):
+                    return "no reply"
+            results = [one_check() for _n in range(width)]
+            peer_bits.append(f"{host} cores {peer_cores or '?'} x{width} " + ",".join(results))
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        line = (
+            f"{stamp} fleet cpu: local {local_ok}/{local_rounds} serial on {cores} threads. "
+            + " | ".join(peer_bits)
+            + ". weight training was not started."
+        )
+        append_capped(LOG_DIR / "fleet-notes.txt", line, limit=200000, keep=400)
+        append_capped(LOG_DIR / "training-notes.txt", line, limit=400000, keep=800)
+        print(line, flush=True)
+        time.sleep(60)
+
+
 def main() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else "code"
     if command == "agent":
@@ -1751,13 +2508,22 @@ def main() -> None:
         rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 10
         drill_main(rounds)
         return
+    if command == "watch":
+        if len(sys.argv) > 2 and sys.argv[2] != "start":
+            watch_main(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0)
+            return
+        print(json.dumps(spawn_watchers()), flush=True)
+        return
+    if command == "fleet":
+        fleet_main()
+        return
     if command == "code":
         code_main(" ".join(sys.argv[2:]).strip())
         return
     if command == "agents":
         terminal(int(sys.argv[2]) if len(sys.argv) > 2 else 4)
         return
-    raise SystemExit("use: agents.py agent | agents.py drill [ROUNDS] | agents.py code [TASK]")
+    raise SystemExit("use: agents.py agent | agents.py drill [ROUNDS] | agents.py watch start | agents.py fleet | agents.py code [TASK]")
 
 
 if __name__ == "__main__":
