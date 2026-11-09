@@ -26,6 +26,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from html.parser import HTMLParser
@@ -701,7 +702,140 @@ def machine_cards() -> list[dict]:
         return cards
     if sys.platform == "darwin":
         return apple_cards()
+    if sys.platform.startswith("linux"):
+        return linux_cards()
     return []
+
+
+# --- AMD / Intel GPUs on Linux, read from sysfs (no extra packages) ---------
+GPU_VENDORS = {0x1002: "amd", 0x8086: "intel", 0x10DE: "nvidia"}
+STEAM_DECK_GPU_IDS = {0x163F, 0x1435}
+DRM_ROOT = Path("/sys/class/drm")
+_lspci_cache: dict = {"names": None}
+
+
+def _sys_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _sys_int(path: Path, base: int = 10) -> int | None:
+    text = _sys_text(path)
+    if not text:
+        return None
+    try:
+        return int(text, base)
+    except ValueError:
+        return None
+
+
+def parse_lspci(out: str) -> dict[tuple[int, int], str]:
+    """`lspci -mm -nn` lines -> {(vendor, device): device name}. Only display
+    controllers (class 03xx)."""
+    names: dict[tuple[int, int], str] = {}
+    for line in out.splitlines():
+        fields = re.findall(r'"([^"]*)"', line)
+        if len(fields) < 3:
+            continue
+        klass, vendor, device = fields[0], fields[1], fields[2]
+        if not re.search(r"\[03[0-9a-f]{2}\]\s*$", klass, re.I):
+            continue
+        vid = re.search(r"\[([0-9a-f]{4})\]\s*$", vendor, re.I)
+        did = re.search(r"\[([0-9a-f]{4})\]\s*$", device, re.I)
+        if not vid or not did:
+            continue
+        name = re.sub(r"\s*\[[0-9a-f]{4}\]\s*$", "", device, flags=re.I).strip()
+        if name:
+            names[(int(vid.group(1), 16), int(did.group(1), 16))] = clip(name, 60)
+    return names
+
+
+def lspci_names() -> dict[tuple[int, int], str]:
+    cached = _lspci_cache.get("names")
+    if cached is not None:
+        return cached
+    names: dict[tuple[int, int], str] = {}
+    if shutil.which("lspci"):
+        try:
+            out = subprocess.check_output(["lspci", "-mm", "-nn"], text=True, timeout=5, stderr=subprocess.DEVNULL)
+            names = parse_lspci(out)
+        except (OSError, subprocess.SubprocessError):
+            names = {}
+    _lspci_cache["names"] = names
+    return names
+
+
+def gpu_name(vendor_id: int, device_id: int, names: dict[tuple[int, int], str] | None = None) -> str:
+    vendor = GPU_VENDORS.get(vendor_id, "")
+    if vendor == "amd" and device_id in STEAM_DECK_GPU_IDS:
+        return "AMD Radeon (Steam Deck APU)"
+    label = {"amd": "AMD", "intel": "Intel", "nvidia": "NVIDIA"}.get(vendor, "")
+    if not label:
+        return "GPU"
+    found = (names or {}).get((vendor_id, device_id), "")
+    return f"{label} {found}" if found else f"{label} GPU"
+
+
+def linux_cards(root: Path | None = None, names: dict[tuple[int, int], str] | None = None) -> list[dict]:
+    """GPUs from /sys/class/drm/card*/device. Read-only. VRAM and GTT come
+    from amdgpu's mem_info_* files where present; an APU (shared memory) is
+    marked unified and reports VRAM carve-out plus GTT as its memory."""
+    root = DRM_ROOT if root is None else root
+    try:
+        entries = sorted(root.glob("card*"))
+    except OSError:
+        return []
+    cards: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not re.fullmatch(r"card\d+", entry.name):
+            continue  # card0-DP-1 and similar are connectors, not GPUs
+        device = entry / "device"
+        vendor_id = _sys_int(device / "vendor", 16)
+        device_id = _sys_int(device / "device", 16)
+        if vendor_id is None or device_id is None:
+            continue
+        try:
+            key = str(device.resolve())
+        except OSError:
+            key = str(device)
+        if key in seen:
+            continue
+        seen.add(key)
+        vendor = GPU_VENDORS.get(vendor_id, "other")
+        mib = 1024 * 1024
+        vram_total = (_sys_int(device / "mem_info_vram_total") or 0) // mib
+        vram_used = (_sys_int(device / "mem_info_vram_used") or 0) // mib
+        gtt_total = (_sys_int(device / "mem_info_gtt_total") or 0) // mib
+        gtt_used = (_sys_int(device / "mem_info_gtt_used") or 0) // mib
+        unified = (vendor == "amd" and (device_id in STEAM_DECK_GPU_IDS or (0 < vram_total <= 2048 and gtt_total > 0))) or (
+            vendor == "intel" and not vram_total
+        )
+        temperature = None
+        try:
+            for sensor in sorted((device / "hwmon").glob("hwmon*/temp1_input")):
+                value = _sys_int(sensor)
+                if value is not None:
+                    temperature = value // 1000
+                    break
+        except OSError:
+            temperature = None
+        card = {
+            "name": gpu_name(vendor_id, device_id, lspci_names() if names is None else names),
+            "vendor": vendor,
+            "pci_id": f"{vendor_id:04x}:{device_id:04x}",
+            "memory_used_mib": vram_used + (gtt_used if unified else 0),
+            "memory_total_mib": vram_total + (gtt_total if unified else 0),
+            "vram_mib": vram_total,
+            "gtt_mib": gtt_total,
+            "temperature_c": temperature,
+        }
+        if unified:
+            card["unified"] = True
+        cards.append(card)
+    return cards
 
 
 def nvidia() -> list[dict]:
@@ -1208,13 +1342,45 @@ def cpu_busy_pct() -> int | None:
     return max(0, min(100, round(100 * load / cores)))
 
 
+def is_cuda_card(card: dict) -> bool:
+    """An NVIDIA card with its own memory. Older workers send no "vendor";
+    their non-unified cards always came from nvidia-smi."""
+    return not card.get("unified") and str(card.get("vendor") or "nvidia") == "nvidia"
+
+
+_model_cache: dict = {"at": 0.0, "up": False}
+
+
+def local_model_cached(ttl: float = 15.0) -> bool:
+    """local_model_ready() at most every `ttl` seconds: /hello is asked often."""
+    now = time.time()
+    if now - float(_model_cache["at"]) < ttl:
+        return bool(_model_cache["up"])
+    up = local_model_ready()
+    _model_cache.update({"at": now, "up": up})
+    return up
+
+
+def pick_accelerator(cards: list[dict], metal: bool, model_up: bool) -> str:
+    if any(is_cuda_card(card) for card in cards):
+        return "cuda"
+    if metal:
+        return "metal"
+    # llama.cpp on AMD/Intel under Linux runs on Vulkan. Only claimed while a
+    # local llama-server is really up.
+    if model_up and any(str(card.get("vendor") or "") in {"amd", "intel"} for card in cards):
+        return "vulkan"
+    return "cpu"
+
+
 def capabilities(cards: list[dict], ram: dict, chat: bool, rpc_ready: bool) -> dict:
     """What this computer can do for side work. Small and read-only."""
     busy = cpu_busy_pct()
     free_mib = int(ram.get("free_mib") or 0)
     gpu_busy = lock_held(GPU_LOCK) if os.name == "nt" else False
-    cuda = [card for card in cards if not card.get("unified")]
+    cuda = [card for card in cards if is_cuda_card(card)]
     metal = sys.platform == "darwin" and platform.machine() == "arm64"
+    model_up = local_model_cached()
     vram_total = max((int(card.get("memory_total_mib") or 0) for card in cuda), default=0)
     vram_free = max(
         (max(0, int(card.get("memory_total_mib") or 0) - int(card.get("memory_used_mib") or 0)) for card in cuda),
@@ -1225,7 +1391,11 @@ def capabilities(cards: list[dict], ram: dict, chat: bool, rpc_ready: bool) -> d
         "cpu_cores": os.cpu_count() or 0,
         "cpu_busy_pct": busy,
         "free_ram_mib": free_mib,
-        "accelerator": "cuda" if cuda else "metal" if metal else "cpu",
+        "accelerator": pick_accelerator(cards, metal, bool(chat or model_up)),
+        # The local llama-server that `generate` jobs use (NEURO_LOCAL_LLM,
+        # default 127.0.0.1:8080). False means this computer takes no
+        # generate jobs.
+        "local_model": model_up,
         "vram_total_mib": vram_total,
         "vram_free_mib": vram_free,
         "rpc_server": rpc_ready,
@@ -1785,7 +1955,7 @@ def side_jobs(status: dict, is_home: bool, training_running: bool | None, chat_o
     caps = status.get("caps") if isinstance(status.get("caps"), dict) else {}
     ram = status.get("ram") if isinstance(status.get("ram"), dict) else {}
     gpus = [card for card in (status.get("gpus") or []) if isinstance(card, dict)]
-    cuda = [card for card in gpus if not card.get("unified")]
+    cuda = [card for card in gpus if is_cuda_card(card)]
     os_name = str(status.get("os") or "").lower()
     free_mib = int(caps.get("free_ram_mib") or ram.get("free_mib") or 0)
     total_mib = int(ram.get("total_mib") or 0)
@@ -1856,7 +2026,7 @@ def mesh_snapshot() -> dict:
     try:
         jobs = job_queue().summary()
     except (OSError, RuntimeError, ValueError):
-        jobs = {"kinds": {}, "nodes": {}, "verified_rows": 0, "total": 0}
+        jobs = {"kinds": {}, "nodes": {}, "verified_rows": 0, "total": 0, "verifiers": {}, "rate": {}}
     return {
         "jobs": jobs,
         "nodes": nodes,
@@ -2226,6 +2396,7 @@ LUAU_TIMEOUT = 10
 LUAU_OUTPUT_CAP = 1024 * 1024
 MINHASH_PERM = 32
 MAX_ATTEMPTS = 3
+RATE_WINDOW = 3600  # seconds of finished jobs behind the rates and the ETA
 LEASE_SECONDS = {
     "generate": 900, "verify_luau": 180, "verify_python_syntax": 120, "verify_js": 180, "verify_ts": 240,
     "verify_html_css": 120, "verify_sql": 120, "verify_math": 120, "dedup_hash": 300,
@@ -2599,6 +2770,9 @@ class JobQueue:
         self.leases: dict[str, dict] = {}
         self.by_node: dict[str, str] = {}
         self.node_done: dict[str, dict[str, int]] = {}
+        # (at, node, kind, ok) of every finish event that carries a time,
+        # newest last. Rates and the queue ETA are counted from these.
+        self.finished: deque[tuple[int, str, str, bool]] = deque(maxlen=200000)
         self.offset = 0
 
     # -- file side ---------------------------------------------------------
@@ -2650,6 +2824,7 @@ class JobQueue:
                 self.leases.clear()
                 self.by_node.clear()
                 self.node_done.clear()
+                self.finished.clear()
                 self.offset = 0
             if size == self.offset:
                 return
@@ -2700,6 +2875,9 @@ class JobQueue:
             if job["node"]:
                 bucket = self.node_done.setdefault(job["node"], {"done": 0, "failed": 0})
                 bucket["done" if job["state"] == "done" else "failed"] += 1
+            at = event.get("at")
+            if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0:
+                self.finished.append((int(at), job["node"], job["kind"], job["state"] == "done"))
             parent = self.jobs.get(job["parent"]) if job["parent"] else None
             if parent is not None and job["kind"] in VERIFY_KINDS:
                 parent["verified"] = bool(job["state"] == "done" and job["passed"])
@@ -2814,15 +2992,18 @@ class JobQueue:
                     note = "saved; not verified: " + str(exc)[:120]
             return True, note
 
-    def summary(self) -> dict:
+    def summary(self, now: float | None = None) -> dict:
+        now = time.time() if now is None else now
         with self.lock:
             try:
                 self.sync()
-                self._expire(time.time())
+                self._expire(now)
             except (OSError, RuntimeError):
                 pass
             kinds = {kind: {"queued": 0, "leased": 0, "done": 0, "failed": 0, "passed": 0} for kind in JOB_KINDS}
             exportable = 0
+            # Verify jobs that queued generate jobs will add when they finish.
+            coming = {kind: 0 for kind in JOB_KINDS}
             for job in self.jobs.values():
                 row = kinds[job["kind"]]
                 row[job["state"]] += 1
@@ -2830,12 +3011,44 @@ class JobQueue:
                     row["passed"] += 1
                 if job["kind"] == "generate" and job["verified"]:
                     exportable += 1
+                if job["kind"] == "generate" and job["state"] in {"queued", "leased"}:
+                    spec = job["payload"].get("verify")
+                    if isinstance(spec, dict) and spec.get("kind") in coming:
+                        coming[spec["kind"]] += 1
+            empty = {"done": 0, "failed": 0, "now": "", "hour_done": 0, "hour_failed": 0, "last_s": None}
             nodes = {}
             for name, bucket in self.node_done.items():
-                nodes[name] = {"done": bucket["done"], "failed": bucket["failed"], "now": ""}
+                nodes[name] = dict(empty, done=bucket["done"], failed=bucket["failed"])
             for jid, held in self.leases.items():
-                nodes.setdefault(held["node"], {"done": 0, "failed": 0, "now": ""})["now"] = self.jobs[jid]["kind"]
-            return {"kinds": kinds, "nodes": nodes, "verified_rows": exportable, "total": len(self.jobs)}
+                nodes.setdefault(held["node"], dict(empty))["now"] = self.jobs[jid]["kind"]
+            hour = {kind: 0 for kind in JOB_KINDS}
+            for at, node, kind, good in reversed(self.finished):
+                age = now - at
+                if node in nodes and nodes[node]["last_s"] is None and age >= -60:
+                    nodes[node]["last_s"] = max(0, int(age))
+                if not -60 <= age < RATE_WINDOW:
+                    continue
+                hour[kind] = hour.get(kind, 0) + 1
+                if node in nodes:
+                    nodes[node]["hour_done" if good else "hour_failed"] += 1
+            verifiers = {}
+            for kind in VERIFY_KINDS:
+                row = kinds[kind]
+                checked = row["done"] + row["failed"]
+                verifiers[kind] = {
+                    "checked": checked,
+                    "passed": row["passed"],
+                    "pct": round(100 * row["passed"] / checked) if checked else None,
+                }
+            return {
+                "kinds": kinds,
+                "nodes": nodes,
+                "verified_rows": exportable,
+                "total": len(self.jobs),
+                "verifiers": verifiers,
+                "rate": queue_rate(kinds, coming, hour),
+                "at": int(now),
+            }
 
     def _results(self) -> tuple[dict[str, str], dict[str, dict]]:
         """Generated texts by job id, and the last verifier verdict by the
@@ -2950,6 +3163,55 @@ class JobQueue:
                     )
         _write_jsonl_atomic(out, rows)
         return out, len(rows)
+
+
+def queue_rate(kinds: dict, coming: dict, hour: dict) -> dict:
+    """Jobs per hour over the last RATE_WINDOW, and how long the open jobs
+    take at that rate. Each kind runs in parallel on its own workers, so the
+    queue ETA is the slowest kind. A verify job that a queued generate job
+    still has to make can only finish after that generate job, so such a kind
+    takes at least as long as generate. A kind with open jobs but nothing
+    finished in the window is "stalled" (no computer takes it now) and has no
+    ETA."""
+    def own_eta(left: int, done: int) -> int | None:
+        return int(left * RATE_WINDOW / done) if left and done else 0 if not left else None
+
+    gen = kinds.get("generate") or {}
+    gen_eta = own_eta(int(gen.get("queued") or 0) + int(gen.get("leased") or 0), int(hour.get("generate") or 0))
+    by_kind = {}
+    stalled = []
+    etas = []
+    left_total = 0
+    for kind, row in kinds.items():
+        open_now = int(row["queued"]) + int(row["leased"])
+        later = int(coming.get(kind) or 0)
+        done = int(hour.get(kind) or 0)
+        if not open_now and not later and not done:
+            continue
+        left_total += open_now + later
+        kind_eta = own_eta(open_now, done)
+        if open_now and not done:
+            stalled.append(kind)
+        if later:
+            # Waits on generate. Unknown when generate itself has no rate.
+            kind_eta = None if gen_eta is None or kind_eta is None else max(kind_eta, gen_eta)
+        if kind_eta is not None and (open_now or later):
+            etas.append(kind_eta)
+        # later: verify jobs that queued generate jobs still have to make.
+        by_kind[kind] = {
+            "left": open_now + later,
+            "later": later,
+            "per_hour": round(done * 3600 / RATE_WINDOW, 1),
+            "eta_s": kind_eta if open_now or later else 0,
+        }
+    return {
+        "window_s": RATE_WINDOW,
+        "per_hour": round(sum(hour.values()) * 3600 / RATE_WINDOW, 1),
+        "left": left_total,
+        "eta_s": max(etas) if etas else (0 if not left_total else None),
+        "stalled": stalled,
+        "by_kind": by_kind,
+    }
 
 
 def _write_jsonl_atomic(out: Path, rows: list[dict]) -> None:
@@ -3789,14 +4051,155 @@ class JobAuthError(Exception):
         self.missing = missing
 
 
-def mesh_url() -> str:
-    raw = os.environ.get("NEURO_MESH_URL", "").strip() or "http://192.168.7.14:8780"
+# --- finding the main PC (serve) without NEURO_MESH_URL ---------------------
+# Order: NEURO_MESH_URL, then the address remembered in mesh_url.txt, then a
+# sweep of this computer's own private /24 for a serve that says so on GET
+# /hello, then the old default. Finding a serve grants nothing: pairing still
+# needs the code approved on that main PC's page, and a worker that already
+# holds a cluster.token only takes a found serve that proves it holds the
+# same token (HMAC of a fresh nonce), so the token is never sent to a device
+# that merely answers /hello.
+DEFAULT_MESH_URL = "http://192.168.7.14:8780"
+MESH_URL_PATH = ROOT / "mesh_url.txt"
+_mesh_url_lock = threading.Lock()
+_mesh_url_cache: dict = {"url": None}
+
+
+def lan_url(raw: str) -> str:
+    """A clean http(s)://host:port on the private LAN (or 127.0.0.1), else ""."""
     try:
-        url = clean_url(raw)
+        url = clean_url(str(raw or ""))
     except ValueError:
         return ""
     host = urlparse(url).hostname or ""
     return url if private_lan(host) or host == "127.0.0.1" else ""
+
+
+def remembered_mesh_url() -> str:
+    try:
+        raw = MESH_URL_PATH.read_text(encoding="utf-8", errors="replace")[:200]
+    except OSError:
+        return ""
+    return lan_url(raw.strip())
+
+
+def remember_mesh_url(url: str) -> None:
+    url = lan_url(url)
+    if not url:
+        return
+    temp = MESH_URL_PATH.parent / f"{MESH_URL_PATH.name}.tmp-{secrets.token_hex(4)}"
+    try:
+        temp.write_text(url + "\n", encoding="utf-8")
+        os.replace(temp, MESH_URL_PATH)
+    except OSError:
+        pass
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def serve_proof_ok(base: str, secret: str) -> bool:
+    """True when the serve at `base` proves it holds `secret` (the same
+    HMAC check serve makes of a worker). Never sends the token."""
+    parsed = urlparse(base)
+    if not parsed.hostname or not parsed.port:
+        return False
+    address = f"{parsed.hostname}:{parsed.port}"
+    nonce = secrets.token_hex(16)
+    try:
+        with _DIRECT.open(base + "/hello/proof?nonce=" + nonce, timeout=4) as response:
+            body = read_reply(response)
+    except (OSError, urllib.error.URLError, ValueError):
+        return False
+    return isinstance(body, dict) and proof_ok(secret, nonce, address, body.get("proof"))
+
+
+def probe_serve(ip: str) -> dict | None:
+    """GET /hello on port 8780 of one LAN address. Returns {"url", "name"}
+    only for a reply that says it is a Neuro serve. Carries no token."""
+    if not private_lan(ip):
+        return None
+    try:
+        with socket.create_connection((ip, DASHBOARD_PORT), 0.6):
+            pass
+    except OSError:
+        return None
+    url = f"http://{ip}:{DASHBOARD_PORT}"
+    try:
+        with _DIRECT.open(url + "/hello", timeout=3) as response:
+            body = read_reply(response)
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+    if not isinstance(body, dict) or body.get("app") != "neuroai-mesh" or body.get("role") != "serve":
+        return None
+    return {"url": url, "name": clip(body.get("name"), 64)}
+
+
+def discover_serves(probe=probe_serve) -> list[dict]:
+    """Every serve on this computer's own private /24, by the LAN sweep's
+    address rules (never 26.x, 192.168.56.x or 169.254.x). This computer's
+    own LAN address is asked too: the main PC may also run a worker."""
+    prefixes, own = ipv4_prefixes()
+    lan = lan_host()
+    if lan:
+        prefixes = [lan.rsplit(".", 1)[0]]
+    hosts = sweep_hosts(prefixes, set())
+    if lan and lan in hosts:
+        hosts.remove(lan)
+        hosts.insert(0, lan)
+    if not hosts:
+        return []
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        return [item for item in pool.map(probe, hosts) if item]
+
+
+def find_mesh_url(discover=discover_serves, prove=serve_proof_ok, say=print) -> str:
+    raw = os.environ.get("NEURO_MESH_URL", "").strip()
+    if raw:
+        return lan_url(raw)
+    remembered = remembered_mesh_url()
+    if remembered:
+        say(f"Main PC: {remembered} (remembered in {MESH_URL_PATH.name}; delete that file to look again).")
+        return remembered
+    say(f"NEURO_MESH_URL is not set. Looking for the main PC on this network (port {DASHBOARD_PORT})...")
+    try:
+        found = discover()
+    except Exception as exc:  # a failed sweep must not stop the worker
+        say(f"The search failed ({type(exc).__name__}).")
+        found = []
+    secret = saved_token()
+    if secret and found:
+        # This worker already holds a token: only a serve that holds the same
+        # one may ever receive it in an Authorization header.
+        proven = [item for item in found if prove(item["url"], secret)]
+        if not proven:
+            for item in found:
+                say(f"  {item['url']} ({item.get('name') or 'no name'}) does not hold this computer's cluster.token.")
+            say("Not using it. If that is your main PC, set NEURO_MESH_URL to its address to pair with it again.")
+            return ""
+        found = proven
+    if len(found) == 1:
+        url = found[0]["url"]
+        remember_mesh_url(url)
+        say(f"Found the main PC: {url} ({found[0].get('name') or 'no name'}). Saved in {MESH_URL_PATH.name}.")
+        if not secret:
+            say("Pairing still needs its code approved on that main PC's page.")
+        return url
+    if len(found) > 1:
+        say("Found more than one main PC on this network:")
+        for item in found:
+            say(f"  {item['url']} ({item.get('name') or 'no name'})")
+        say("Set NEURO_MESH_URL to the one this computer should work for, then start the worker again.")
+        return ""
+    say(f"No main PC answered. Trying the default {DEFAULT_MESH_URL}; set NEURO_MESH_URL if yours is elsewhere.")
+    return lan_url(DEFAULT_MESH_URL)
+
+
+def mesh_url() -> str:
+    """The main PC's address for this worker, found once per process."""
+    with _mesh_url_lock:
+        if _mesh_url_cache["url"] is None:
+            _mesh_url_cache["url"] = find_mesh_url(say=lambda line: print(line, flush=True))
+        return _mesh_url_cache["url"]
 
 
 def machine_busy() -> str:
@@ -3837,8 +4240,8 @@ def job_loop() -> None:
     _job_state["on"] = True
     base = mesh_url()
     if not base:
-        _job_state.update({"on": False, "paused": "NEURO_MESH_URL is not a LAN address"})
-        print("Jobs are off: NEURO_MESH_URL is not a LAN address.", flush=True)
+        _job_state.update({"on": False, "paused": "no main PC address (set NEURO_MESH_URL to a LAN address)"})
+        print("Jobs are off: no main PC address. Set NEURO_MESH_URL to the main PC's LAN address.", flush=True)
         return
     node = socket.gethostname()
     time.sleep(20)
@@ -4014,12 +4417,14 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def parse_request(self) -> bool:
+        self._body_done = False
         if not super().parse_request():
             return False
         # Both ports listen on 0.0.0.0, so they are also reachable on the VPN
         # (26.x) and host-only (192.168.56.x) adapters. Only loopback and the
         # private home LAN get an answer.
         if not lan_client(self.client_address[0]):
+            self._body_done = True  # no reading from outside the LAN
             self.send_json(403, {"error": "LAN only"})
             return False
         if self.mode == "serve" and not browser_host_ok(self.headers.get("Host", "")):
@@ -4032,6 +4437,8 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def send_json(self, code: int, payload: dict) -> None:
+        if code >= 400 and self.command in {"POST", "PUT", "PATCH", "DELETE"} and not getattr(self, "_body_done", True):
+            self.drain_body()
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -4075,6 +4482,22 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def drain_body(self, limit: int = 65536) -> None:
+        """Read (and drop) a small unread request body before a refusal.
+        Closing with it unread makes Windows reset the connection, so the
+        caller saw a dropped socket instead of the 401/403."""
+        self._body_done = True
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except (TypeError, ValueError):
+            return
+        if 0 < length <= limit:
+            try:
+                self.connection.settimeout(2)
+                self.rfile.read(length)
+            except OSError:
+                pass
+
     def read_json(self, limit: int = 10000) -> dict:
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -4082,6 +4505,7 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         if length <= 0 or length > limit:
             return {}
+        self._body_done = True
         try:
             data = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
@@ -4094,6 +4518,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/hello":
                 payload = local_status()
                 payload["app"] = "neuroai-mesh"
+                payload["role"] = "work"
                 payload["port"] = WORKER_PORT
                 self.send_json(200, payload)
                 return
@@ -4121,6 +4546,30 @@ class Handler(BaseHTTPRequestHandler):
             if not self.worker_token_ok():
                 return
             self.send_json(200, local_status())
+            return
+        if path == "/hello":
+            # Lets a worker without NEURO_MESH_URL find this main PC. Says
+            # only what it is; holds nothing secret.
+            self.send_json(200, {"app": "neuroai-mesh", "role": "serve", "port": DASHBOARD_PORT, "name": clip(socket.gethostname(), 64)})
+            return
+        if path == "/hello/proof":
+            # The mirror of the worker's proof: a worker that already holds a
+            # token checks a found main PC with it before sending it. Answers
+            # an HMAC of the worker's nonce; never the token or a hash of it.
+            if not proof_rate_ok(str(self.client_address[0])):
+                self.send_json(429, {"error": "Too many token checks. Try again in a minute."})
+                return
+            nonce = (parse_qs(urlparse(self.path).query).get("nonce") or [""])[0]
+            if not _NONCE.match(nonce):
+                self.send_json(400, {"error": "Send nonce as 32 to 128 lowercase hex characters."})
+                return
+            secret = saved_token()
+            if not secret:
+                self.send_json(200, {"app": "neuroai-mesh", "role": "serve", "has_token": False})
+                return
+            local = self.connection.getsockname()
+            address = f"{local[0]}:{local[1]}"
+            self.send_json(200, {"app": "neuroai-mesh", "role": "serve", "has_token": True, "proof": proof_digest(secret, nonce, address)})
             return
         if path in {"/", "/dashboard"}:
             raw = DASHBOARD.read_bytes()

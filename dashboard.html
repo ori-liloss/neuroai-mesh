@@ -35,6 +35,13 @@
     .glance p { margin: 0; background: #10141f; border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
     .glance b { display: block; font-family: Georgia, serif; font-size: 20px; font-weight: 500; }
     .glance span { display: block; margin-top: 4px; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+    .glance.four { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 12px; }
+    .factory-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) auto; gap: 4px 12px; align-items: baseline; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
+    .factory-row span { color: var(--muted); overflow-wrap: anywhere; }
+    .factory-row .wide { grid-column: 1 / -1; }
+    .pass { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto; gap: 12px; align-items: center; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; font-family: var(--mono); font-size: 12px; }
+    .pass .bar { margin-top: 0; }
+    .hint, .factory-row .hint { color: var(--gold); }
     .stage { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; }
     .card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 20px; }
     .k { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em; color: var(--muted); }
@@ -101,7 +108,8 @@
     #log { display: flex; flex-direction: column; gap: 8px; min-height: 280px; }
     .bubble { max-width: 78%; padding: 12px 14px; border-radius: 16px; border: 1px solid var(--line); white-space: pre-wrap; }
     .user { align-self: end; background: #18243b; }
-    @media (max-width: 1100px) { .app, .stage, .bay, .glance { grid-template-columns: 1fr; } .app { height: auto; } main { height: auto; } }
+    @media (max-width: 1100px) { .app, .stage, .bay, .glance, .glance.four { grid-template-columns: 1fr; } .app { height: auto; } main { height: auto; } }
+    @media (max-width: 700px) { .factory-row, .pass { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -219,10 +227,21 @@
           <div class="k">DATA FACTORY</div>
           <h2>Jobs</h2>
           <p class="muted">The other computers take small jobs from a queue on this PC: generate with their own local model, check code and math answers, and hash text for dedup. A job is data for a built-in check, never a command. Only rows that pass a check are exported for the next training run. Training stays on this PC.</p>
+          <div class="glance four">
+            <p><b id="f-rows">–</b><span>verified rows ready to export</span></p>
+            <p><b id="f-rate">–</b><span id="f-rate-sub">jobs per hour, last hour</span></p>
+            <p><b id="f-left">–</b><span id="f-left-sub">jobs left in the queue</span></p>
+            <p><b id="f-eta">–</b><span id="f-eta-sub">at the recent rate</span></p>
+          </div>
           <p class="muted" id="jobs-total">–</p>
-          <div id="jobs-kinds"></div>
+          <p class="muted hint" id="jobs-stalled"></p>
           <h2 style="font-size:22px">Computers</h2>
           <div id="jobs-nodes"></div>
+          <h2 style="font-size:22px">Checks</h2>
+          <p class="muted">Share of finished checks that passed, per verifier. Only generated rows whose check passed are exported.</p>
+          <div id="jobs-verifiers"></div>
+          <h2 style="font-size:22px">Queue by kind</h2>
+          <div id="jobs-kinds"></div>
           <p class="muted">Add jobs on this PC with <code>python mesh.py jobs add generate-verify prompts.jsonl</code>, then <code>python mesh.py jobs export verified.jsonl</code>.</p>
         </article>
       </section>
@@ -367,6 +386,21 @@ function fitRows(box, item) {
   state.textContent = jobs && jobs.on ? (jobs.paused ? "paused: " + String(jobs.paused) : jobs.current ? "running " + String(jobs.current) : "done " + Number(jobs.done || 0)) : "";
   row.append(name, state);
   box.append(row);
+  const model = modelLine(item);
+  const modelRow = document.createElement("div");
+  modelRow.className = "row";
+  const modelName = document.createElement("span");
+  modelName.textContent = model.text;
+  const modelState = document.createElement("b");
+  modelState.textContent = model.up ? "generate on" : "generate off";
+  modelRow.append(modelName, modelState);
+  box.append(modelRow);
+  if (model.hint) {
+    const hint = document.createElement("p");
+    hint.className = "muted hint";
+    hint.textContent = model.hint;
+    box.append(hint);
+  }
 }
 function duty(item, index) {
   const status = (item && item.status) || {};
@@ -654,43 +688,158 @@ function cell(row, value, tag) {
   node.textContent = String(value);
   row.append(node);
 }
+function duration(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s < 0) return "–";
+  if (s < 60) return "under a minute";
+  const m = Math.round(s / 60);
+  if (m < 60) return m + " min";
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + " h " + (m % 60) + " min";
+  return Math.round(h / 24) + " days";
+}
+function ago(seconds) {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return "no job yet";
+  return Number(seconds) < 60 ? "last job just now" : "last job " + duration(seconds) + " ago";
+}
+function modelLine(item) {
+  // Local model status for generate jobs. Workers report caps.local_model;
+  // older ones only list "generate" in job_kinds while their model is up.
+  const status = (item && item.status) || {};
+  const caps = status.caps || {};
+  const kinds = (caps.job_kinds || []).map(String);
+  if (item && item.url === "local") {
+    if (status.chat_server || caps.local_model) return { up: true, text: "Local model: up on this PC" };
+    return { up: false, text: "Local model: off on this PC" };
+  }
+  const up = caps.local_model === true || kinds.includes("generate");
+  const accel = String(caps.accelerator || "");
+  if (up) return { up: true, text: "Local model: up · takes generate jobs" + (accel && accel !== "cpu" ? " · " + accel : "") };
+  if (caps.local_model === false || (caps.jobs && caps.jobs.on)) {
+    return {
+      up: false,
+      text: "Local model: none · no generate jobs",
+      hint: "No local model on this computer, so it only runs checks. To generate too, start llama-server there on port 8080 (or set NEURO_LOCAL_LLM); it picks up generate jobs within a minute.",
+    };
+  }
+  return { up: false, text: "Local model: not reported (older worker)" };
+}
+function nowLine(item, done) {
+  const caps = (item && item.status && item.status.caps) || {};
+  const jobs = caps.jobs || null;
+  if (done && done.now) return "running " + String(done.now);
+  if (jobs && jobs.on && jobs.current) return "running " + String(jobs.current);
+  if (jobs && jobs.on && jobs.paused) return "paused: " + String(jobs.paused);
+  if (jobs && jobs.on) return "waiting for a job it can run";
+  if (item && item.url === "local") return "holds the queue";
+  if (!item || !item.status) return "not connected now";
+  return "jobs off (older worker or NEURO_JOBS=0)";
+}
+function factoryRow(box, name, item, done) {
+  const row = document.createElement("div");
+  row.className = "factory-row";
+  const who = document.createElement("b");
+  who.textContent = name;
+  const now = document.createElement("span");
+  now.textContent = nowLine(item, done);
+  const count = document.createElement("b");
+  const timed = "hour_done" in done;  // an older serve sends no rates
+  const hour = Number(done.hour_done || 0) + Number(done.hour_failed || 0);
+  count.textContent = "done " + Number(done.done || 0) + " · failed " + Number(done.failed || 0) + (timed ? " · " + hour + " in the last hour" : "");
+  row.append(who, now, count);
+  const caps = (item && item.status && item.status.caps) || {};
+  const kinds = (caps.job_kinds || []).map(String);
+  const model = item && item.status ? modelLine(item) : null;
+  const meta = document.createElement("span");
+  meta.className = "wide";
+  meta.textContent = [timed ? ago(done.last_s) : "", model ? model.text : "", kinds.length ? "runs " + kinds.join(", ") : ""].filter(Boolean).join(" · ");
+  row.append(meta);
+  if (model && model.hint) {
+    const hint = document.createElement("span");
+    hint.className = "wide hint";
+    hint.textContent = model.hint;
+    row.append(hint);
+  }
+  box.append(row);
+}
 function drawJobs(list) {
   const jobs = mesh.jobs || {};
+  const rate = jobs.rate || {};
   const kindsBox = document.getElementById("jobs-kinds");
   const nodesBox = document.getElementById("jobs-nodes");
-  if (!kindsBox || !nodesBox) return;
+  const checksBox = document.getElementById("jobs-verifiers");
+  if (!kindsBox || !nodesBox || !checksBox) return;
+  text("f-rows", String(Number(jobs.verified_rows || 0)));
+  text("f-rate", rate.per_hour != null ? String(rate.per_hour) : "–");
+  text("f-left", rate.left != null ? String(rate.left) : "–");
+  const later = Object.values(rate.by_kind || {}).reduce((sum, row) => sum + Number((row && row.later) || 0), 0);
+  text("f-left-sub", later ? "jobs left, " + later + " of them checks not made yet" : "jobs left in the queue");
+  const stalled = (rate.stalled || []).map(String);
+  if (rate.eta_s === 0) {
+    text("f-eta", "done");
+    text("f-eta-sub", "nothing left in the queue");
+  } else if (rate.eta_s != null) {
+    text("f-eta", duration(rate.eta_s));
+    text("f-eta-sub", "until the queue is empty, at the last hour's rate");
+  } else {
+    text("f-eta", "–");
+    text("f-eta-sub", rate.window_s ? "no job finished in the last hour" : "rates appear after serve restarts with this version");
+  }
+  text("jobs-stalled", stalled.length ? "Waiting, and no computer took one in the last hour: " + stalled.join(", ") + ". Not counted in the time above." : "");
   text("jobs-total", Number(jobs.total || 0) + " jobs in the queue file · " + Number(jobs.verified_rows || 0) + " verified rows ready to export");
+  nodesBox.replaceChildren();
+  const work = jobs.nodes || {};
+  const shown = new Set();
+  for (const item of list) {
+    const key = String(item.name || "").toLowerCase().split(".")[0];
+    shown.add(key);
+    if (item.url === "local" && !work[key]) continue;
+    factoryRow(nodesBox, item.name + (item.url === "local" ? " (this PC)" : ""), item, work[key] || {});
+  }
+  for (const [key, done] of Object.entries(work)) {
+    if (shown.has(key)) continue;
+    factoryRow(nodesBox, key, { url: "", status: null }, done || {});
+  }
+  if (!nodesBox.children.length) {
+    const note = document.createElement("p");
+    note.className = "muted";
+    note.textContent = "No other computer is connected.";
+    nodesBox.append(note);
+  }
+  checksBox.replaceChildren();
+  for (const [kind, row] of Object.entries(jobs.verifiers || {})) {
+    if (!row || !Number(row.checked || 0)) continue;
+    const line = document.createElement("div");
+    line.className = "pass";
+    cell(line, kind);
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    const fill = document.createElement("i");
+    fill.style.width = Math.max(0, Math.min(100, Number(row.pct || 0))) + "%";
+    bar.append(fill);
+    line.append(bar);
+    cell(line, Number(row.passed || 0) + " of " + Number(row.checked || 0) + " · " + Number(row.pct || 0) + "%", "b");
+    checksBox.append(line);
+  }
+  if (!checksBox.children.length) {
+    const note = document.createElement("p");
+    note.className = "muted";
+    note.textContent = "No check has finished yet.";
+    checksBox.append(note);
+  }
   kindsBox.replaceChildren();
   const head = document.createElement("div");
   head.className = "row";
   cell(head, "kind");
-  cell(head, "queued · leased · done · failed · passed", "b");
+  cell(head, "queued · leased · done · failed · passed · per hour", "b");
   kindsBox.append(head);
   for (const [kind, row] of Object.entries(jobs.kinds || {})) {
     const line = document.createElement("div");
     line.className = "row";
     cell(line, kind);
-    cell(line, [row.queued, row.leased, row.done, row.failed, row.passed].map((n) => Number(n || 0)).join(" · "), "b");
+    const speed = ((rate.by_kind || {})[kind] || {}).per_hour;
+    cell(line, [row.queued, row.leased, row.done, row.failed, row.passed].map((n) => Number(n || 0)).join(" · ") + " · " + Number(speed || 0), "b");
     kindsBox.append(line);
-  }
-  nodesBox.replaceChildren();
-  const work = jobs.nodes || {};
-  for (const item of list.slice(1)) {
-    const caps = (item.status && item.status.caps) || {};
-    const key = String(item.name || "").toLowerCase().split(".")[0];
-    const done = work[key] || {};
-    const line = document.createElement("div");
-    line.className = "row";
-    const kinds = (caps.job_kinds || []).map(String);
-    cell(line, item.name + " · " + (kinds.length ? kinds.join(", ") : "no job kinds yet (older worker or jobs off)"));
-    cell(line, (done.now ? "running " + String(done.now) + " · " : "") + "done " + Number(done.done || 0) + " · failed " + Number(done.failed || 0), "b");
-    nodesBox.append(line);
-  }
-  if (list.length < 2) {
-    const note = document.createElement("p");
-    note.className = "muted";
-    note.textContent = "No other computer is connected.";
-    nodesBox.append(note);
   }
 }
 function appRows(status, url) {
