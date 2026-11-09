@@ -42,7 +42,7 @@ cd neuroai-mesh
 bash platforms/start-mac.sh
 ```
 
-The next time, `git pull` when there is a new version, then `bash platforms/start-mac.sh`. The script does not update the code by itself. The Windows page finds the machine. On the Mac, do not open 127.0.0.1. That address is the Mac itself. Open the Windows address shown on the Share page, which looks like http://192.168.7.14:8780. There is no file to copy and no address to paste into the worker.
+To also run a local model (so the Mac generates training data), use `sh platforms/mac-worker.sh` instead: it starts llama-server (after `brew install llama.cpp`) and the worker together. The next time, `git pull` when there is a new version, then `bash platforms/start-mac.sh`. The script does not update the code by itself. The Windows page finds the machine. On the Mac, do not open 127.0.0.1. That address is the Mac itself. Open the Windows address shown on the Share page, which looks like http://192.168.7.14:8780. There is no file to copy and no address to paste into the worker.
 
 `mesh.py serve` belongs on Windows. macOS has no `python` command. The script uses `python3`. If Python is missing: `brew install python`, then run the script again.
 

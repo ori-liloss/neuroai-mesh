@@ -90,6 +90,23 @@ else
   echo "      The model is ready."
 fi
 
+# A "Neuro Worker" icon on the Desktop (Desktop mode), so next time is one double-click.
+LAUNCHER="$HOME/Desktop/neuro-worker.desktop"
+if [ -d "$HOME/Desktop" ] && [ ! -e "$LAUNCHER" ]; then
+  SCRIPT="$(pwd)/platforms/steamdeck.sh"
+  cat > "$LAUNCHER" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Neuro Worker
+Comment=Start the Neuro worker and its local model
+Exec=konsole --hold -e sh "$SCRIPT"
+Icon=utilities-terminal
+Terminal=false
+EOF
+  chmod +x "$LAUNCHER"
+  echo "      Added a 'Neuro Worker' icon to the Desktop. Next time, double-click it."
+fi
+
 echo "[4/4] Starting the Neuro worker. Main PC: $NEURO_MESH_URL"
 echo "      A pairing code (Pairing code: ### ###) appears in about 30 seconds."
 echo "      Approve it on the main PC's Neuro page. Ctrl+C stops everything."

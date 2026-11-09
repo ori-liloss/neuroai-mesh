@@ -146,6 +146,12 @@ export NEURO_MESH_URL=http://192.168.1.20:8780
 bash platforms/start-mac.sh
 ```
 
+With a local model too (recommended; one window, keeps the Mac awake): `brew install llama.cpp` once, then
+
+```bash
+cd ~/neuroai-mesh && git pull && sh platforms/mac-worker.sh
+```
+
 macOS has no `python`; the script uses `python3` (`brew install python` if missing). Do not open
 127.0.0.1 on the Mac — that is the Mac itself. Do not run `mesh.py serve` there.
 

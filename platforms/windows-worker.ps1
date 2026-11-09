@@ -256,6 +256,22 @@ $PyArgs = @()
 if ($Py.Count -gt 1) { $PyArgs = $Py[1..($Py.Count - 1)] }
 Write-Host "[1/5] Python: $($Py -join ' ')"
 
+# A "Neuro Worker" icon on the Desktop, so next time is one double-click.
+try {
+  $desktop = [Environment]::GetFolderPath('Desktop')
+  $shortcut = Join-Path $desktop 'Neuro Worker.lnk'
+  if ($desktop -and -not (Test-Path -LiteralPath $shortcut)) {
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+    $link.TargetPath = Join-Path $PSScriptRoot 'windows-worker.cmd'
+    $link.WorkingDirectory = $RepoRoot
+    $link.Description = 'Start the Neuro worker and its local model'
+    $link.Save()
+    Write-Host "      Added a 'Neuro Worker' icon to the Desktop. Next time, double-click it."
+  }
+} catch {
+  Write-Host '      (Could not add a Desktop icon; start it with platforms\windows-worker.cmd.)'
+}
+
 # ---------------------------------------------------------------- keep awake
 
 $awakeOk = $false
