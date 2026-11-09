@@ -17,10 +17,6 @@ else
   exit 1
 fi
 
-if command -v git >/dev/null 2>&1 && [ -d .git ]; then
-  git pull --ff-only || true
-fi
-
 echo "This Mac joins the Windows page by itself. Leave that page open."
 echo "Do not run mesh.py serve here."
 echo "Ctrl+C stops this worker. The command is: bash platforms/start-mac.sh"
@@ -40,21 +36,43 @@ done
 if [ -n "$lan_ip" ]; then
   echo "Default route: $lan_ip"
 fi
+case "$lan_ip" in
+  ""|*[!0-9.]*) lan_ip="" ;;
+esac
 
 rpc=""
+rpc_busy=0
 for candidate in /opt/homebrew/bin/ggml-rpc-server "$HOME/llama.cpp/build/bin/ggml-rpc-server" "$HOME/llama.cpp/build/bin/rpc-server"; do
-  if [ -x "$candidate" ]; then
+  set +e
+  "$PY" -c 'import os,stat,sys
+p=sys.argv[1]
+try:
+    info=os.stat(p)
+except FileNotFoundError:
+    sys.exit(2)
+except OSError:
+    sys.exit(1)
+sys.exit(0 if stat.S_ISREG(info.st_mode) and os.access(p, os.X_OK) else 3)' "$candidate"
+  code=$?
+  set -e
+  if [ "$code" -eq 0 ]; then
     rpc=$candidate
     break
   fi
+  if [ "$code" -eq 1 ]; then
+    rpc_busy=1
+    break
+  fi
 done
-if [ -z "$rpc" ]; then
+if [ -z "$rpc" ] && [ "$rpc_busy" -eq 0 ]; then
   found=$(command -v ggml-rpc-server 2>/dev/null || true)
   if [ -n "$found" ] && [ -x "$found" ]; then
     rpc=$found
   fi
 fi
-if [ -n "$rpc" ] && [ -n "$lan_ip" ]; then
+if [ "$rpc_busy" -eq 1 ]; then
+  echo "The memory program could not be read. This Mac does not start another one."
+elif [ -n "$rpc" ] && [ -n "$lan_ip" ]; then
   if "$PY" -c "import socket,sys; s=socket.socket(); s.settimeout(0.4); r=s.connect_ex(('$lan_ip', 50052)); s.close(); sys.exit(0 if r==0 else 1)"; then
     echo "Mac memory is already waiting on ${lan_ip}:50052."
   else

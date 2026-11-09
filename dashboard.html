@@ -111,7 +111,9 @@
         <button type="button" data-view="try">Try</button>
         <button type="button" data-view="share">Share</button>
         <button type="button" data-view="training">Training</button>
+        <button type="button" data-view="jobs">Jobs</button>
       </nav>
+      <p class="muted" id="page-state"></p>
     </aside>
     <main>
       <section class="view" id="view-machines">
@@ -137,6 +139,7 @@
             <p class="muted" id="pick-meta">–</p>
             <p class="muted" id="doing">–</p>
             <div class="bar"><i id="pick-bar"></i></div>
+            <div id="pick-fit"></div>
             <div id="pick-hogs"></div>
             <p class="muted" id="stop-note"></p>
           </article>
@@ -201,6 +204,18 @@
           <p class="muted" id="train-note"></p>
         </article>
       </section>
+      <section class="view" id="view-jobs" hidden>
+        <article class="card">
+          <div class="k">DATA FACTORY</div>
+          <h2>Jobs</h2>
+          <p class="muted">The other computers take small jobs from a queue on this PC: generate with their own local model, check code and math answers, and hash text for dedup. A job is data for a built-in check, never a command. Only rows that pass a check are exported for the next training run. Training stays on this PC.</p>
+          <p class="muted" id="jobs-total">–</p>
+          <div id="jobs-kinds"></div>
+          <h2 style="font-size:22px">Computers</h2>
+          <div id="jobs-nodes"></div>
+          <p class="muted">Add jobs on this PC with <code>python mesh.py jobs add generate-verify prompts.jsonl</code>, then <code>python mesh.py jobs export verified.jsonl</code>.</p>
+        </article>
+      </section>
     </main>
   </div>
 <script>
@@ -227,7 +242,9 @@ function hogs(rows, url) {
     const size = document.createElement("b");
     size.textContent = item.mb != null ? item.mb + " MB" : "";
     row.append(name, size);
-    if (item.pid && item.stoppable !== false) {
+    // Only a row the computer itself marks stoppable gets a button. An old
+    // worker that does not say so gets none.
+    if (item.pid && item.stoppable === true) {
       const button = document.createElement("button");
       button.className = "quiet";
       button.type = "button";
@@ -238,7 +255,12 @@ function hogs(rows, url) {
     box.append(row);
   }
 }
+let stopping = false;
 async function stopProcess(pid, name, url) {
+  if (stopping) return;
+  const where = url === "local" ? "this PC" : String(url || "");
+  if (!window.confirm("Stop " + String(name || "this program") + " (PID " + Number(pid) + ") on " + where + "? Unsaved work in it is lost.")) return;
+  stopping = true;
   let text = "That computer did not answer.";
   try {
     const response = await fetch("/api/process/stop", {
@@ -246,11 +268,13 @@ async function stopProcess(pid, name, url) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pid, name, url: url === "local" ? "" : url }),
     });
-    const body = await response.json();
-    text = body.note || body.error || "Could not stop that process.";
+    const body = await readJsonLimited(response, 8000);
+    if (!body || typeof body !== "object") throw new Error("unread");
+    text = String(body.note || body.error || "Could not stop that process.").slice(0, 300);
   } catch (error) {
     text = "That computer did not answer.";
   }
+  stopping = false;
   const local = document.getElementById("stop-note");
   const share = document.getElementById("share-note");
   if (local) local.textContent = text;
@@ -281,27 +305,64 @@ function lines(id, rows, empty) {
 }
 let picked = 0;
 let mapKey = "";
+function machineKey(name, os) {
+  // NAME and NAME.local are the same computer; a Mac on two addresses is one row.
+  return String(name || "").trim().toLowerCase().split(".")[0] + "|" + String(os || "").trim().toLowerCase();
+}
 function cluster() {
-  const local = (mesh.nodes[0] && mesh.nodes[0].status) || {};
-  const list = [{ name: local.name || "This PC", status: local, url: "local" }];
-  const seen = new Set();
+  const home = (mesh.nodes || [])[0] || {};
+  const local = home.status || {};
+  const list = [{ name: local.name || "This PC", status: local, url: "local", fit: home.fit || [], misses: 0 }];
+  const seen = new Set([machineKey(local.name, local.os)]);
+  const urls = new Set();
   const rows = [].concat(mesh.found || [], (mesh.nodes || []).slice(1));
   for (const item of rows) {
-    if (!item || !item.ok || !item.status || item.url === "local") continue;
+    if (!item || !item.ok || !item.status || typeof item.status !== "object" || item.url === "local") continue;
     const status = item.status;
     const os = String(status.os || "").toLowerCase();
     if (os === "windows") status.kind = "laptop";
-    const name = status.name || item.url;
-    const key = String(name) + "|" + os;
-    if (!name || seen.has(key)) continue;
+    const name = String(status.name || item.url || "");
+    const key = item.limited ? "url|" + item.url : machineKey(name, os);
+    if (!name || seen.has(key) || urls.has(item.url)) continue;
     seen.add(key);
-    list.push({ name, status, url: item.url });
+    urls.add(item.url);
+    list.push({ name, status, url: item.url, fit: item.fit || [], misses: Number(item.misses || 0), seen_s: Number(item.seen_s || 0) });
   }
   return list;
 }
+function fitLine(item) {
+  const ready = (item.fit || []).filter((job) => job.ready).map((job) => job.label);
+  const later = (item.fit || []).filter((job) => !job.ready).map((job) => job.label);
+  if (!ready.length && !later.length) return "";
+  return (ready.length ? "Good for: " + ready.join(", ") + "." : "") + (later.length ? " Not now: " + later.join(", ") + "." : "");
+}
+function fitRows(box, item) {
+  for (const job of item.fit || []) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const name = document.createElement("span");
+    name.textContent = String(job.label || job.job || "") + " · " + String(job.why || "");
+    const state = document.createElement("b");
+    state.textContent = job.ready ? "ready" : "not now";
+    row.append(name, state);
+    box.append(row);
+  }
+  const kinds = ((item.status && item.status.caps && item.status.caps.job_kinds) || []).map(String);
+  const jobs = (item.status && item.status.caps && item.status.caps.jobs) || null;
+  const row = document.createElement("div");
+  row.className = "row";
+  const name = document.createElement("span");
+  name.textContent = kinds.length ? "Data factory jobs: " + kinds.join(", ") : item.url === "local" ? "Data factory queue is on this PC." : "No data factory jobs from this computer yet. It needs one git pull and a restart of its worker.";
+  const state = document.createElement("b");
+  state.textContent = jobs && jobs.on ? (jobs.paused ? "paused: " + String(jobs.paused) : jobs.current ? "running " + String(jobs.current) : "done " + Number(jobs.done || 0)) : "";
+  row.append(name, state);
+  box.append(row);
+}
 function duty(item, index) {
   const status = (item && item.status) || {};
+  if (item && item.misses > 0) return "no answer for " + (item.seen_s || 0) + " s";
   if (index === 0 && mesh.training && mesh.training.running) return "training";
+  if (index === 0 && mesh.training && mesh.training.running === null) return "training state unknown";
   if (index === 0) return status.chat_server ? "runs the model" : "this PC";
   if (status.rpc_listening) return "memory waiting";
   return "checks agents";
@@ -313,7 +374,8 @@ function doing(item, index) {
   if (index === 0 && mesh.training && mesh.training.running) return "This computer is training on its NVIDIA GPU. Chat is paused." + tail;
   if (status.chat_server) return "This computer is serving chat." + tail;
   if (status.rpc_listening) return "This computer is listening, ready to hold part of the next run, and it can check the agents." + tail;
-  if (index > 0) return "This computer checks the agent code on its own processor. It is not holding the model, and it does not take the training step." + tail;
+  const fit = fitLine(item);
+  if (index > 0) return "This computer does side work on its own processor. It is not holding the model, and it does not take the training step. " + fit + tail;
   return (busy.length ? "This computer is busy." : "This computer is quiet.") + tail;
 }
 function plainDetail(detail) {
@@ -502,8 +564,9 @@ function paint() {
   text("pool", pool);
   const home = list[0] && list[0].status;
   const trainingNow = Boolean(mesh.training && mesh.training.running);
-  text("g-model", trainingNow ? "Training" : home && home.chat_server ? "Model on this PC" : "Model is off");
-  text("g-model-sub", trainingNow ? "Step " + (mesh.training.step || "–") + " of " + (mesh.training.max_steps || "–") : home && home.chat_server ? "Chat is using this computer." : "Nothing is serving chat.");
+  const trainingUnknown = Boolean(mesh.training && mesh.training.running === null);
+  text("g-model", trainingNow ? "Training" : trainingUnknown ? "Training unknown" : home && home.chat_server ? "Model on this PC" : "Model is off");
+  text("g-model-sub", trainingNow ? "Step " + (mesh.training.step || "–") + " of " + (mesh.training.max_steps || "–") : trainingUnknown ? "The training log cannot be read." : home && home.chat_server ? "Chat is using this computer." : "Nothing is serving chat.");
   text("g-count", list.length + (list.length === 1 ? " computer" : " computers"));
   text("g-count-sub", list.length < 2 ? "The next one appears when its command is running." : list.slice(1).map((item) => item.name).join(", "));
   const workers = crew.workers || [];
@@ -524,10 +587,16 @@ function paint() {
     bar.style.width = total ? Math.round(100 * used / total) + "%" : "0";
     bar.parentElement.classList.toggle("hot", Boolean(total && used / total >= 0.9));
   }
+  const fitBox = document.getElementById("pick-fit");
+  if (fitBox) {
+    fitBox.replaceChildren();
+    if (current) fitRows(fitBox, current);
+  }
   hogs(current && current.status.heavy, current ? current.url : "");
+  drawJobs(list);
   lines("model-list", (mesh.models || []).map((item) => ({ name: item.name + (item.loaded ? " · loaded" : " · on disk"), mb: item.mb })), "No GGUF files found.");
   const training = mesh.training || {};
-  text("train-title", training.running ? "Running" : "Stopped");
+  text("train-title", training.stale_lock ? "Stopped · lock held" : training.running ? "Running" : training.running === null ? "Unknown" : "Stopped");
   text("train-step", training.step ? String(training.step) : "–");
   text("train-loss", training.loss != null ? "Last loss " + training.loss + " · step " + training.step + " of " + training.max_steps : "No loss");
   text("train-reason", training.reason || "");
@@ -563,12 +632,56 @@ function paint() {
   }
   const start = document.getElementById("start-train");
   if (start) {
-    start.disabled = Boolean(training.running);
-    start.textContent = training.running ? "Training is running" : "Start training";
+    start.disabled = training.running !== false || Boolean(training.stale_lock);
+    start.textContent = training.stale_lock ? "GPU lock still held" : training.running ? "Training is running" : training.running === null ? "Training state unknown" : "Start training";
   }
   drawShare(list);
   const arrived = mesh.arrivals || [];
   text("arrived", arrived.length ? arrived.map((item) => (item.name || item.host || item.url) + ": " + (item.ok ? item.passed + " of " + item.rounds : (item.error || "failed"))).join(" · ") : "");
+}
+function cell(row, value, tag) {
+  const node = document.createElement(tag || "span");
+  node.textContent = String(value);
+  row.append(node);
+}
+function drawJobs(list) {
+  const jobs = mesh.jobs || {};
+  const kindsBox = document.getElementById("jobs-kinds");
+  const nodesBox = document.getElementById("jobs-nodes");
+  if (!kindsBox || !nodesBox) return;
+  text("jobs-total", Number(jobs.total || 0) + " jobs in the queue file · " + Number(jobs.verified_rows || 0) + " verified rows ready to export");
+  kindsBox.replaceChildren();
+  const head = document.createElement("div");
+  head.className = "row";
+  cell(head, "kind");
+  cell(head, "queued · leased · done · failed · passed", "b");
+  kindsBox.append(head);
+  for (const [kind, row] of Object.entries(jobs.kinds || {})) {
+    const line = document.createElement("div");
+    line.className = "row";
+    cell(line, kind);
+    cell(line, [row.queued, row.leased, row.done, row.failed, row.passed].map((n) => Number(n || 0)).join(" · "), "b");
+    kindsBox.append(line);
+  }
+  nodesBox.replaceChildren();
+  const work = jobs.nodes || {};
+  for (const item of list.slice(1)) {
+    const caps = (item.status && item.status.caps) || {};
+    const key = String(item.name || "").toLowerCase().split(".")[0];
+    const done = work[key] || {};
+    const line = document.createElement("div");
+    line.className = "row";
+    const kinds = (caps.job_kinds || []).map(String);
+    cell(line, item.name + " · " + (kinds.length ? kinds.join(", ") : "no job kinds yet (older worker or jobs off)"));
+    cell(line, (done.now ? "running " + String(done.now) + " · " : "") + "done " + Number(done.done || 0) + " · failed " + Number(done.failed || 0), "b");
+    nodesBox.append(line);
+  }
+  if (list.length < 2) {
+    const note = document.createElement("p");
+    note.className = "muted";
+    note.textContent = "No other computer is connected.";
+    nodesBox.append(note);
+  }
 }
 function appRows(status, url) {
   const box = document.createElement("div");
@@ -580,7 +693,7 @@ function appRows(status, url) {
     const size = document.createElement("b");
     size.textContent = (app.mb != null ? app.mb + " MB" : "");
     row.append(name, size);
-    if (app.pid && app.stoppable !== false) {
+    if (app.pid && app.stoppable === true) {
       const button = document.createElement("button");
       button.className = "quiet";
       button.type = "button";
@@ -628,7 +741,7 @@ function kindLabel(kind) {
   return "desktop";
 }
 function show(view) {
-  for (const name of ["machines", "models", "try", "share", "training"]) document.getElementById("view-" + name).hidden = name !== view;
+  for (const name of ["machines", "models", "try", "share", "training", "jobs"]) document.getElementById("view-" + name).hidden = name !== view;
   document.querySelectorAll("nav button").forEach((button) => button.classList.toggle("on", button.dataset.view === view));
 }
 document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => show(button.dataset.view); });
@@ -636,8 +749,10 @@ document.getElementById("stop-agents").onclick = async () => {
   const note = document.getElementById("share-note");
   try {
     const response = await fetch("/api/agents/stop", { method: "POST" });
-    const body = await response.json();
-    if (note) note.textContent = "Stopped " + ((body.stopped || []).length) + " code workers.";
+    const body = await readJsonLimited(response, 8000);
+    if (!body || typeof body !== "object") throw new Error("unread");
+    const stopped = Array.isArray(body.stopped) ? body.stopped.slice(0, 40) : [];
+    if (note) note.textContent = "Stopped " + stopped.length + " code workers.";
   } catch (error) {
     if (note) note.textContent = "Could not stop the code workers.";
   }
@@ -646,8 +761,9 @@ document.getElementById("stop-model").onclick = async () => {
   const note = document.getElementById("share-note");
   try {
     const response = await fetch("/api/model/stop", { method: "POST" });
-    const body = await response.json();
-    if (note) note.textContent = body.note || "Could not stop the model.";
+    const body = await readJsonLimited(response, 8000);
+    if (!body || typeof body !== "object") throw new Error("unread");
+    if (note) note.textContent = String(body.note || "Could not stop the model.").slice(0, 300);
   } catch (error) {
     if (note) note.textContent = "Could not stop the model.";
   }
@@ -658,48 +774,84 @@ document.getElementById("check-helpers").onclick = async () => {
   if (note) note.textContent = "Checking the joined computers. Training stays on this PC.";
   try {
     const response = await fetch("/api/helpers/check", { method: "POST" });
-    const body = await response.json();
-    const rows = body.checked || [];
+    const body = await readJsonLimited(response, 64000);
+    if (!body || typeof body !== "object") throw new Error("unread");
+    const rows = Array.isArray(body.checked) ? body.checked.slice(0, 12) : [];
     if (!rows.length) {
       if (note) note.textContent = "No other computer is running the worker yet. It appears after the command starts.";
       return;
     }
-    if (note) note.textContent = rows.map((item) => (item.host || item.url) + ": " + (item.ok ? item.passed + " of " + item.rounds : (item.error || "failed"))).join(" · ");
+    if (note) note.textContent = rows.map((item) => (item.host || item.url) + ": " + (item.ok ? item.passed + " of " + item.rounds : (item.error || "failed"))).join(" · ").slice(0, 500);
   } catch (error) {
     if (note) note.textContent = "The joined computers did not answer.";
   }
 };
 document.getElementById("share-run").onclick = async () => {
-  const response = await fetch("/api/share/offer", { method: "POST" });
-  const body = await response.json();
-  const peers = body.peers || [];
+  let body = {};
+  try {
+    const response = await fetch("/api/share/offer", { method: "POST" });
+    body = await readJsonLimited(response, 64000);
+    if (!body || typeof body !== "object") throw new Error("unread");
+  } catch (error) {
+    document.getElementById("share-note").textContent = "This PC's page server did not answer.";
+    return;
+  }
+  const peers = Array.isArray(body.peers) ? body.peers.slice(0, 12) : [];
   const ready = peers.filter((item) => item.ok).map((item) => item.name);
   const blocked = peers.filter((item) => !item.ok);
   let note = body.note || "";
   if (!peers.length) note = "No other computer is connected. " + note;
   else if (ready.length) note = ready.join(", ") + " is listening. " + note;
   else note = blocked.map((item) => item.name + ": " + plainDetail(item.detail)).join(" ") + " " + note;
-  document.getElementById("share-note").textContent = note;
+  document.getElementById("share-note").textContent = String(note).slice(0, 500);
   refresh();
 };
 document.getElementById("add-model").onsubmit = async (event) => {
   event.preventDefault();
   const path = new FormData(event.target).get("path");
   const response = await fetch("/api/models", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ path }) });
-  const body = await response.json();
-  document.getElementById("model-note").textContent = body.error || "Added.";
-  if (response.ok) event.target.reset();
+  const body = await readJsonLimited(response, 8000);
+  document.getElementById("model-note").textContent = body && typeof body === "object" ? String(body.error || "Added.").slice(0, 300) : "The reply could not be read.";
+  if (response.ok && body && !body.error) event.target.reset();
   refresh();
 };
 document.getElementById("start-train").onclick = async () => {
   const response = await fetch("/api/training/start", { method: "POST" });
-  const body = await response.json();
-  document.getElementById("train-note").textContent = body.error || "Started.";
+  const body = await readJsonLimited(response, 8000);
+  document.getElementById("train-note").textContent = body && typeof body === "object" ? String(body.error || "Started.").slice(0, 300) : "The reply could not be read.";
 };
+async function readJsonLimited(response, max) {
+  const raw = await readTextLimited(response, max);
+  if (!raw || raw.length > max) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    return null;
+  }
+}
+async function readTextLimited(response, max) {
+  const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+  if (!reader) return "";
+  const decoder = new TextDecoder();
+  let text = "";
+  let total = 0;
+  while (true) {
+    const step = await reader.read();
+    if (step.done) break;
+    if (!step.value) continue;
+    total += step.value.byteLength;
+    if (total > max) {
+      try { await reader.cancel(); } catch (error) {}
+      break;
+    }
+    text += decoder.decode(step.value, { stream: true });
+  }
+  return text + decoder.decode();
+}
 document.getElementById("say").onsubmit = async (event) => {
   event.preventDefault();
   const box = document.getElementById("message");
-  const message = box.value.trim();
+  const message = box.value.trim().slice(0, 4000);
   if (!message) return;
   box.value = "";
   document.getElementById("send").disabled = true;
@@ -710,11 +862,13 @@ document.getElementById("say").onsubmit = async (event) => {
   log.append(mine);
   try {
     const response = await fetch("/api/chat", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ message }) });
-    const body = await response.json();
+    const raw = await readTextLimited(response, 20000);
+    let body = {};
+    try { body = JSON.parse(raw); } catch (error) { body = {}; }
     if (!response.ok) throw new Error(body.error || "No reply");
     const reply = document.createElement("div");
     reply.className = "bubble";
-    reply.textContent = body.reply || "No text.";
+    reply.textContent = String(body.reply || "No text.").slice(0, 12000);
     log.append(reply);
   } catch (error) {
     const reply = document.createElement("div");
@@ -724,15 +878,36 @@ document.getElementById("say").onsubmit = async (event) => {
   }
   document.getElementById("send").disabled = false;
 };
+let loading = false;
 async function refresh() {
+  // One request at a time: a slow status read must not pile up requests.
+  if (loading) return;
+  loading = true;
   try {
-    const response = await fetch("/api/mesh");
-    if (!response.ok) return;
-    mesh = await response.json();
-    try { crew = await (await fetch("/api/agents")).json(); } catch (error) { crew = { workers: [] }; }
+    const response = await fetch("/api/mesh", { cache: "no-store" });
+    if (!response.ok) {
+      text("page-state", "The last status read failed. Showing the one before.");
+      return;
+    }
+    const next = await readJsonLimited(response, 400000);
+    if (!next || typeof next !== "object" || !Array.isArray(next.nodes)) {
+      text("page-state", "The status reply was not readable.");
+      return;
+    }
+    mesh = next;
+    try {
+      const agents = await fetch("/api/agents", { cache: "no-store" });
+      const body = await readJsonLimited(agents, 200000);
+      crew = body && Array.isArray(body.workers) ? body : { workers: [] };
+    } catch (error) {
+      crew = { workers: [] };
+    }
+    text("page-state", "");
     paint();
   } catch (error) {
-    return;
+    text("page-state", "This PC's page server did not answer.");
+  } finally {
+    loading = false;
   }
 }
 refresh();

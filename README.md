@@ -84,11 +84,53 @@ netsh advfirewall firewall add rule name="Neuro worker" dir=in action=allow prot
 
 Do not open 8781, or the llama.cpp RPC port 50052, to the public internet. RPC has no login.
 
+The dashboard and the worker answer only loopback and private home-LAN addresses. Requests from a VPN adapter (26.x), the VirtualBox host-only net (192.168.56.x) or link-local addresses get 403. The LAN sweep never scans those ranges. A POST from another web site open in a browser is refused, so a page elsewhere cannot press Stop.
+
 ## What a joined computer does
 
 It reports its memory and checks the agent code on its own processor. The weight update stays on the NVIDIA PC. If `ggml-rpc-server` is installed on the Mac, the script listens on the Mac's LAN address at port 50052 and offers that RAM. The model already loaded on the Windows GPU does not move. The Mac joins the next time that server starts. One training run is not split across the computers. The page does not run shell commands on the Mac.
 
 `bash platforms/build-mac-rpc.sh` builds that listener from llama.cpp commit `c0ab6e5c0`, the same commit as the Windows build in this project. The two builds have to match.
+
+## Side work for training: the data factory
+
+One training run stays on the NVIDIA PC. A 7B model cannot be trained across the Mac and the laptops over Wi-Fi, and CUDA and Metal cannot share one run. The other computers instead make and check training data. The main PC keeps a small job queue in `jobs/` (gitignored, never inside the training data folder). Each worker pulls one job at a time when it is idle, runs it with a built-in handler, and sends the result back. A job is data for one of these handlers, never a command:
+
+| Kind | What it does | Runs on |
+| --- | --- | --- |
+| `generate` | Asks the worker's own local model at `http://127.0.0.1:8080/v1` (or the port in `NEURO_LOCAL_LLM`). Thinking off, at most 2048 tokens. Never sent to another host. | A computer with a local llama-server |
+| `verify_luau` | Runs the code with `luau` (on PATH or `NEURO_LUAU`), 10 s limit, 1 MB output limit. | A computer with luau |
+| `verify_python_syntax` | `compile()` only. The code is never run. | Every worker |
+| `verify_math` | Compares the final or `\boxed{}` answer with the expected one. | Every worker |
+| `dedup_hash` | Normalized sha256 plus a 32-value MinHash for each text. | Every worker |
+
+On the main PC:
+
+```powershell
+python mesh.py jobs add generate-verify prompts.jsonl
+python mesh.py jobs status
+python mesh.py jobs export verified.jsonl
+```
+
+A `prompts.jsonl` row looks like `{"prompt": "What is 6*7?", "verify": {"kind": "verify_math", "expected": "42"}, "max_tokens": 512}`. When a generated reply comes back, the matching verify job is queued by itself. `export` writes only replies that passed into `jobs/verified.jsonl`, as chat rows for the next training run. Other kinds: `python mesh.py jobs add verify_math rows.jsonl` with rows like `{"answer": "...", "expected": "42"}`, `dedup_hash` with `{"texts": ["...", "..."]}`.
+
+The **Jobs** page shows queued, leased, done and failed counts per kind and per computer, and the Machines page shows which kinds each computer can run.
+
+### Each worker, once
+
+1. `git pull`, then stop and start `mesh.py work` again (Mac: `bash platforms/start-mac.sh`).
+2. Copy `cluster.token` from the main PC into the worker's folder by hand (USB stick or a private copy). The job endpoints need the main PC's token; the page never sends it. Without it the worker says "Jobs paused" and keeps working as before.
+3. If the main PC is not `192.168.7.14`, set `NEURO_MESH_URL=http://<main PC>:8780` before starting the worker. `NEURO_JOBS=0` turns jobs off.
+
+A worker takes no job while its CPU is above 75 %, it has under 1 GB free memory, or the GPU lock is held.
+
+### A local model so `generate` lights up
+
+- **RTX 3050 laptop (LAPTOP-M906OEFU):** llama.cpp `llama-server` with a small GGUF, e.g. a Qwen3.5 2B or 4B Q4: `llama-server -m model.gguf --host 127.0.0.1 --port 8080 -ngl 99 -c 8192`.
+- **Mac mini:** the same llama.cpp built with Metal (`cmake -B build && cmake --build build -j`), `./build/bin/llama-server -m model.gguf --host 127.0.0.1 --port 8080 -ngl 99`.
+- **Old laptop (OhProggraming):** no model. It runs `verify_*` and `dedup_hash` only.
+
+Keep the model server on `127.0.0.1`. The worker checks `/v1/models` once a minute and only then offers `generate`.
 
 ## The page
 

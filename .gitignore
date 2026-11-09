@@ -8,5 +8,7 @@ agents.db-shm
 agents.stop
 agent-logs/
 models.json
+jobs/
+*.json.tmp
 __pycache__/
 *.pyc

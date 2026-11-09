@@ -9,19 +9,26 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -29,6 +36,30 @@ _agent_home = Path(__file__).resolve().parent.parent / "neuro-agents"
 if (_agent_home / "agents.py").is_file():
     sys.path.insert(0, str(_agent_home))
 from urllib.parse import parse_qs, urlparse
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.URLError("redirect")
+
+
+_NO_REDIRECT = urllib.request.build_opener(_NoRedirect)
+
+
+def file_state(path: Path) -> str:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "busy"
+    if stat.S_ISREG(info.st_mode) and info.st_size > 0:
+        return "file"
+    return "missing"
+
+
+def open_limited(request, timeout: float):
+    return _NO_REDIRECT.open(request, timeout=timeout)
+
 
 ROOT = Path(__file__).resolve().parent
 TOKEN_PATH = ROOT / "cluster.token"
@@ -39,6 +70,83 @@ DASHBOARD = ROOT / "dashboard.html"
 RPC_PORT = 50052
 DASHBOARD_PORT = 8780
 WORKER_PORT = 8781
+GPU_LOCK = Path(r"D:\liliai\train_local\gpu.lock")
+MAX_REPLY = 2 * 1024 * 1024
+
+# Never scanned and never allowed to talk to the dashboard or the worker:
+# link-local, the VirtualBox host-only net, and the 26.x VPN range.
+_BLOCKED_NETS = tuple(
+    ipaddress.ip_network(net) for net in ("169.254.0.0/16", "192.168.56.0/24", "26.0.0.0/8")
+)
+_PRIVATE_NETS = tuple(
+    ipaddress.ip_network(net) for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+
+
+def private_lan(ip: str) -> bool:
+    """True for a home-LAN IPv4 address that may be scanned or bound."""
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return False
+    if addr.version != 4:
+        return False
+    if any(addr in net for net in _BLOCKED_NETS):
+        return False
+    return any(addr in net for net in _PRIVATE_NETS)
+
+
+def lan_client(ip: str) -> bool:
+    """True when a request may be answered: loopback or the private LAN."""
+    raw = str(ip or "").split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    if addr.is_loopback:
+        return True
+    return private_lan(str(addr))
+
+
+def browser_host_ok(host_header: str) -> bool:
+    """Reject DNS-rebinding names: allow IP literals, localhost and LAN-style names."""
+    host = str(host_header or "").strip().lower()
+    if not host:
+        return True
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host == "localhost" or "." not in host:
+        return True
+    return host.endswith((".local", ".lan", ".home", ".internal", ".home.arpa", ".localhost"))
+
+
+def origin_ok(origin: str | None, host_header: str | None) -> bool:
+    """A browser POST must come from this page itself, not from another site."""
+    if origin is None:
+        return True
+    value = origin.strip()
+    if not value or value == "null":
+        return False
+    parsed = urlparse(value)
+    netloc = (parsed.netloc or "").lower()
+    return bool(netloc) and netloc == str(host_header or "").strip().lower()
+
+
+def machine_key(status: dict) -> tuple[str, str]:
+    """One key per real computer. A Mac on two addresses, or a name that
+    flips between NAME and NAME.local, is still one computer."""
+    name = str(status.get("name") or "").strip().lower()
+    name = name.split(".", 1)[0]
+    return (name, str(status.get("os") or "").strip().lower())
 
 
 def token() -> str:
@@ -62,7 +170,6 @@ def token_id() -> str:
 _found_lock = threading.Lock()
 _found: list[dict] = []
 _heavy_cache = {"at": 0.0, "rows": []}
-_node_cache = {"at": 0.0, "rows": []}
 
 
 def authorized(header: str | None) -> bool:
@@ -213,17 +320,30 @@ def nvidia() -> list[dict]:
         )
     except (OSError, subprocess.SubprocessError):
         return []
+    return parse_nvidia(out)
+
+
+def _number(text: str) -> int | None:
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_nvidia(out: str) -> list[dict]:
+    # A laptop GPU in low power can print "[N/A]" for a field. That must not
+    # take the whole status reply down, or the machine vanishes from the page.
     cards = []
     for line in out.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 4:
+        if len(parts) < 4 or not parts[0]:
             continue
         cards.append(
             {
                 "name": parts[0],
-                "memory_used_mib": int(float(parts[1])),
-                "memory_total_mib": int(float(parts[2])),
-                "temperature_c": int(float(parts[3])),
+                "memory_used_mib": _number(parts[1]) or 0,
+                "memory_total_mib": _number(parts[2]) or 0,
+                "temperature_c": _number(parts[3]),
             }
         )
     return cards
@@ -242,13 +362,43 @@ PROTECTED = {
     "lsass.exe",
     "winlogon.exe",
     "fontdrvhost.exe",
+    "svchost.exe",
+    "dwm.exe",
+    "explorer.exe",
+    "sihost.exe",
+    "taskhostw.exe",
+    "spoolsv.exe",
+    "lsaiso.exe",
+    "msmpeng.exe",
+    "audiodg.exe",
+    # Console hosts: stopping one also ends the training run or this page
+    # that was started inside it.
+    "conhost.exe",
+    "openconsole.exe",
+    "windowsterminal.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
     "kernel_task",
     "launchd",
     "windowserver",
+    "loginwindow",
+    "finder",
+    "dock",
+    "systemuiserver",
+    "terminal",
+    "iterm2",
+    "systemd",
+    "xorg",
+    "gnome-shell",
+    "gnome-terminal-server",
+    "sshd",
 }
 
 
 def process_running(image: str) -> bool:
+    if os.name == "nt" and not image.lower().endswith(".exe"):
+        return False
     try:
         if os.name == "nt":
             out = subprocess.check_output(
@@ -274,8 +424,12 @@ def port_open(port: int) -> bool:
 
 def rpc_binary() -> str | None:
     override = os.environ.get("NEURO_RPC_BIN", "").strip()
-    if override and Path(override).exists():
-        return override
+    if override:
+        state = file_state(Path(override))
+        if state == "busy":
+            return None
+        if state == "file":
+            return override
     names = ["ggml-rpc-server.exe", "ggml-rpc-server"]
     candidates = [
         Path(r"D:\liliai\tools\llama-cpp-cuda\ggml-rpc-server.exe"),
@@ -283,7 +437,10 @@ def rpc_binary() -> str | None:
         ROOT / "ggml-rpc-server",
     ]
     for candidate in candidates:
-        if candidate.exists():
+        state = file_state(candidate)
+        if state == "busy":
+            return None
+        if state == "file":
             return str(candidate)
     for name in names:
         found = shutil.which(name)
@@ -297,61 +454,31 @@ def heavy_processes() -> list[dict]:
     if now - _heavy_cache["at"] < 4:
         return list(_heavy_cache["rows"])
     rows: list[dict] = []
+    kept = keep_pids()
+    # While the GPU lock is held (or cannot be read) the training run is a
+    # Python process whose PID may not be readable, so no Python process on
+    # this computer gets a Stop button.
+    guard_python = lock_held(GPU_LOCK)
     try:
         if os.name == "nt":
-            out = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, timeout=8, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, timeout=8, stderr=subprocess.DEVNULL, errors="replace")
             for line in out.splitlines():
                 parts = [part.strip().strip('"') for part in line.split('","')]
                 if len(parts) < 5:
                     continue
-                name = parts[0].strip('"')
                 pid_text = parts[1].strip()
-                mem = parts[-1].replace(",", "").replace(" K", "").replace(" ", "")
+                mem = re.sub(r"[^0-9]", "", parts[-1])
                 if not pid_text.isdigit() or not mem.isdigit():
                     continue
-                mb = int(mem) // 1024
-                if mb < 12:
-                    continue
-                lowered = name.lower()
-                role = "other"
-                if lowered.startswith("llama-server"):
-                    role = "model"
-                elif "rpc-server" in lowered:
-                    role = "share"
-                elif pid_text.isdigit() and int(pid_text) in keep_pids():
-                    role = "page" if int(pid_text) == os.getpid() else "training"
-                elif lowered.startswith("python"):
-                    role = "python"
-                rows.append(
-                    {
-                        "name": name,
-                        "pid": int(pid_text),
-                        "mb": mb,
-                        "role": role,
-                        "stoppable": lowered not in PROTECTED and role not in {"training", "page"},
-                    }
-                )
+                rows_add(rows, parts[0].strip('"'), int(pid_text), int(mem) // 1024, kept, guard_python)
         else:
-            out = subprocess.check_output(["ps", "-axo", "pid=,rss=,comm="], text=True, timeout=4)
+            out = subprocess.check_output(["ps", "-axo", "pid=,rss=,comm="], text=True, timeout=4, errors="replace")
             for line in out.splitlines():
                 bits = line.strip().split(None, 2)
                 if len(bits) < 3 or not bits[0].isdigit() or not bits[1].isdigit():
                     continue
-                mb = int(bits[1]) // 1024
-                if mb < 12:
-                    continue
                 name = bits[2].replace("\\", "/").split("/")[-1][:40]
-                lowered = name.lower()
-                role = "model" if lowered.startswith("llama-server") else "share" if "rpc-server" in lowered else "page" if int(bits[0]) == os.getpid() else "training" if int(bits[0]) in keep_pids() else "other"
-                rows.append(
-                    {
-                        "name": name,
-                        "pid": int(bits[0]),
-                        "mb": mb,
-                        "role": role,
-                        "stoppable": lowered not in PROTECTED and role not in {"training", "page"},
-                    }
-                )
+                rows_add(rows, name, int(bits[0]), int(bits[1]) // 1024, kept, guard_python)
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
     rows.sort(key=lambda item: item["mb"], reverse=True)
@@ -361,15 +488,46 @@ def heavy_processes() -> list[dict]:
     return list(kept)
 
 
+def process_role(name: str, pid: int, kept: set[int], guard_python: bool) -> tuple[str, bool]:
+    """Return (role, stoppable) for one process row. Pure, so it can be tested."""
+    lowered = name.lower()
+    if pid == os.getpid():
+        return "page", False
+    if pid in kept:
+        return "training", False
+    if lowered.startswith("llama-server"):
+        return "model", True
+    if "rpc-server" in lowered:
+        return "share", True
+    if lowered.startswith("python"):
+        return "python", not guard_python and lowered not in PROTECTED
+    return "other", lowered not in PROTECTED
+
+
+def rows_add(rows: list[dict], name: str, pid: int, mb: int, kept: set[int], guard_python: bool) -> None:
+    if mb < 12 or pid <= 0 or not name:
+        return
+    role, stoppable = process_role(name, pid, kept, guard_python)
+    rows.append({"name": name, "pid": pid, "mb": mb, "role": role, "stoppable": stoppable})
+
+
 def keep_pids() -> set[int]:
     pids = {os.getpid()}
-    lock = Path(r"D:\liliai\train_local\gpu.lock")
     try:
-        text = lock.read_text(encoding="utf-8", errors="replace").strip()
+        text = GPU_LOCK.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         text = ""
     if text.isdigit():
         pids.add(int(text))
+    else:
+        # The lock may hold JSON such as {"pid": 1234}.
+        try:
+            data = json.loads(text) if text.startswith("{") else {}
+        except ValueError:
+            data = {}
+        pid = data.get("pid") if isinstance(data, dict) else None
+        if isinstance(pid, int) and pid > 0:
+            pids.add(pid)
     return pids
 
 
@@ -387,48 +545,109 @@ def dataset_index() -> list[dict]:
     root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data")) / "training"
     if lock_held(root.parent.parent / "train_local" / "gpu.lock"):
         return [{"name": "held while training runs", "mb": 0}]
-    rows = []
+    rows: list[dict] = []
     try:
-        paths = root.rglob("*.jsonl")
+        for path in root.rglob("*.jsonl"):
+            try:
+                size = path.stat().st_size
+                name = path.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            rows.append({"name": name, "mb": round(size / (1024 * 1024), 1)})
+            if len(rows) >= 16:
+                break
     except OSError:
+        # A folder that cannot be read ends the walk; what was listed stays.
         return rows
-    for path in paths:
-        try:
-            size = path.stat().st_size
-        except OSError:
-            continue
-        rows.append({"name": path.relative_to(root).as_posix(), "mb": round(size / (1024 * 1024), 1)})
-        if len(rows) >= 16:
-            break
     return rows
 
 
 _training_cache: dict = {"at": 0.0, "view": None}
 
 
-def live_training(data_root: Path) -> dict:
-    lock = data_root.parent / "train_local" / "gpu.lock"
-    running = lock_held(lock)
+def newest_log(log_dir: Path, pattern: str = "neuro-ai-long-v1-") -> tuple[Path | None, float, bool]:
+    """Return (newest log, its mtime, readable). readable is False when the
+    folder exists but cannot be listed, so the caller can say "unknown"
+    instead of "stopped"."""
+    newest: Path | None = None
+    newest_at = 0.0
+    try:
+        with os.scandir(log_dir) as entries:
+            for entry in entries:
+                if not (entry.name.startswith(pattern) and entry.name.endswith(".log")):
+                    continue
+                try:
+                    at = entry.stat().st_mtime
+                except OSError:
+                    continue
+                if newest is None or at > newest_at:
+                    newest, newest_at = Path(entry.path), at
+    except FileNotFoundError:
+        return None, 0.0, True
+    except OSError:
+        return None, 0.0, False
+    return newest, newest_at, True
+
+
+def parse_log_tail(tail: str) -> dict:
     step = None
     max_steps = None
     loss = None
-    log_dir = data_root / "training" / "logs"
-    newest = None
-    try:
-        if log_dir.is_dir():
-            logs = list(log_dir.glob("neuro-ai-long-v1-*.log"))
-            if logs:
-                newest = max(logs, key=lambda path: path.stat().st_mtime)
-    except OSError:
-        newest = None
-    fresh = False
-    if newest is not None:
+    marks = [(int(a), int(b)) for a, b in re.findall(r"(\d+)/(\d+)", tail) if int(b) > 0]
+    if marks:
+        # An eval progress bar ("12/120") shares the log with the train bar.
+        # The train bar has the largest total, so only that one is used.
+        total = max(b for _, b in marks)
+        train = [a for a, b in marks if b == total and a <= b]
+        if train:
+            step = train[-1]
+            max_steps = total
+    losses = re.findall(r"'loss': '?([0-9]+(?:\.[0-9]+)?(?:[eE]-?[0-9]+)?)'?", tail)
+    if losses:
         try:
-            fresh = time.time() - newest.stat().st_mtime < 180
-        except OSError:
-            fresh = False
-    if fresh:
+            loss = round(float(losses[-1]), 4)
+        except ValueError:
+            loss = None
+    return {"step": step, "max_steps": max_steps, "loss": loss}
+
+
+TRAINER_PATTERN = re.compile(r"ml[\\/]+training[\\/]+train(?:_next)?\.py", re.I)
+
+
+def trainer_alive() -> bool | None:
+    """True if a train.py / train_next.py process exists on this machine, False if none,
+    None if the process list could not be read."""
+    try:
+        if os.name == "nt":
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
+                 "ForEach-Object { $_.CommandLine }"],
+                text=True, timeout=10, errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            out = subprocess.check_output(["ps", "-axo", "command="], text=True, timeout=5, errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return bool(TRAINER_PATTERN.search(out))
+
+
+def live_training(data_root: Path) -> dict:
+    lock = data_root.parent / "train_local" / "gpu.lock"
+    running: bool | None = lock_held(lock)
+    stale_lock = False
+    step = None
+    max_steps = None
+    loss = None
+    newest, newest_at, readable = newest_log(data_root / "training" / "logs")
+    if not readable and not running:
+        # The log folder could not be read and the lock says free. That is
+        # not proof the run stopped, so the page shows "unknown".
+        running = None
+    fresh = newest is not None and time.time() - newest_at < 180
+    if fresh and newest is not None:
         running = True
+        tail = ""
         try:
             size = newest.stat().st_size
             start = max(0, size - 24000)
@@ -443,17 +662,16 @@ def live_training(data_root: Path) -> dict:
                 tail = raw.decode("utf-8", errors="replace")
         except OSError:
             tail = ""
-        marks = re.findall(r"(\d+)/(\d+)", tail)
-        if marks:
-            step = int(marks[-1][0])
-            max_steps = int(marks[-1][1])
-        losses = re.findall(r"'loss': '([0-9.]+)'", tail)
-        if losses:
-            try:
-                loss = round(float(losses[-1]), 4)
-            except ValueError:
-                loss = None
-    return {"running": running, "step": step, "max_steps": max_steps, "loss": loss}
+        parsed = parse_log_tail(tail)
+        step, max_steps, loss = parsed["step"], parsed["max_steps"], parsed["loss"]
+    elif running and trainer_alive() is False:
+        # The lock is held but no trainer process exists: the run stopped or crashed and
+        # left its lock behind. The card stays reserved (lock_held stays True everywhere
+        # else), but the page must not claim training is going.
+        running = False
+        stale_lock = True
+    return {"running": running, "step": step, "max_steps": max_steps, "loss": loss, "log_readable": readable,
+            "stale_lock": stale_lock}
 
 
 def training_view() -> dict:
@@ -465,12 +683,16 @@ def training_view() -> dict:
     versions_path = data_root / "versions.json"
     active = ""
     served = "Neuro"
-    if versions_path.is_file():
+    if file_state(versions_path) == "busy":
+        active = "The version list could not be read."
+    elif file_state(versions_path) == "file":
         try:
+            if versions_path.stat().st_size > 1_000_000:
+                raise OSError
             versions = json.loads(versions_path.read_text(encoding="utf-8"))
-            active = str(versions.get("activePeft") or "")
-        except (OSError, json.JSONDecodeError):
-            active = ""
+            active = str(versions.get("activePeft") or "")[:80] if isinstance(versions, dict) else ""
+        except (OSError, ValueError):
+            active = "The version list could not be read."
     state_path = data_root / "training" / "runs" / "neuro-ai-long-v1" / "checkpoint-6933" / "trainer_state.json"
     step = 0
     max_steps = 0
@@ -479,6 +701,8 @@ def training_view() -> dict:
     if state_path.is_file():
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError("trainer_state.json is not an object")
             step = int(state.get("global_step") or 0)
             max_steps = int(state.get("max_steps") or 0)
             for row in reversed(state.get("log_history") or []):
@@ -498,12 +722,23 @@ def training_view() -> dict:
         max_steps = live["max_steps"]
     if live["loss"] is not None:
         loss = live["loss"]
-    if live["running"]:
+    if live.get("stale_lock"):
+        reason = ("No training process is running on this PC, but the GPU lock file is still there. "
+                  "The run stopped or crashed. The card stays reserved until the lock is checked and "
+                  "removed by hand from an administrator window. Nothing was restarted.")
+    elif live["running"] is None:
+        reason = "The training log folder cannot be read by this page, so it cannot tell whether the run is going. Nothing was stopped. Training stays on this NVIDIA PC."
+    elif live["running"]:
         reason = "Resumed on this NVIDIA PC from the saved checkpoint. The run continues on this computer. One training run is not split across computers. The dataset files are unchanged."
     else:
         reason = "Training stays on this NVIDIA PC. A joined computer can hold part of the served model only after chat is stopped and that computer is listening on its own LAN address. One training run is not split across the machines. The dataset files are unchanged."
     view = {
-        "running": bool(live["running"]),
+        # True, False, or None when the log folder cannot be read.
+        "running": live["running"] if live["running"] is None else bool(live["running"]),
+        "state": "stopped_lock_held" if live.get("stale_lock") else
+                 "unknown" if live["running"] is None else "running" if live["running"] else "stopped",
+        "stale_lock": bool(live.get("stale_lock")),
+        "log_readable": bool(live.get("log_readable", True)),
         "run": "neuro-ai-long-v1",
         "step": step,
         "max_steps": max_steps,
@@ -519,52 +754,189 @@ def training_view() -> dict:
     return view
 
 
+def luau_binary() -> str | None:
+    override = os.environ.get("NEURO_LUAU_BIN", "").strip()
+    if override:
+        state = file_state(Path(override))
+        if state == "busy":
+            return None
+        if state == "file":
+            return override
+    for candidate in (
+        Path(r"D:\liliai\tools\luau\luau.exe"),
+        ROOT / "tools" / "luau.exe",
+        ROOT / "tools" / "luau",
+        ROOT / "luau.exe",
+        ROOT / "luau",
+    ):
+        state = file_state(candidate)
+        if state == "busy":
+            return None
+        if state == "file":
+            return str(candidate)
+    return shutil.which("luau")
+
+
+_cpu_sample: dict = {"at": 0.0, "idle": 0, "total": 0, "pct": None}
+
+
+def cpu_busy_pct() -> int | None:
+    """Whole-machine CPU use in percent, or None when it is not known yet."""
+    if os.name == "nt":
+        idle, kernel, user = ctypes.c_ulonglong(), ctypes.c_ulonglong(), ctypes.c_ulonglong()
+        try:
+            ok = ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user))
+        except (AttributeError, OSError):
+            return None
+        if not ok:
+            return None
+        now = time.time()
+        if now - float(_cpu_sample["at"]) < 1.0:
+            return _cpu_sample["pct"]
+        # Kernel time includes idle time on Windows.
+        total = kernel.value + user.value
+        now_idle = idle.value
+        last_total, last_idle = int(_cpu_sample["total"]), int(_cpu_sample["idle"])
+        _cpu_sample.update({"at": now, "total": total, "idle": now_idle})
+        span = total - last_total
+        if last_total and span > 0:
+            _cpu_sample["pct"] = max(0, min(100, round(100 * (1 - (now_idle - last_idle) / span))))
+        return _cpu_sample["pct"]
+    try:
+        load = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return None
+    cores = os.cpu_count() or 1
+    return max(0, min(100, round(100 * load / cores)))
+
+
+def capabilities(cards: list[dict], ram: dict, chat: bool, rpc_ready: bool) -> dict:
+    """What this computer can do for side work. Small and read-only."""
+    busy = cpu_busy_pct()
+    free_mib = int(ram.get("free_mib") or 0)
+    gpu_busy = lock_held(GPU_LOCK) if os.name == "nt" else False
+    cuda = [card for card in cards if not card.get("unified")]
+    metal = sys.platform == "darwin" and platform.machine() == "arm64"
+    vram_total = max((int(card.get("memory_total_mib") or 0) for card in cuda), default=0)
+    vram_free = max(
+        (max(0, int(card.get("memory_total_mib") or 0) - int(card.get("memory_used_mib") or 0)) for card in cuda),
+        default=0,
+    )
+    return {
+        "version": 1,
+        "cpu_cores": os.cpu_count() or 0,
+        "cpu_busy_pct": busy,
+        "free_ram_mib": free_mib,
+        "accelerator": "cuda" if cuda else "metal" if metal else "cpu",
+        "vram_total_mib": vram_total,
+        "vram_free_mib": vram_free,
+        "rpc_server": rpc_ready,
+        "luau": bool(luau_binary()),
+        "python": platform.python_version(),
+        "gpu_lock": gpu_busy,
+        "idle": bool(not chat and not gpu_busy and (busy is None or busy < 35) and free_mib >= 2048),
+        # Data-factory job kinds this worker really runs. Empty unless the
+        # job thread of `mesh.py work` is on.
+        "job_kinds": worker_kinds() if _job_state.get("on") else [],
+        "jobs": {
+            "on": bool(_job_state.get("on")),
+            "done": int(_job_state.get("done") or 0),
+            "failed": int(_job_state.get("failed") or 0),
+            "paused": str(_job_state.get("paused") or ""),
+            "current": str(_job_state.get("current") or ""),
+        },
+    }
+
+
 def local_status() -> dict:
     cards = machine_cards()
     binary = rpc_binary()
     chat = process_running("llama-server.exe") or process_running("llama-server")
+    ram = ram_mib()
     return {
         "name": socket.gethostname(),
         "os": platform.system().lower(),
         "machine": platform.machine(),
-        "ram": ram_mib(),
+        "ram": ram,
         "gpus": cards,
         "heavy": heavy_processes(),
         "chat_server": chat,
         "rpc_binary": binary,
         "rpc_listening": port_open(RPC_PORT),
         "temperature_c": cards[0]["temperature_c"] if cards else None,
+        "caps": capabilities(cards, ram, chat, bool(binary)),
     }
 
 
-def read_nodes() -> list[dict]:
-    if not NODES_PATH.exists():
-        return []
+# The discovery thread and the page's request threads both read and rewrite
+# nodes.json and specs.json. One lock plus an atomic replace keeps a reader
+# from seeing a half-written file, reading it as empty, and then writing the
+# empty list back over every saved computer.
+_files_lock = threading.RLock()
+
+
+def read_json_list(path: Path, strict: bool = False) -> list[dict]:
+    """Read a saved list. With strict=True an unreadable or damaged file
+    raises RuntimeError, so a read-modify-write never replaces it with []."""
+    with _files_lock:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise RuntimeError(path.name + " cannot be read. Nothing was changed.") from exc
+            return []
     try:
-        data = json.loads(NODES_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        data = json.loads(raw)
+    except ValueError as exc:
+        if strict:
+            raise RuntimeError(path.name + " is damaged. Nothing was changed.") from exc
         return []
     if not isinstance(data, list):
+        if strict:
+            raise RuntimeError(path.name + " is not a list. Nothing was changed.")
         return []
-    return [item for item in data if isinstance(item, dict) and item.get("url")]
+    return [item for item in data if isinstance(item, dict)]
+
+
+def write_json_list(path: Path, rows: list[dict]) -> None:
+    raw = json.dumps(rows, ensure_ascii=False, indent=2)
+    with _files_lock:
+        temp = path.with_name(path.name + ".tmp")
+        temp.write_text(raw, encoding="utf-8")
+        for attempt in range(5):
+            try:
+                os.replace(temp, path)
+                return
+            except PermissionError:
+                # Windows refuses a replace while another program has the file open.
+                time.sleep(0.05 * (attempt + 1))
+        os.replace(temp, path)
+
+
+def read_nodes(strict: bool = False) -> list[dict]:
+    return [item for item in read_json_list(NODES_PATH, strict) if isinstance(item.get("url"), str) and item.get("url")]
 
 
 def write_nodes(nodes: list[dict]) -> None:
-    NODES_PATH.write_text(json.dumps(nodes, indent=2), encoding="utf-8")
+    write_json_list(NODES_PATH, nodes)
 
 
-def read_specs() -> list[dict]:
-    if not SPECS_PATH.exists():
-        return []
-    try:
-        data = json.loads(SPECS_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
-    return data if isinstance(data, list) else []
+def read_specs(strict: bool = False) -> list[dict]:
+    return read_json_list(SPECS_PATH, strict)
 
 
 def write_specs(specs: list[dict]) -> None:
-    SPECS_PATH.write_text(json.dumps(specs, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_list(SPECS_PATH, specs)
+
+
+def add_node(url: str) -> None:
+    with _files_lock:
+        nodes = read_nodes(strict=True)
+        if not any(node["url"] == url for node in nodes):
+            nodes.append({"url": url})
+            write_nodes(nodes)
 
 
 def clip(value: object, limit: int = 80) -> str:
@@ -593,16 +965,14 @@ def save_spec(raw: dict) -> dict:
         "vram_gb": clip(raw.get("vram_gb"), 16),
         "role": "agent-check",
     }
-    specs = [spec for spec in read_specs() if spec.get("name") != name]
-    if len(specs) >= 6:
-        raise ValueError("Six computers are already saved")
-    specs.append(item)
-    write_specs(specs)
-    if item["url"]:
-        nodes = read_nodes()
-        if not any(node["url"] == item["url"] for node in nodes):
-            nodes.append({"url": item["url"]})
-            write_nodes(nodes)
+    with _files_lock:
+        specs = [spec for spec in read_specs(strict=True) if spec.get("name") != name]
+        if len(specs) >= 6:
+            raise ValueError("Six computers are already saved")
+        specs.append(item)
+        write_specs(specs)
+        if item["url"]:
+            add_node(item["url"])
     return item
 
 
@@ -618,17 +988,24 @@ def fetch_worker(url: str) -> dict:
         url.rstrip("/") + "/status",
         headers={"Authorization": "Bearer " + token()},
     )
-    with urllib.request.urlopen(request, timeout=4) as response:
-        body = json.loads(response.read().decode("utf-8"))
+    with open_limited(request, 4) as response:
+        body = read_reply(response)
     if not isinstance(body, dict):
         raise ValueError("Bad worker response")
     return body
 
 
+def read_reply(response) -> object:
+    raw = response.read(MAX_REPLY + 1)
+    if len(raw) > MAX_REPLY:
+        raise ValueError("Worker reply is too large")
+    return json.loads(raw.decode("utf-8"))
+
+
 def fetch_public(url: str, path: str) -> dict:
     request = urllib.request.Request(url.rstrip("/") + path)
-    with urllib.request.urlopen(request, timeout=4) as response:
-        body = json.loads(response.read().decode("utf-8"))
+    with open_limited(request, 4) as response:
+        body = read_reply(response)
     if not isinstance(body, dict):
         raise ValueError("Bad worker response")
     return body
@@ -639,28 +1016,37 @@ def pull_legacy(url: str) -> dict:
         return {"url": url, "ok": True, "status": fetch_worker(url)}
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
+            # An old worker with its own token. It is running, but it says
+            # nothing about itself, so it is named by its address, not
+            # guessed as "Mac".
+            host = urlparse(url).hostname or url
             return {
                 "url": url,
                 "ok": True,
                 "limited": True,
-                "status": {"name": "Mac", "os": "", "ram": {}},
+                "status": {"name": "worker at " + host, "os": "", "ram": {}},
             }
         return {"url": url, "ok": False, "error": f"http {exc.code}"}
-    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
+    except (OSError, urllib.error.URLError, ValueError):
         return {"url": url, "ok": False, "error": "no reply"}
 
 
-def pull_worker(url: str) -> dict:
+def pull_worker(url: str, legacy: bool = True) -> dict:
+    """Ask one worker for /hello. legacy=False (used by the LAN sweep) never
+    falls back to /status, so this PC's token is only ever sent to a saved
+    address, not to any device that happens to answer on port 8781."""
     try:
         status = fetch_public(url, "/hello")
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
+        if exc.code == 404 and legacy:
             return pull_legacy(url)
         return {"url": url, "ok": False, "error": f"http {exc.code}"}
-    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
+    except (OSError, urllib.error.URLError, ValueError):
         return {"url": url, "ok": False, "error": "no reply"}
     if status.get("app") != "neuroai-mesh":
         return {"url": url, "ok": False, "error": "not a Neuro worker"}
+    status["name"] = clip(status.get("name"), 64)
+    status["os"] = clip(status.get("os"), 16).lower()
     return {"url": url, "ok": True, "status": status}
 
 
@@ -672,22 +1058,28 @@ def ipv4_prefixes() -> tuple[list[str], set[str]]:
             ip = socket.gethostbyname(socket.gethostname())
         except OSError:
             return [], set()
-        if ip.count(".") == 3 and not ip.startswith("127."):
+        if private_lan(ip):
             return [ip.rsplit(".", 1)[0]], {ip}
         return [], set()
-    out = subprocess.check_output(["ipconfig"], text=True, errors="replace")
+    try:
+        out = subprocess.check_output(["ipconfig"], text=True, errors="replace", timeout=10, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return [], set()
+    return parse_ipconfig(out)
+
+
+def parse_ipconfig(out: str) -> tuple[list[str], set[str]]:
+    prefixes: list[str] = []
+    own: set[str] = set()
     current = ""
     for line in out.splitlines():
         if "IPv4" in line and ":" in line:
-            current = line.split(":")[-1].strip()
-        elif current and "Subnet Mask" in line and ":" in line:
-            mask = line.split(":")[-1].strip()
-            if (
-                mask == "255.255.255.0"
-                and current.count(".") == 3
-                and not current.startswith("127.")
-            ):
+            current = re.sub(r"\(.*\)", "", line.split(":")[-1]).strip()
+            if current.count(".") == 3:
                 own.add(current)
+        elif current and ("Subnet Mask" in line or "Mask" in line) and ":" in line:
+            mask = line.split(":")[-1].strip()
+            if mask == "255.255.255.0" and private_lan(current):
                 prefix = current.rsplit(".", 1)[0]
                 if prefix not in prefixes:
                     prefixes.append(prefix)
@@ -696,6 +1088,8 @@ def ipv4_prefixes() -> tuple[list[str], set[str]]:
 
 
 def probe_host(ip: str) -> dict | None:
+    if not private_lan(ip):
+        return None
     sock = socket.socket()
     sock.settimeout(0.6)
     try:
@@ -704,7 +1098,7 @@ def probe_host(ip: str) -> dict | None:
         return None
     finally:
         sock.close()
-    return pull_worker(f"http://{ip}:{WORKER_PORT}")
+    return pull_worker(f"http://{ip}:{WORKER_PORT}", legacy=False)
 
 
 def remember_peer(item: dict) -> None:
@@ -714,10 +1108,10 @@ def remember_peer(item: dict) -> None:
     url = str(item.get("url") or "")
     if not url:
         return
-    nodes = read_nodes()
-    if not any(node["url"] == url for node in nodes):
-        nodes.append({"url": url})
-        write_nodes(nodes)
+    try:
+        add_node(url)
+    except (RuntimeError, OSError):
+        return
     system = str(status.get("os") or "").lower()
     bay = {"darwin": "mac", "linux": "linux", "windows": "windows"}.get(system)
     if not bay:
@@ -725,7 +1119,11 @@ def remember_peer(item: dict) -> None:
     name = clip(status.get("name") or "", 40)
     if not name:
         return
-    if any(spec.get("url") == url or spec.get("name") == name for spec in read_specs()):
+    short = name.lower().split(".", 1)[0]
+    if any(
+        spec.get("url") == url or str(spec.get("name") or "").lower().split(".", 1)[0] == short
+        for spec in read_specs()
+    ):
         return
     total = int((status.get("ram") or {}).get("total_mib") or 0)
     kind = {"windows": "laptop", "mac": "mini", "linux": "penguin"}[bay]
@@ -743,21 +1141,29 @@ def remember_peer(item: dict) -> None:
                 "gpu": "",
             }
         )
-    except ValueError:
+    except (ValueError, RuntimeError, OSError):
         return
+
+
+def sweep_hosts(prefixes: list[str], own: set[str]) -> list[str]:
+    """Every address to probe. Only private /24 nets; never 26.x, 169.254.x,
+    or the 192.168.56.x host-only net; never this computer's own address."""
+    hosts: list[str] = []
+    for prefix in prefixes:
+        for n in range(1, 255):
+            ip = f"{prefix}.{n}"
+            if ip not in own and private_lan(ip):
+                hosts.append(ip)
+    return hosts
 
 
 def scan_lan() -> list[dict]:
     prefixes, own = ipv4_prefixes()
     lan = lan_host()
-    if lan.count(".") == 3:
+    if lan:
+        own.add(lan)
         prefixes = [lan.rsplit(".", 1)[0]]
-    hosts = [
-        f"{prefix}.{n}"
-        for prefix in prefixes
-        for n in range(1, 255)
-        if f"{prefix}.{n}" not in own
-    ]
+    hosts = sweep_hosts(prefixes, own)
     if not hosts:
         return []
     with ThreadPoolExecutor(max_workers=16) as pool:
@@ -774,10 +1180,11 @@ def note_arrival(item: dict) -> None:
     url = str(item.get("url") or "")
     if not url:
         return
+    seen_key = "|".join(peer_identity(item))
     with _arrival_lock:
-        if url in _seen_peers:
+        if seen_key in _seen_peers:
             return
-        _seen_peers.add(url)
+        _seen_peers.add(seen_key)
     result = ask_check(url)
     status = item.get("status") or {}
     result["name"] = str(status.get("name") or url)
@@ -792,40 +1199,70 @@ _sweep_at = 0.0
 
 def peer_identity(item: dict) -> tuple[str, str]:
     status = item.get("status") or {}
-    if status.get("os") and not item.get("limited"):
-        return (str(status.get("name") or ""), str(status.get("os")))
+    if status.get("os") and status.get("name") and not item.get("limited"):
+        return machine_key(status)
     return ("url", str(item.get("url") or ""))
 
 
-def settle_peers(items: list[dict], prefer: set[str]) -> list[dict]:
+def local_key() -> tuple[str, str]:
+    return machine_key({"name": socket.gethostname(), "os": platform.system().lower()})
+
+
+def settle_peers(
+    items: list[dict],
+    prefer: set[str],
+    misses: dict[str, int] | None = None,
+    skip: tuple[str, str] | None = None,
+) -> list[dict]:
+    """One row per real computer. Among the addresses of one computer, the
+    one that answered most recently wins; on a tie the address already shown
+    stays, so the row does not jump between .247 and .248. A worker on this
+    same computer is skipped, because this PC is already the first row."""
+    misses = misses or {}
     ranked: dict[tuple[str, str], dict] = {}
     for item in items:
         key = peer_identity(item)
+        if skip is not None and key == skip:
+            continue
         current = ranked.get(key)
         if current is None:
             ranked[key] = item
             continue
         url = str(item.get("url") or "")
         current_url = str(current.get("url") or "")
-        if url in prefer and current_url not in prefer:
+        mine = (misses.get(url, 0), 0 if url in prefer else 1)
+        theirs = (misses.get(current_url, 0), 0 if current_url in prefer else 1)
+        if mine < theirs:
             ranked[key] = item
     return list(ranked.values())
+
+
+def count_misses(hold: dict[str, dict], answered: list[dict], now: float, limit: int = 3) -> None:
+    """Update the held rows in place. A row that did not answer gains a miss;
+    after more than `limit` misses in a row it is dropped. A row that
+    answered is reset to zero misses."""
+    answered_urls = {str(item.get("url") or "") for item in answered}
+    for url, held in list(hold.items()):
+        if url in answered_urls:
+            continue
+        held["misses"] = int(held.get("misses") or 0) + 1
+        if held["misses"] > limit:
+            hold.pop(url, None)
+    for item in answered:
+        url = str(item.get("url") or "")
+        if url:
+            hold[url] = {"item": item, "misses": 0, "at": now}
 
 
 def known_worker_urls() -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
-    for node in read_nodes():
-        url = str(node.get("url") or "")
+    with _found_lock:
+        extra = [str(item.get("url") or "") for item in _found]
+    for url in [str(node.get("url") or "") for node in read_nodes()] + extra + list(_hold.keys()):
         if url and url not in seen:
             seen.add(url)
             urls.append(url)
-    with _found_lock:
-        for item in _found:
-            url = str(item.get("url") or "")
-            if url and url not in seen:
-                seen.add(url)
-                urls.append(url)
     return urls
 
 
@@ -835,38 +1272,42 @@ def discovery_loop() -> None:
         try:
             with _found_lock:
                 previous = {str(item.get("url") or "") for item in _found}
+                previous_keys = {peer_identity(item) for item in _found}
+            saved = {str(node.get("url") or "") for node in read_nodes()}
+            urls = known_worker_urls()
             alive: list[dict] = []
-            for url in known_worker_urls():
-                item = pull_worker(url)
-                if item.get("ok"):
-                    alive.append(item)
+            if urls:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    pulled = list(pool.map(lambda url: pull_worker(url, legacy=url in saved), urls))
+                alive = [item for item in pulled if item.get("ok")]
             now = time.time()
             if now - _sweep_at >= 45:
                 _sweep_at = now
-                alive.extend(scan_lan())
-            fresh_urls = {str(item.get("url") or "") for item in alive}
-            for url, held in list(_hold.items()):
-                if url in fresh_urls:
-                    continue
-                held["misses"] = int(held.get("misses") or 0) + 1
-                if held["misses"] > 3:
-                    _hold.pop(url, None)
-            for item in alive:
-                url = str(item.get("url") or "")
-                if url:
-                    _hold[url] = {"item": item, "misses": 0}
-            found = settle_peers([held["item"] for held in _hold.values()], previous)
+                asked = {str(item.get("url") or "") for item in alive}
+                alive.extend(item for item in scan_lan() if str(item.get("url") or "") not in asked)
+            count_misses(_hold, alive, now)
+            misses = {url: int(held.get("misses") or 0) for url, held in _hold.items()}
+            found = settle_peers([held["item"] for held in _hold.values()], previous, misses, local_key())
+            shown: list[dict] = []
             fresh: list[dict] = []
             for item in found:
                 remember_peer(item)
-                if str(item.get("url") or "") not in previous:
+                url = str(item.get("url") or "")
+                held = _hold.get(url) or {}
+                # A copy that tells the page how old this row is. A row that
+                # missed a check is still shown, but marked, not faked live.
+                row = dict(item)
+                row["misses"] = int(held.get("misses") or 0)
+                row["seen_s"] = max(0, int(now - float(held.get("at") or now)))
+                shown.append(row)
+                if peer_identity(item) not in previous_keys:
                     fresh.append(item)
             with _found_lock:
-                _found = found
+                _found = shown
             for item in fresh:
                 threading.Thread(target=note_arrival, args=(item,), name="neuro-arrival", daemon=True).start()
         except Exception as exc:
-            print(f"discovery failed: {exc}", flush=True)
+            print(f"discovery failed: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(10)
 
 
@@ -878,22 +1319,33 @@ def known_models() -> list[dict]:
     models = []
     data_root = Path(os.environ.get("NEURO_AI_DATA", r"D:\liliai\neuro-ai-data"))
     folder = data_root / "models" / "gguf"
-    paths = []
-    if folder.is_dir():
-        paths.extend(folder.rglob("*.gguf"))
+    paths: list[Path] = []
+    try:
+        if folder.is_dir():
+            for path in folder.rglob("*.gguf"):
+                paths.append(path)
+                if len(paths) >= 64:
+                    break
+    except OSError:
+        pass
     extra = ROOT / "models.json"
-    if extra.is_file():
-        try:
-            saved = json.loads(extra.read_text(encoding="utf-8"))
-            if isinstance(saved, list):
-                paths.extend(Path(item.get("path", "")) for item in saved if isinstance(item, dict))
-        except (OSError, json.JSONDecodeError):
-            pass
+    try:
+        saved = json.loads(extra.read_text(encoding="utf-8"))
+        if isinstance(saved, list):
+            paths.extend(
+                Path(item["path"]) for item in saved if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"]
+            )
+    except (OSError, ValueError):
+        pass
     seen = set()
     for path in paths:
-        if not path.is_file() or path.suffix.lower() != ".gguf" or "mmproj" in path.name.lower():
+        try:
+            if not path.is_file() or path.suffix.lower() != ".gguf" or "mmproj" in path.name.lower():
+                continue
+            key = str(path.resolve()).lower()
+            size = path.stat().st_size
+        except OSError:
             continue
-        key = str(path.resolve()).lower()
         if key in seen:
             continue
         seen.add(key)
@@ -901,7 +1353,7 @@ def known_models() -> list[dict]:
             {
                 "name": path.stem,
                 "path": str(path),
-                "mb": path.stat().st_size // (1024 * 1024),
+                "mb": size // (1024 * 1024),
                 "loaded": "qwen3.5-9b" in path.name.lower() and "q5" in path.name.lower(),
             }
         )
@@ -917,51 +1369,96 @@ def save_model(raw_path: str) -> dict:
     if "mmproj" in path.name.lower():
         raise ValueError("That file is a projector, not the model.")
     extra = ROOT / "models.json"
-    saved = []
-    if extra.is_file():
-        try:
-            current = json.loads(extra.read_text(encoding="utf-8"))
-            if isinstance(current, list):
-                saved = current
-        except (OSError, json.JSONDecodeError):
-            saved = []
     item = {"name": path.stem, "path": str(path)}
-    if not any(entry.get("path") == item["path"] for entry in saved if isinstance(entry, dict)):
-        saved.append(item)
-    extra.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+    with _files_lock:
+        saved = read_json_list(extra, strict=True)
+        if not any(entry.get("path") == item["path"] for entry in saved):
+            saved.append(item)
+            write_json_list(extra, saved)
     return item
 
 
-def pull_saved_workers() -> list[dict]:
-    rows: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for item in read_nodes():
-        pulled = pull_worker(str(item.get("url") or ""))
-        status = pulled.get("status") or {}
-        if pulled.get("ok") and status.get("os"):
-            key = (str(status.get("name") or ""), str(status.get("os") or ""))
+def side_jobs(status: dict, is_home: bool, training_running: bool | None, chat_on_home: bool) -> list[dict]:
+    """Which side job fits this computer. Pure: built only from the status a
+    worker already reports, so an old worker without "caps" still gets a
+    best guess from its RAM and GPU list. Nothing here starts a job."""
+    caps = status.get("caps") if isinstance(status.get("caps"), dict) else {}
+    ram = status.get("ram") if isinstance(status.get("ram"), dict) else {}
+    gpus = [card for card in (status.get("gpus") or []) if isinstance(card, dict)]
+    cuda = [card for card in gpus if not card.get("unified")]
+    os_name = str(status.get("os") or "").lower()
+    free_mib = int(caps.get("free_ram_mib") or ram.get("free_mib") or 0)
+    total_mib = int(ram.get("total_mib") or 0)
+    cores = int(caps.get("cpu_cores") or 0)
+    vram_total = int(caps.get("vram_total_mib") or max((int(card.get("memory_total_mib") or 0) for card in cuda), default=0))
+    vram_free = int(
+        caps.get("vram_free_mib")
+        or max((int(card.get("memory_total_mib") or 0) - int(card.get("memory_used_mib") or 0) for card in cuda), default=0)
+    )
+    busy_pct = caps.get("cpu_busy_pct")
+    chat_here = bool(status.get("chat_server"))
+    has_caps = bool(caps)
+    cpu_free = not chat_here and (busy_pct is None or int(busy_pct) < 60)
+    jobs: list[dict] = []
+
+    def add(job: str, label: str, ready: bool, why: str) -> None:
+        jobs.append({"job": job, "label": label, "ready": bool(ready), "why": why})
+
+    if is_home:
+        add("train", "Training", bool(cuda), "The one training run stays on this NVIDIA PC.")
+        return jobs
+    if cuda and vram_total >= 4000:
+        add(
+            "eval",
+            "Eval on CUDA",
+            vram_free >= 3500 and not chat_here,
+            f"{round(vram_total / 1024)} GB NVIDIA memory, {round(max(0, vram_free) / 1024, 1)} GB free. Fits a small quantized model or a saved checkpoint eval, not training.",
+        )
+    if cores >= 4 or (not has_caps and total_mib >= 8000):
+        if caps.get("luau"):
+            add("verify", "Verified-code checks", cpu_free, "Runs the Luau checks on its own processor.")
         else:
-            key = ("url", str(pulled.get("url") or ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        rows.append(pulled)
-    return rows
+            add("verify", "Agent code checks", cpu_free, "Runs the agent drill on its own processor." + ("" if has_caps else " Older worker: the core count is not reported."))
+    if free_mib >= 4096 or (not has_caps and total_mib >= 12000):
+        add("dedup", "Data dedup and filtering", cpu_free and free_mib >= 4096, "CPU and RAM work on a copy of a dataset shard. The training files are not touched.")
+    rpc_ok = bool(caps.get("rpc_server") or status.get("rpc_binary"))
+    if rpc_ok or os_name == "darwin":
+        ready = rpc_ok and not chat_on_home and free_mib >= 4096
+        why = "Lends memory to one llama.cpp inference run over the LAN, only after chat on this PC is off."
+        if not rpc_ok:
+            why = "Needs ggml-rpc-server built first. " + why
+        elif chat_on_home:
+            why = "Waits: chat is still on this PC. " + why
+        add("rpc", "llama.cpp RPC memory", ready, why)
+    return jobs
 
 
 def mesh_snapshot() -> dict:
     local = local_status()
-    now = time.time()
-    if now - _node_cache["at"] >= 8:
-        _node_cache["rows"] = pull_saved_workers()
-        _node_cache["at"] = now
-    nodes = [{"url": "local", "ok": True, "status": local}, *list(_node_cache["rows"])]
+    # The page used to ask every saved worker again here, one by one, on the
+    # request thread. An asleep laptop made each refresh wait. The discovery
+    # thread already asks them every 10 seconds, so its result is used.
     with _found_lock:
-        found = list(_found)
+        found = [dict(item) for item in _found]
+    training = training_view()
+    chat_home = bool(local.get("chat_server"))
+    nodes = [{"url": "local", "ok": True, "status": local}, *found]
+    for index, item in enumerate(nodes):
+        status = item.get("status") if isinstance(item.get("status"), dict) else {}
+        try:
+            item["fit"] = side_jobs(status, index == 0, training.get("running"), chat_home)
+        except (TypeError, ValueError):
+            item["fit"] = []
+    lan = lan_host()
     with _arrival_lock:
         arrivals = list(_arrivals)
         checks = list(_checks.values())
+    try:
+        jobs = job_queue().summary()
+    except (OSError, RuntimeError, ValueError):
+        jobs = {"kinds": {}, "nodes": {}, "verified_rows": 0, "total": 0}
     return {
+        "jobs": jobs,
         "nodes": nodes,
         "found": found,
         "token_id": token_id(),
@@ -973,9 +1470,9 @@ def mesh_snapshot() -> dict:
             "reason": "Extra machines check the agent code on their own CPU and can lend memory to one inference run. One training run stays on the NVIDIA PC.",
         },
         "specs": read_specs(),
-        "training": training_view(),
+        "training": training,
         "models": known_models(),
-        "lan": ("http://" + lan_host() + ":" + str(DASHBOARD_PORT)) if lan_host() else "",
+        "lan": ("http://" + lan + ":" + str(DASHBOARD_PORT)) if lan else "",
         "arrivals": arrivals,
         "checks": checks,
         "share": {
@@ -1000,9 +1497,7 @@ def lan_host() -> str:
             host = sock.getsockname()[0]
     except OSError:
         return ""
-    if host.startswith(("10.", "192.168.", "172.")):
-        return host
-    return ""
+    return host if private_lan(host) else ""
 
 
 def ask_check(url: str) -> dict:
@@ -1014,7 +1509,7 @@ def ask_check(url: str) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            body = json.loads(response.read().decode("utf-8"))
+            body = read_reply(response)
     except urllib.error.HTTPError as exc:
         if exc.code in {401, 404}:
             return {"url": url, "ok": False, "error": "That computer is running an older worker. Pull and start it again."}
@@ -1071,6 +1566,8 @@ def start_rpc() -> dict:
 
 
 def ask_local(message: str) -> dict:
+    text = message if isinstance(message, str) else ""
+    text = text.replace("\0", "")[:4_000]
     payload = json.dumps(
         {
             "messages": [
@@ -1078,7 +1575,7 @@ def ask_local(message: str) -> dict:
                     "role": "system",
                     "content": "You are Neuro, running on this computer. Answer the user.",
                 },
-                {"role": "user", "content": message},
+                {"role": "user", "content": text},
             ],
             "temperature": 0.7,
             "max_tokens": 2048,
@@ -1090,16 +1587,24 @@ def ask_local(message: str) -> dict:
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=180) as response:
-        body = json.loads(response.read().decode("utf-8"))
-    choices = body.get("choices") if isinstance(body, dict) else None
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            raw = response.read(1_000_000)
+        body = json.loads(raw.decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {"reply": "", "reasoning": "", "tokens": {}, "error": "Neuro did not answer."}
+    if not isinstance(body, dict):
+        return {"reply": "", "reasoning": "", "tokens": {}, "error": "Neuro did not answer."}
+    choices = body.get("choices")
     message_body = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
     if not isinstance(message_body, dict):
         return {"reply": "", "reasoning": "", "tokens": {}, "error": "Neuro did not answer."}
+    reply = message_body.get("content") or ""
+    reasoning = message_body.get("reasoning_content") or ""
     return {
-        "reply": message_body.get("content") or "",
-        "reasoning": message_body.get("reasoning_content") or "",
-        "tokens": body.get("usage") or {},
+        "reply": reply[:12_000] if isinstance(reply, str) else "",
+        "reasoning": reasoning[:4_000] if isinstance(reasoning, str) else "",
+        "tokens": body.get("usage") if isinstance(body.get("usage"), dict) else {},
     }
 
 
@@ -1118,16 +1623,17 @@ def offer_share() -> dict:
             headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
-                body = json.loads(response.read().decode("utf-8"))
+            with open_limited(request, 8) as response:
+                body = read_reply(response)
+            body = body if isinstance(body, dict) else {}
             listening = bool(body.get("started") or body.get("already"))
             results.append({"name": name, "ok": listening, "detail": "listening" if listening else "answered"})
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:180]
+            detail = error_detail(exc)
             if "token" in detail.lower():
                 detail = "That computer is running an older worker. Pull and start it again."
             results.append({"name": name, "ok": False, "detail": detail})
-        except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+        except (OSError, urllib.error.URLError, ValueError) as exc:
             results.append({"name": name, "ok": False, "detail": str(exc)[:180]})
     return {
         "moved": False,
@@ -1135,6 +1641,21 @@ def offer_share() -> dict:
         "peers": results,
         "note": "The loaded model stays on this PC. A computer that is listening joins the next start. Splitting a model that already fits this GPU makes the run slower.",
     }
+
+
+def error_detail(exc: urllib.error.HTTPError) -> str:
+    """The worker's own error text, never the raw HTTP body dump."""
+    try:
+        raw = exc.read(4096).decode("utf-8", errors="replace")
+    except OSError:
+        return f"http {exc.code}"
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return raw[:180]
+    if isinstance(body, dict):
+        return clip(body.get("error") or body.get("note") or f"http {exc.code}", 180)
+    return raw[:180]
 
 
 def process_name(pid: int) -> str:
@@ -1158,20 +1679,32 @@ def process_name(pid: int) -> str:
         out = subprocess.check_output(["ps", "-p", str(pid), "-o", "comm="], text=True, timeout=4)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return out.strip().replace("\\", "/").split("/")[-1]
+    # Same 40-character cut as the process list, so a long Mac name matches.
+    return out.strip().replace("\\", "/").split("/")[-1][:40]
 
 
 def stop_owned_process(pid: int, expected: str = "") -> dict:
+    if pid <= 0:
+        return {"stopped": False, "note": "Missing process."}
     name = process_name(pid)
     if not name:
         return {"stopped": False, "note": "That process is already gone."}
     wanted = expected.strip()
     if not wanted or name.lower() != wanted.lower():
         return {"stopped": False, "note": "That process changed. Nothing was stopped."}
-    if name.lower() in PROTECTED or pid in keep_pids():
+    if name.lower() in PROTECTED or pid in keep_pids() or pid == os.getpid():
         return {"stopped": False, "note": name + " keeps the training run or the computer up, so it was left on."}
+    # Only a program that the page lists with a Stop button can be stopped.
+    # This also covers Python while the GPU lock is held, and anything small.
+    _heavy_cache["at"] = 0.0
+    listed = next((row for row in heavy_processes() if row.get("pid") == pid), None)
+    if listed is None or not listed.get("stoppable") or str(listed.get("name") or "").lower() != name.lower():
+        return {"stopped": False, "note": name + " is not on the list of programs that can be stopped, so it was left on."}
     if os.name == "nt":
-        done = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
+        try:
+            done = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return {"stopped": False, "note": "Could not stop " + name + "."}
         stopped = done.returncode == 0
     else:
         try:
@@ -1215,7 +1748,6 @@ def stop_at(url: str, pid: int, name: str = "") -> dict:
         return {"stopped": False, "note": "That address is not a joined computer."}
     if not peer_known(clean):
         return {"stopped": False, "note": "That computer is not connected."}
-    _node_cache["at"] = 0.0
     request = urllib.request.Request(
         clean + "/process/stop",
         data=json.dumps({"pid": pid, "name": name}).encode("utf-8"),
@@ -1223,27 +1755,30 @@ def stop_at(url: str, pid: int, name: str = "") -> dict:
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
-            body = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = read_reply(response)
         if isinstance(body, dict):
-            return body
+            return {"stopped": bool(body.get("stopped")), "note": clip(body.get("note") or "", 240)}
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:180]
+        detail = error_detail(exc)
         if exc.code in {404, 401} or "token" in detail.lower():
             return {"stopped": False, "note": "That computer is running an older worker. Pull and start it again."}
         return {"stopped": False, "note": detail or "Could not stop that process."}
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+    except (OSError, urllib.error.URLError, ValueError):
         return {"stopped": False, "note": "That computer did not answer."}
     return {"stopped": False, "note": "Could not stop that process."}
 
 
 def stop_model() -> dict:
-    if os.name == "nt":
-        done = subprocess.run(["taskkill", "/IM", "llama-server.exe", "/F"], capture_output=True, text=True)
+    try:
+        if os.name == "nt":
+            done = subprocess.run(["taskkill", "/IM", "llama-server.exe", "/F"], capture_output=True, text=True, timeout=15)
+        else:
+            done = subprocess.run(["pkill", "-x", "llama-server"], capture_output=True, text=True, timeout=15)
         stopped = done.returncode == 0
-    else:
-        done = subprocess.run(["pkill", "-x", "llama-server"], capture_output=True, text=True)
-        stopped = done.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        stopped = False
+    _heavy_cache["at"] = 0.0
     return {
         "stopped": stopped,
         "note": "Stopped the loaded model on this PC. Code workers and other programs were left running.",
@@ -1251,15 +1786,22 @@ def stop_model() -> dict:
 
 
 def stop_rpc() -> dict:
-    if not PID_PATH.exists():
+    try:
+        pid_text = PID_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
         return {"stopped": False}
-    pid_text = PID_PATH.read_text(encoding="utf-8").strip()
     PID_PATH.unlink(missing_ok=True)
     if not pid_text.isdigit():
         return {"stopped": False}
     pid = int(pid_text)
+    # The saved PID may have been reused by another program since.
+    if "rpc-server" not in process_name(pid).lower():
+        return {"stopped": False, "note": "The share listener was already gone."}
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return {"stopped": False}
     else:
         try:
             os.kill(pid, 15)
@@ -1268,23 +1810,1839 @@ def stop_rpc() -> dict:
     return {"stopped": True, "pid": pid}
 
 
+# ---------------------------------------------------------------------------
+# Data factory: a small job queue on the main PC. Idle workers pull a job,
+# run it with a built-in handler, and post the result. A job is data for one
+# of the handlers below. No job can name a program, a shell line, a host, or
+# a file path. Training itself stays on the NVIDIA PC.
+# ---------------------------------------------------------------------------
+
+JOBS_DIR = ROOT / "jobs"
+JOB_KINDS = (
+    "generate", "verify_luau", "verify_python_syntax", "verify_js", "verify_ts",
+    "verify_html_css", "verify_sql", "verify_math", "dedup_hash",
+)
+VERIFY_KINDS = (
+    "verify_luau", "verify_python_syntax", "verify_js", "verify_ts",
+    "verify_html_css", "verify_sql", "verify_math",
+)
+# The verifiers added for the coding set never run generated code:
+#   verify_js        node --check (parse only), one temp file per code block
+#   verify_ts        node's built-in stripTypeScriptTypes (a parser), then node --check
+#   verify_html_css  html.parser structure checks plus a CSS brace/string scanner
+#   verify_sql       sqlite3 in memory: DDL builds a throwaway catalog, every other
+#                    statement is only compiled with EXPLAIN, never stepped
+# A verifier that cannot run here (no node, an old node) reports
+# "unavailable" as a failed job, never as a pass or as a rejected answer.
+CODE_KINDS = {"verify_python_syntax": "python", "verify_js": "js", "verify_ts": "ts", "verify_html_css": "html", "verify_sql": "sql"}
+MAX_SAMPLES = 16
+MAX_CODE_BLOCKS = 16
+CODE_LIMIT = 200000
+NODE_TIMEOUT = 10
+NODE_OUTPUT_CAP = 256 * 1024
+JOB_LINE_LIMIT = 256 * 1024
+JOB_RESULT_LIMIT = 512 * 1024
+JOB_OUTPUT_LIMIT = 256 * 1024
+GENERATE_MAX_TOKENS = 2048
+GENERATE_TIMEOUT = 600
+LUAU_TIMEOUT = 10
+LUAU_OUTPUT_CAP = 1024 * 1024
+MINHASH_PERM = 32
+MAX_ATTEMPTS = 3
+LEASE_SECONDS = {
+    "generate": 900, "verify_luau": 180, "verify_python_syntax": 120, "verify_js": 180, "verify_ts": 240,
+    "verify_html_css": 120, "verify_sql": 120, "verify_math": 120, "dedup_hash": 300,
+}
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_HEX16 = re.compile(r"^[0-9a-f]{16}$")
+SKILLS = {"general", "code", "math", "luau"}
+
+
+class JobError(ValueError):
+    pass
+
+
+def _job_text(value: object, limit: int, field: str) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str):
+        raise JobError(field + " must be text")
+    if len(value) > limit:
+        raise JobError(f"{field} is longer than {limit} characters")
+    return value
+
+
+def _clamp(value: object, low: float, high: float, default: float) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    return max(low, min(high, number))
+
+
+def validate_verify_spec(spec: object) -> dict:
+    if not isinstance(spec, dict):
+        raise JobError("verify must be an object")
+    kind = spec.get("kind")
+    if kind not in VERIFY_KINDS:
+        raise JobError("verify.kind must be one of " + ", ".join(VERIFY_KINDS))
+    out: dict = {"kind": kind}
+    if kind == "verify_math":
+        out["expected"] = _job_text(spec.get("expected"), 200, "verify.expected")
+        if spec.get("tol") is not None:
+            out["tol"] = _clamp(spec.get("tol"), 0.0, 1.0, 1e-6)
+    if kind == "verify_luau" and spec.get("expect_stdout") is not None:
+        out["expect_stdout"] = _job_text(spec.get("expect_stdout"), 4000, "verify.expect_stdout")
+    if kind == "verify_sql" and spec.get("schema") is not None:
+        out["schema"] = _job_text(spec.get("schema"), 64000, "verify.schema")
+    if kind == "verify_html_css" and spec.get("require_tags") is not None:
+        out["require_tags"] = _tag_list(spec.get("require_tags"), "verify.require_tags")
+    return out
+
+
+def _tag_list(value: object, field: str) -> list[str]:
+    if not isinstance(value, list) or len(value) > 32:
+        raise JobError(field + " must be a list of up to 32 tag names")
+    tags = []
+    for item in value:
+        tag = _job_text(item, 40, field).strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", tag):
+            raise JobError(field + " holds a bad tag name")
+        tags.append(tag)
+    return tags
+
+
+def _code_blocks_field(raw: dict, lang: str) -> list[str]:
+    """Code for verify_js / verify_ts: `blocks` (a list), `code` (one
+    block) or `answer` (a markdown reply; its fenced blocks are taken)."""
+    if raw.get("blocks") is not None:
+        blocks = raw.get("blocks")
+        if not isinstance(blocks, list):
+            raise JobError("blocks must be a list of code strings")
+        blocks = [_job_text(block, CODE_LIMIT, "block") for block in blocks]
+    elif raw.get("code") is not None:
+        blocks = [_job_text(raw.get("code"), CODE_LIMIT, "code")]
+    elif raw.get("answer") is not None:
+        blocks = pick_blocks(_job_text(raw.get("answer"), CODE_LIMIT, "answer"), lang)
+    else:
+        raise JobError("needs code, blocks or answer")
+    if len(blocks) > MAX_CODE_BLOCKS:
+        raise JobError(f"more than {MAX_CODE_BLOCKS} code blocks")
+    if sum(len(block) for block in blocks) > CODE_LIMIT:
+        raise JobError(f"the code is longer than {CODE_LIMIT} characters")
+    return blocks
+
+
+def validate_job(kind: str, raw: object) -> dict:
+    """Check one job and return the clean payload that is stored and sent.
+    Unknown fields are dropped, sizes are capped."""
+    if kind not in JOB_KINDS:
+        raise JobError("Unknown job kind. Use one of " + ", ".join(JOB_KINDS))
+    if not isinstance(raw, dict):
+        raise JobError("A job must be a JSON object")
+    payload: dict
+    if kind == "generate":
+        messages = raw.get("messages")
+        if messages is None and isinstance(raw.get("prompt"), str):
+            messages = []
+            if isinstance(raw.get("system"), str) and raw["system"].strip():
+                messages.append({"role": "system", "content": raw["system"]})
+            messages.append({"role": "user", "content": raw["prompt"]})
+        if not isinstance(messages, list) or not 1 <= len(messages) <= 32:
+            raise JobError("generate needs messages (1 to 32) or a prompt")
+        clean = []
+        total = 0
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") not in {"system", "user", "assistant"}:
+                raise JobError("Each message needs role system, user or assistant")
+            content = _job_text(message.get("content"), 32000, "message content")
+            total += len(content)
+            clean.append({"role": message["role"], "content": content})
+        if total > 64000:
+            raise JobError("The messages are longer than 64000 characters")
+        if clean[-1]["role"] != "user":
+            raise JobError("The last message must be from the user")
+        payload = {
+            "messages": clean,
+            "max_tokens": int(_clamp(raw.get("max_tokens"), 1, GENERATE_MAX_TOKENS, 1024)),
+            "temperature": _clamp(raw.get("temperature"), 0.0, 2.0, 0.7),
+            "top_p": _clamp(raw.get("top_p"), 0.01, 1.0, 0.95),
+        }
+        if raw.get("verify") is not None:
+            payload["verify"] = validate_verify_spec(raw.get("verify"))
+        # Rejection sampling: `samples` copies of one prompt share a `group`
+        # (JobQueue.add_many makes the copies). `seed` keeps them different.
+        samples = int(_clamp(raw.get("samples"), 1, MAX_SAMPLES, 1))
+        if samples > 1:
+            payload["samples"] = samples
+        group = raw.get("group")
+        if isinstance(group, str) and _HEX16.match(group):
+            payload["group"] = group
+            payload["sample"] = int(_clamp(raw.get("sample"), 0, MAX_SAMPLES - 1, 0))
+        seed = raw.get("seed")
+        if isinstance(seed, int) and not isinstance(seed, bool) and 0 <= seed < 2 ** 31:
+            payload["seed"] = seed
+    elif kind in ("verify_js", "verify_ts"):
+        payload = {"blocks": _code_blocks_field(raw, CODE_KINDS[kind])}
+    elif kind == "verify_html_css":
+        if raw.get("html") is None and raw.get("css") is None and raw.get("answer") is not None:
+            html, css = split_web(_job_text(raw.get("answer"), CODE_LIMIT, "answer"))
+        else:
+            html = _job_text(raw.get("html") if raw.get("html") is not None else raw.get("code") or "", CODE_LIMIT, "html")
+            css = _job_text(raw.get("css") or "", CODE_LIMIT, "css")
+        if len(html) + len(css) > CODE_LIMIT:
+            raise JobError(f"the code is longer than {CODE_LIMIT} characters")
+        payload = {"html": html, "css": css}
+        if raw.get("require_tags") is not None:
+            payload["require_tags"] = _tag_list(raw.get("require_tags"), "require_tags")
+    elif kind == "verify_sql":
+        if raw.get("code") is None and raw.get("answer") is not None:
+            code = join_sql(pick_blocks(_job_text(raw.get("answer"), 64000, "answer"), "sql"))
+        else:
+            code = raw.get("code")
+        payload = {"code": _job_text(code, 64000, "code")}
+        if raw.get("schema") is not None:
+            payload["schema"] = _job_text(raw.get("schema"), 64000, "schema")
+    elif kind == "verify_luau":
+        payload = {"code": _job_text(raw.get("code"), 64000, "code")}
+        if raw.get("expect_stdout") is not None:
+            payload["expect_stdout"] = _job_text(raw.get("expect_stdout"), 4000, "expect_stdout")
+    elif kind == "verify_python_syntax":
+        payload = {"code": _job_text(raw.get("code"), 200000, "code")}
+    elif kind == "verify_math":
+        payload = {
+            "answer": _job_text(raw.get("answer"), 64000, "answer"),
+            "expected": _job_text(raw.get("expected"), 200, "expected"),
+        }
+        if raw.get("tol") is not None:
+            payload["tol"] = _clamp(raw.get("tol"), 0.0, 1.0, 1e-6)
+    else:  # dedup_hash
+        texts = raw.get("texts")
+        if not isinstance(texts, list) or not 1 <= len(texts) <= 500:
+            raise JobError("dedup_hash needs texts: a list of 1 to 500 strings")
+        clean_texts = [_job_text(text, 50000, "text") for text in texts]
+        if sum(len(text) for text in clean_texts) > 1_000_000:
+            raise JobError("The texts are longer than 1,000,000 characters in total")
+        payload = {"texts": clean_texts}
+    meta = raw.get("meta")
+    if isinstance(meta, dict):
+        packed = json.dumps(meta, ensure_ascii=False)
+        if len(packed) > 2000:
+            raise JobError("meta is larger than 2000 characters")
+        payload["meta"] = json.loads(packed)
+    return payload
+
+
+def strip_thinking(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def extract_code(text: str, languages: tuple[str, ...]) -> str:
+    """The last fenced code block, preferring one tagged with a wanted
+    language. Without a fence the whole reply is the code."""
+    text = strip_thinking(text)
+    blocks = re.findall(r"```([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", text, flags=re.DOTALL)
+    if not blocks:
+        return text
+    tagged = [body for tag, body in blocks if tag.lower() in languages]
+    return (tagged or [body for _, body in blocks])[-1]
+
+
+# Fence info string -> language. jsx/tsx/vue are left out on purpose: no
+# verifier here parses them, so they never count as JavaScript.
+LANG_ALIASES = {
+    "javascript": "js", "js": "js", "mjs": "js", "cjs": "js", "node": "js", "nodejs": "js", "ecmascript": "js",
+    "typescript": "ts", "ts": "ts", "mts": "ts", "cts": "ts",
+    "html": "html", "htm": "html", "xhtml": "html", "html5": "html",
+    "css": "css",
+    "sql": "sql", "sqlite": "sql", "sqlite3": "sql",
+    "python": "python", "py": "python", "python3": "python",
+    "lua": "luau", "luau": "luau",
+}
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`{]*)")
+
+
+def code_blocks(text: str) -> list[dict]:
+    """Fenced code blocks of a markdown reply, in order:
+    [{"lang": canonical or "", "tag": raw info word, "code": body, "closed": bool}].
+    A fence that is never closed (a cut-off reply) runs to the end, so a
+    truncated block is still checked and fails instead of being skipped."""
+    lines = strip_thinking(text).splitlines()
+    blocks: list[dict] = []
+    index = 0
+    while index < len(lines):
+        match = _FENCE_OPEN.match(lines[index])
+        if not match or (match.group(1)[0] == "`" and "`" in lines[index][match.end():]):
+            index += 1
+            continue
+        fence, tag = match.group(1), match.group(2).lower().lstrip(".")
+        closing = re.compile(r"^ {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*$")
+        body: list[str] = []
+        closed = False
+        index += 1
+        while index < len(lines):
+            if closing.match(lines[index]):
+                closed = True
+                index += 1
+                break
+            body.append(lines[index])
+            index += 1
+        blocks.append({"lang": LANG_ALIASES.get(tag, ""), "tag": tag, "code": "\n".join(body) + "\n", "closed": closed})
+    return blocks
+
+
+def pick_blocks(text: str, lang: str) -> list[str]:
+    """Blocks tagged with `lang`; else the untagged blocks; else, when the
+    reply has no fence at all, the whole reply. A reply whose only blocks are
+    in other languages gives [] (the verifier then fails it)."""
+    blocks = code_blocks(text)
+    tagged = [block["code"] for block in blocks if block["lang"] == lang]
+    if tagged:
+        return tagged
+    untagged = [block["code"] for block in blocks if not block["tag"]]
+    if untagged:
+        return untagged
+    return [] if blocks else [strip_thinking(text)]
+
+
+def split_web(text: str) -> tuple[str, str]:
+    """HTML and CSS of a markdown reply. Untagged blocks (or a reply with no
+    fence) count as HTML when they start with '<', else as CSS."""
+    blocks = code_blocks(text)
+    html = [block["code"] for block in blocks if block["lang"] == "html"]
+    css = [block["code"] for block in blocks if block["lang"] == "css"]
+    if not html and not css:
+        loose = [block["code"] for block in blocks if not block["tag"]] if blocks else [strip_thinking(text)]
+        for part in loose:
+            (html if part.lstrip().startswith("<") else css).append(part)
+    return "\n".join(html), "\n".join(css)
+
+
+def join_sql(blocks: list[str]) -> str:
+    """SQL blocks in order, each ended with ';' so blocks cannot run together."""
+    import sqlite3
+
+    parts = []
+    for block in blocks:
+        part = block.strip()
+        if part:
+            parts.append(part if sqlite3.complete_statement(part) else part + "\n;")
+    return "\n".join(parts)
+
+
+def verify_payload(spec: dict, text: str) -> dict:
+    """Build the verify job that checks one generated reply."""
+    kind = spec["kind"]
+    if kind == "verify_math":
+        payload: dict = {"answer": strip_thinking(text)[-64000:], "expected": spec["expected"]}
+        if "tol" in spec:
+            payload["tol"] = spec["tol"]
+        return payload
+    if kind == "verify_python_syntax":
+        return {"code": extract_code(text, ("python", "py", "python3"))}
+    if kind in ("verify_js", "verify_ts"):
+        return {"blocks": pick_blocks(text, CODE_KINDS[kind])}
+    if kind == "verify_html_css":
+        html, css = split_web(text)
+        payload = {"html": html, "css": css}
+        if "require_tags" in spec:
+            payload["require_tags"] = spec["require_tags"]
+        return payload
+    if kind == "verify_sql":
+        payload = {"code": join_sql(pick_blocks(text, "sql"))}
+        if "schema" in spec:
+            payload["schema"] = spec["schema"]
+        return payload
+    payload = {"code": extract_code(text, ("lua", "luau"))}
+    if "expect_stdout" in spec:
+        payload["expect_stdout"] = spec["expect_stdout"]
+    return payload
+
+
+def check_output(kind: str, payload: dict, ok: bool, output: object) -> tuple[bool, bool | None, dict]:
+    """Validate a worker's result. Returns (ok, passed, output to store)."""
+    if not isinstance(output, dict):
+        return False, None, {"error": "output must be a JSON object"}
+    if len(json.dumps(output, ensure_ascii=False)) > JOB_OUTPUT_LIMIT:
+        return False, None, {"error": "output is too large"}
+    if not ok:
+        return False, None, {"error": clip(output.get("error") or "failed", 300)}
+    if kind == "generate":
+        text = output.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return False, None, {"error": "generate returned no text"}
+        usage = output.get("usage") if isinstance(output.get("usage"), dict) else {}
+        return True, None, {
+            "text": text,
+            "finish_reason": clip(output.get("finish_reason"), 40),
+            "model": clip(output.get("model"), 120),
+            "usage": {key: int(usage[key]) for key in ("prompt_tokens", "completion_tokens") if isinstance(usage.get(key), int)},
+        }
+    if kind in VERIFY_KINDS:
+        passed = output.get("passed")
+        if not isinstance(passed, bool):
+            return False, None, {"error": "verify result has no passed flag"}
+        clean = {"passed": passed}
+        for key in ("error", "detail", "stderr_tail", "stdout_tail", "found", "returncode", "line"):
+            if key in output:
+                value = output[key]
+                clean[key] = value if isinstance(value, int) and not isinstance(value, bool) else clip(value, 4000)
+        return True, passed, clean
+    hashes = output.get("hashes")
+    texts = payload.get("texts") or []
+    if not isinstance(hashes, list) or len(hashes) != len(texts):
+        return False, None, {"error": "dedup_hash returned the wrong number of rows"}
+    for row in hashes:
+        if not isinstance(row, dict) or not isinstance(row.get("sha256"), str) or not _HEX64.match(row["sha256"]):
+            return False, None, {"error": "dedup_hash returned a bad sha256"}
+        signature = row.get("minhash")
+        if not isinstance(signature, list) or len(signature) != MINHASH_PERM or not all(isinstance(v, int) for v in signature):
+            return False, None, {"error": "dedup_hash returned a bad minhash"}
+    return True, None, {"hashes": [{"sha256": row["sha256"], "minhash": row["minhash"]} for row in hashes], "num_perm": MINHASH_PERM}
+
+
+class JobQueue:
+    """Append-only queue in jobs/queue.jsonl plus jobs/results.jsonl.
+
+    queue.jsonl holds "add" and "finish" events. Both `mesh.py serve` and the
+    `mesh.py jobs add` command append to it, so the server reads new lines
+    before each lease. Leases are kept in memory only: after a restart every
+    leased job is simply queued again.
+    """
+
+    def __init__(self, folder: Path = JOBS_DIR):
+        self.folder = folder
+        self.queue_path = folder / "queue.jsonl"
+        self.results_path = folder / "results.jsonl"
+        self.lock = threading.RLock()
+        self.jobs: dict[str, dict] = {}
+        self.order: list[str] = []
+        self.leases: dict[str, dict] = {}
+        self.by_node: dict[str, str] = {}
+        self.node_done: dict[str, dict[str, int]] = {}
+        self.offset = 0
+
+    # -- file side ---------------------------------------------------------
+    def _file_lock(self) -> int | None:
+        self.folder.mkdir(parents=True, exist_ok=True)
+        lock = self.folder / "queue.lock"
+        deadline = time.time() + 10
+        while True:
+            try:
+                return os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    if time.time() - lock.stat().st_mtime > 30:
+                        lock.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.time() > deadline:
+                    raise RuntimeError("The job queue is locked by another command.")
+                time.sleep(0.02)
+
+    def _file_unlock(self, handle: int | None) -> None:
+        if handle is None:
+            return
+        os.close(handle)
+        (self.folder / "queue.lock").unlink(missing_ok=True)
+
+    def _append(self, path: Path, rows: list[dict]) -> None:
+        data = b"".join(
+            (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8") for row in rows
+        )
+        handle = self._file_lock()
+        try:
+            with open(path, "ab", buffering=0) as out:
+                out.write(data)
+        finally:
+            self._file_unlock(handle)
+
+    def sync(self) -> None:
+        with self.lock:
+            try:
+                size = self.queue_path.stat().st_size
+            except FileNotFoundError:
+                return
+            if size < self.offset:
+                # The file was replaced. Read it again from the start.
+                self.jobs.clear()
+                self.order.clear()
+                self.leases.clear()
+                self.by_node.clear()
+                self.node_done.clear()
+                self.offset = 0
+            if size == self.offset:
+                return
+            with open(self.queue_path, "rb") as handle:
+                handle.seek(self.offset)
+                chunk = handle.read(size - self.offset)
+            end = chunk.rfind(b"\n")
+            if end < 0:
+                return
+            self.offset += end + 1
+            for raw in chunk[:end].split(b"\n"):
+                try:
+                    event = json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    self._apply(event)
+
+    def _apply(self, event: dict) -> None:
+        op = event.get("op")
+        jid = str(event.get("id") or "")
+        if op == "add":
+            kind = event.get("kind")
+            if not jid or jid in self.jobs or kind not in JOB_KINDS or not isinstance(event.get("payload"), dict):
+                return
+            self.jobs[jid] = {
+                "id": jid,
+                "kind": kind,
+                "payload": event["payload"],
+                "parent": str(event.get("parent") or ""),
+                "state": "queued",
+                "attempts": 0,
+                "node": "",
+                "passed": None,
+                "verified": None,
+            }
+            self.order.append(jid)
+        elif op == "finish":
+            job = self.jobs.get(jid)
+            if job is None or job["state"] in {"done", "failed"}:
+                return
+            job["state"] = "done" if event.get("ok") else "failed"
+            job["passed"] = event.get("passed") if isinstance(event.get("passed"), bool) else None
+            job["node"] = str(event.get("node") or "")
+            held = self.leases.pop(jid, None)
+            if held and self.by_node.get(held["node"]) == jid:
+                self.by_node.pop(held["node"], None)
+            if job["node"]:
+                bucket = self.node_done.setdefault(job["node"], {"done": 0, "failed": 0})
+                bucket["done" if job["state"] == "done" else "failed"] += 1
+            parent = self.jobs.get(job["parent"]) if job["parent"] else None
+            if parent is not None and job["kind"] in VERIFY_KINDS:
+                parent["verified"] = bool(job["state"] == "done" and job["passed"])
+
+    def _expire(self, now: float) -> None:
+        for jid, held in list(self.leases.items()):
+            if held["until"] > now:
+                continue
+            self.leases.pop(jid, None)
+            if self.by_node.get(held["node"]) == jid:
+                self.by_node.pop(held["node"], None)
+            job = self.jobs.get(jid)
+            if job is None or job["state"] != "leased":
+                continue
+            if job["attempts"] >= MAX_ATTEMPTS:
+                self._append(self.queue_path, [{"op": "finish", "id": jid, "ok": False, "node": "", "note": "lease expired", "at": int(now)}])
+                self.sync()
+            else:
+                job["state"] = "queued"
+
+    # -- public ------------------------------------------------------------
+    def add(self, kind: str, raw: dict, parent: str = "") -> str:
+        return self.add_many([(kind, raw)], parent)[0]
+
+    def add_many(self, rows: list[tuple[str, dict]], parent: str = "") -> list[str]:
+        events = []
+        ids = []
+        now = int(time.time())
+        expanded = [(kind, copy) for kind, raw in rows for copy in expand_samples(kind, raw)]
+        for kind, raw in expanded:
+            payload = validate_job(kind, raw)
+            jid = secrets.token_hex(8)
+            event = {"op": "add", "id": jid, "kind": kind, "payload": payload, "parent": parent, "at": now}
+            if len(json.dumps(event, ensure_ascii=False)) > JOB_LINE_LIMIT:
+                raise JobError("One job is larger than 256 KB")
+            events.append(event)
+            ids.append(jid)
+        if events:
+            with self.lock:
+                self._append(self.queue_path, events)
+                self.sync()
+        return ids
+
+    def lease(self, node: str, kinds: object, now: float | None = None) -> dict | None:
+        node = machine_key({"name": node, "os": ""})[0]
+        if not node or not isinstance(kinds, list):
+            return None
+        wanted = {kind for kind in kinds if kind in JOB_KINDS}
+        if not wanted:
+            return None
+        now = time.time() if now is None else now
+        with self.lock:
+            self.sync()
+            self._expire(now)
+            current = self.by_node.get(node)
+            if current and current in self.leases:
+                # One job per worker at a time: a worker that restarted gets
+                # the same job back instead of a second one.
+                return self._view(current)
+            for jid in self.order:
+                job = self.jobs[jid]
+                if job["state"] != "queued" or job["kind"] not in wanted:
+                    continue
+                job["state"] = "leased"
+                job["attempts"] += 1
+                job["node"] = node
+                self.leases[jid] = {"lease": secrets.token_hex(12), "node": node, "until": now + LEASE_SECONDS[job["kind"]]}
+                self.by_node[node] = jid
+                return self._view(jid)
+        return None
+
+    def _view(self, jid: str) -> dict:
+        job = self.jobs[jid]
+        held = self.leases[jid]
+        return {
+            "id": jid,
+            "kind": job["kind"],
+            "payload": job["payload"],
+            "lease": held["lease"],
+            "lease_s": int(LEASE_SECONDS[job["kind"]]),
+        }
+
+    def finish(self, body: dict, now: float | None = None) -> tuple[bool, str]:
+        jid = str(body.get("id") or "")
+        lease = str(body.get("lease") or "")
+        node = machine_key({"name": str(body.get("node") or ""), "os": ""})[0]
+        now = time.time() if now is None else now
+        with self.lock:
+            self.sync()
+            self._expire(now)
+            held = self.leases.get(jid)
+            if held is None or not lease or not hmac.compare_digest(held["lease"], lease):
+                return False, "No open lease for that job. It may have expired and gone back to the queue."
+            if node != held["node"]:
+                return False, "That job is leased to another computer."
+            job = self.jobs[jid]
+            ok, passed, output = check_output(job["kind"], job["payload"], body.get("ok") is True, body.get("output"))
+            self._append(
+                self.results_path,
+                [{"id": jid, "kind": job["kind"], "parent": job["parent"], "node": node, "ok": ok, "passed": passed, "output": output, "at": int(now)}],
+            )
+            self._append(self.queue_path, [{"op": "finish", "id": jid, "ok": ok, "passed": passed, "node": node, "at": int(now)}])
+            self.sync()
+            note = "saved"
+            spec = job["payload"].get("verify")
+            if job["kind"] == "generate" and ok and isinstance(spec, dict):
+                try:
+                    self.add(spec["kind"], verify_payload(spec, output["text"]), parent=jid)
+                    note = "saved; " + spec["kind"] + " queued"
+                except (JobError, KeyError) as exc:
+                    job["verified"] = False
+                    note = "saved; not verified: " + str(exc)[:120]
+            return True, note
+
+    def summary(self) -> dict:
+        with self.lock:
+            try:
+                self.sync()
+                self._expire(time.time())
+            except (OSError, RuntimeError):
+                pass
+            kinds = {kind: {"queued": 0, "leased": 0, "done": 0, "failed": 0, "passed": 0} for kind in JOB_KINDS}
+            exportable = 0
+            for job in self.jobs.values():
+                row = kinds[job["kind"]]
+                row[job["state"]] += 1
+                if job["passed"]:
+                    row["passed"] += 1
+                if job["kind"] == "generate" and job["verified"]:
+                    exportable += 1
+            nodes = {}
+            for name, bucket in self.node_done.items():
+                nodes[name] = {"done": bucket["done"], "failed": bucket["failed"], "now": ""}
+            for jid, held in self.leases.items():
+                nodes.setdefault(held["node"], {"done": 0, "failed": 0, "now": ""})["now"] = self.jobs[jid]["kind"]
+            return {"kinds": kinds, "nodes": nodes, "verified_rows": exportable, "total": len(self.jobs)}
+
+    def _results(self) -> tuple[dict[str, str], dict[str, dict]]:
+        """Generated texts by job id, and the last verifier verdict by the
+        generate job it checked."""
+        texts: dict[str, str] = {}
+        verdicts: dict[str, dict] = {}
+        try:
+            with open(self.results_path, "rb") as handle:
+                for raw in handle:
+                    try:
+                        row = json.loads(raw.decode("utf-8"))
+                    except ValueError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    output = row.get("output") if isinstance(row.get("output"), dict) else {}
+                    if row.get("kind") == "generate" and row.get("ok"):
+                        text = output.get("text")
+                        if isinstance(text, str):
+                            texts[str(row.get("id"))] = text
+                    elif row.get("kind") in VERIFY_KINDS and row.get("parent"):
+                        verdicts[str(row["parent"])] = {
+                            "ok": row.get("ok") is True,
+                            "passed": row.get("passed") if isinstance(row.get("passed"), bool) else None,
+                            "error": clip(output.get("error") or "", 300),
+                        }
+        except FileNotFoundError:
+            pass
+        return texts, verdicts
+
+    def export(self, name: str, per_prompt: int = 1) -> tuple[Path, int]:
+        """Write only verified generate rows, as chat training rows, into
+        the jobs folder. With rejection sampling, at most `per_prompt`
+        verified candidates of one prompt group are kept (0 keeps all);
+        identical answers are written once."""
+        base = Path(str(name)).name
+        if not base.endswith(".jsonl") or base in {"queue.jsonl", "results.jsonl"}:
+            raise JobError("Name the export file like verified.jsonl")
+        with self.lock:
+            self.sync()
+            texts, _ = self._results()
+            rows = []
+            kept: dict[str, list[str]] = {}
+            for jid in self.order:
+                job = self.jobs[jid]
+                if job["kind"] != "generate" or not job["verified"] or jid not in texts:
+                    continue
+                payload = job["payload"]
+                answer = strip_thinking(texts[jid])
+                group = kept.setdefault(str(payload.get("group") or jid), [])
+                if answer in group or (per_prompt > 0 and len(group) >= per_prompt):
+                    continue
+                group.append(answer)
+                rows.append(
+                    {
+                        "messages": payload["messages"] + [{"role": "assistant", "content": answer}],
+                        "skill": job_skill(payload),
+                        "verified_by": (payload.get("verify") or {}).get("kind", ""),
+                        "node": job["node"],
+                        "job": jid,
+                        **({"group": payload["group"]} if "group" in payload else {}),
+                        **({"meta": payload["meta"]} if "meta" in payload else {}),
+                    }
+                )
+        self.folder.mkdir(parents=True, exist_ok=True)
+        out = self.folder / base
+        _write_jsonl_atomic(out, rows)
+        return out, len(rows)
+
+    def export_pairs(self, target: str) -> tuple[Path, int]:
+        """Preference rows for DPO/KTO: for one prompt, a candidate the
+        verifier passed (chosen) against one it ran and failed (rejected).
+        A candidate whose verifier could not run (unavailable, timed out)
+        or never ran is neither. Candidates pair up once each. The file goes
+        where the user names it, but never into the live training folder."""
+        out = pairs_target(target, self.folder)
+        with self.lock:
+            self.sync()
+            texts, verdicts = self._results()
+            groups: dict[str, dict] = {}
+            for jid in self.order:
+                job = self.jobs[jid]
+                verdict = verdicts.get(jid)
+                if job["kind"] != "generate" or jid not in texts or not verdict or not verdict["ok"] or verdict["passed"] is None:
+                    continue
+                payload = job["payload"]
+                key = str(payload.get("group") or hashlib.sha256(
+                    json.dumps([payload["messages"], payload.get("verify")], sort_keys=True, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()[:16])
+                bucket = groups.setdefault(key, {"chosen": [], "rejected": []})
+                answer = strip_thinking(texts[jid])
+                side = bucket["chosen" if verdict["passed"] else "rejected"]
+                if answer and all(answer != seen for _, seen in bucket["chosen"] + bucket["rejected"]):
+                    side.append((jid, answer))
+            rows = []
+            for key, bucket in groups.items():
+                for (good, good_text), (bad, bad_text) in zip(bucket["chosen"], bucket["rejected"]):
+                    payload = self.jobs[good]["payload"]
+                    rows.append(
+                        {
+                            "prompt": payload["messages"],
+                            "chosen": [{"role": "assistant", "content": good_text}],
+                            "rejected": [{"role": "assistant", "content": bad_text}],
+                            "skill": job_skill(payload),
+                            "verified_by": (payload.get("verify") or {}).get("kind", ""),
+                            "rejected_error": verdicts[bad]["error"],
+                            "group": key,
+                            "chosen_job": good,
+                            "rejected_job": bad,
+                            **({"meta": payload["meta"]} if "meta" in payload else {}),
+                        }
+                    )
+        _write_jsonl_atomic(out, rows)
+        return out, len(rows)
+
+
+def _write_jsonl_atomic(out: Path, rows: list[dict]) -> None:
+    temp = out.with_name(out.name + ".tmp")
+    try:
+        with open(temp, "w", encoding="utf-8", newline="\n") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.replace(temp, out)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def job_skill(payload: dict) -> str:
+    """Training domain of a generate row (prepare.py reads `skill`)."""
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    if meta.get("skill") in SKILLS:
+        return str(meta["skill"])
+    kind = (payload.get("verify") or {}).get("kind", "")
+    if kind == "verify_luau":
+        return "luau"
+    if kind == "verify_math":
+        return "math"
+    return "code" if kind in CODE_KINDS else "general"
+
+
+def expand_samples(kind: str, raw: object) -> list[object]:
+    """A generate row with "samples": N becomes N jobs that share a group id
+    and differ by seed (and by a slightly warmer default temperature)."""
+    if kind != "generate" or not isinstance(raw, dict) or isinstance(raw.get("group"), str):
+        return [raw]
+    samples = int(_clamp(raw.get("samples"), 1, MAX_SAMPLES, 1))
+    if samples <= 1:
+        return [raw]
+    group = secrets.token_hex(8)
+    copies = []
+    for index in range(samples):
+        copy = dict(raw)
+        copy.update({"samples": samples, "group": group, "sample": index, "seed": secrets.randbelow(2 ** 31)})
+        if raw.get("temperature") is None:
+            copy["temperature"] = 0.8
+        copies.append(copy)
+    return copies
+
+
+def training_roots() -> list[Path]:
+    roots = [Path(r"D:\liliai\neuro-ai-data\training")]
+    env = os.environ.get("NEURO_AI_DATA", "").strip()
+    if env:
+        roots.append(Path(env) / "training")
+    return roots
+
+
+def pairs_target(name: str, jobs_folder: Path) -> Path:
+    """Where `jobs export --pairs` may write. A bare file name goes into the
+    jobs folder. Any path inside a training folder is refused, also through
+    a link, so preference rows can never land in the SFT data by accident."""
+    raw = str(name or "").strip()
+    if not raw:
+        raise JobError("Name the pairs file, like pairs.jsonl")
+    path = Path(raw)
+    if path.suffix.lower() != ".jsonl":
+        raise JobError("Name the pairs file like pairs.jsonl")
+    if not path.is_absolute() and len(path.parts) == 1:
+        jobs_folder.mkdir(parents=True, exist_ok=True)
+        path = jobs_folder / path
+    try:
+        resolved = path.resolve()
+        roots = [root.resolve() for root in training_roots()]
+        reserved = {(jobs_folder / item).resolve() for item in ("queue.jsonl", "results.jsonl")}
+    except (OSError, RuntimeError):
+        raise JobError("The pairs path could not be checked. Nothing was written.")
+    folded = os.path.normcase(str(resolved))
+    for root in roots:
+        top = os.path.normcase(str(root))
+        if folded == top or folded.startswith(top.rstrip("\\/") + os.sep):
+            raise JobError(f"Refused: {resolved} is inside the training folder {root}. Write pairs somewhere else.")
+    if resolved in reserved:
+        raise JobError("Refused: that is the job queue itself.")
+    if resolved.is_dir():
+        raise JobError("The pairs path is a folder. Name a .jsonl file.")
+    if not resolved.parent.is_dir():
+        raise JobError(f"The folder {resolved.parent} does not exist.")
+    return resolved
+
+
+_queue_lock = threading.Lock()
+_queue: JobQueue | None = None
+
+
+def job_queue() -> JobQueue:
+    global _queue
+    with _queue_lock:
+        if _queue is None:
+            _queue = JobQueue()
+        return _queue
+
+
+# -- worker-side handlers ----------------------------------------------------
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: D401 - urllib hook
+        return None
+
+
+# No proxy and no redirects: a job reply or a token can only go to the exact
+# address named here.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def local_llm_base() -> str:
+    raw = os.environ.get("NEURO_LOCAL_LLM", "").strip()
+    port = 8080
+    if raw.isdigit():
+        port = int(raw)
+    elif raw:
+        parsed = urlparse(raw if "://" in raw else "http://" + raw)
+        try:
+            if parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port:
+                port = parsed.port
+        except ValueError:
+            port = 8080
+    if not 1 <= port <= 65535:
+        port = 8080
+    return f"http://127.0.0.1:{port}"
+
+
+def local_model_ready() -> bool:
+    try:
+        with _DIRECT.open(local_llm_base() + "/v1/models", timeout=2) as response:
+            return response.status == 200 and isinstance(read_reply(response), dict)
+    except (OSError, urllib.error.URLError, ValueError):
+        return False
+
+
+def luau_path() -> str | None:
+    override = os.environ.get("NEURO_LUAU", "").strip()
+    if override:
+        try:
+            if Path(override).is_file():
+                return override
+        except OSError:
+            pass
+        found = shutil.which(override)
+        if found:
+            return found
+    return luau_binary()
+
+
+_kinds_cache: dict = {"at": 0.0, "kinds": []}
+_job_state: dict = {"on": False, "done": 0, "failed": 0, "paused": "", "current": ""}
+
+
+def worker_kinds() -> list[str]:
+    now = time.time()
+    if now - float(_kinds_cache["at"]) < 60:
+        return list(_kinds_cache["kinds"])
+    kinds = ["verify_python_syntax", "verify_html_css", "verify_math", "dedup_hash"]
+    if sqlite_ready():
+        kinds.insert(2, "verify_sql")
+    node = node_path()
+    if node:
+        kinds.insert(1, "verify_js")
+        if node_strips_types(node):
+            kinds.insert(2, "verify_ts")
+    if luau_path():
+        kinds.insert(0, "verify_luau")
+    if local_model_ready():
+        kinds.insert(0, "generate")
+    _kinds_cache.update({"at": now, "kinds": kinds})
+    return list(kinds)
+
+
+def job_generate(payload: dict) -> tuple[bool, dict]:
+    body = {
+        "messages": payload["messages"],
+        "max_tokens": min(int(payload.get("max_tokens") or 1024), GENERATE_MAX_TOKENS),
+        "temperature": payload.get("temperature", 0.7),
+        "top_p": payload.get("top_p", 0.95),
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    if isinstance(payload.get("seed"), int):
+        body["seed"] = payload["seed"]
+    request = urllib.request.Request(
+        local_llm_base() + "/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with _DIRECT.open(request, timeout=GENERATE_TIMEOUT) as response:
+        reply = read_reply(response)
+    choices = reply.get("choices") if isinstance(reply, dict) else None
+    first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = first.get("message") if isinstance(first.get("message"), dict) else {}
+    text = message.get("content")
+    if not isinstance(text, str) or not text.strip():
+        return False, {"error": "The local model returned no text."}
+    usage = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
+    return True, {
+        "text": text[:120000],
+        "finish_reason": clip(first.get("finish_reason"), 40),
+        "model": clip(reply.get("model"), 120),
+        "usage": {key: usage[key] for key in ("prompt_tokens", "completion_tokens") if isinstance(usage.get(key), int)},
+    }
+
+
+def _tail(path: Path, limit: int) -> str:
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - limit))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def job_verify_luau(payload: dict) -> tuple[bool, dict]:
+    binary = luau_path()
+    if not binary:
+        return False, {"error": "luau is not installed on this computer."}
+    folder = Path(tempfile.mkdtemp(prefix="neuro-luau-"))
+    try:
+        script = folder / "job.luau"
+        script.write_text(payload["code"], encoding="utf-8")
+        out_path, err_path = folder / "out.txt", folder / "err.txt"
+        reason = ""
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        with open(out_path, "wb") as out, open(err_path, "wb") as err:
+            process = subprocess.Popen(
+                [binary, str(script)],
+                cwd=str(folder),
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                creationflags=flags,
+            )
+            deadline = time.time() + LUAU_TIMEOUT
+            while process.poll() is None:
+                if time.time() > deadline:
+                    reason = f"timed out after {LUAU_TIMEOUT} s"
+                    break
+                try:
+                    if out_path.stat().st_size + err_path.stat().st_size > LUAU_OUTPUT_CAP:
+                        reason = "printed more than 1 MB"
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            if reason:
+                process.kill()
+            try:
+                process.wait(5)
+            except subprocess.TimeoutExpired:
+                pass
+        stdout = _tail(out_path, 4000)
+        stderr = _tail(err_path, 2000)
+        code = process.returncode if process.returncode is not None else -1
+        expected = payload.get("expect_stdout")
+        passed = not reason and code == 0 and (expected is None or stdout.strip() == str(expected).strip())
+        result = {"passed": passed, "returncode": int(code), "stdout_tail": stdout, "stderr_tail": stderr}
+        if reason:
+            result["error"] = reason
+        return True, result
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def job_verify_python_syntax(payload: dict) -> tuple[bool, dict]:
+    # compile() only builds a code object. It is never run.
+    try:
+        compile(payload["code"], "<job>", "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        return True, {"passed": False, "error": clip(f"{type(exc).__name__}: {exc.msg}", 300), "line": int(exc.lineno or 0)}
+    except (ValueError, RecursionError, MemoryError, OverflowError) as exc:
+        return True, {"passed": False, "error": clip(f"{type(exc).__name__}: {exc}", 300)}
+    return True, {"passed": True}
+
+
+# -- coding verifiers: parse only, never run the generated code --------------
+
+
+def node_path() -> str | None:
+    override = os.environ.get("NEURO_NODE", "").strip()
+    if override:
+        try:
+            if Path(override).is_file():
+                return override
+        except OSError:
+            pass
+        return shutil.which(override)
+    return shutil.which("node")
+
+
+def _node_env(folder: Path) -> dict:
+    """A scrubbed environment: no PATH, no NODE_OPTIONS / NODE_PATH, temp and
+    home inside the job folder."""
+    env = {"TEMP": str(folder), "TMP": str(folder), "TMPDIR": str(folder), "HOME": str(folder),
+           "USERPROFILE": str(folder), "NODE_NO_WARNINGS": "1"}
+    if os.name == "nt":
+        env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    return env
+
+
+def _run_fixed(argv: list[str], folder: Path, timeout: float, output_cap: int) -> dict:
+    """Run a fixed argument list (never a shell) with a time limit and an
+    output cap. Output goes to files in `folder`."""
+    out_path, err_path = folder / "out.txt", folder / "err.txt"
+    reason = ""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        process = subprocess.Popen(
+            argv, cwd=str(folder), stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+            env=_node_env(folder), shell=False, creationflags=flags,
+        )
+        deadline = time.time() + timeout
+        while process.poll() is None:
+            if time.time() > deadline:
+                reason = f"timed out after {timeout:g} s"
+                break
+            try:
+                if out_path.stat().st_size + err_path.stat().st_size > output_cap:
+                    reason = "printed too much"
+                    break
+            except OSError:
+                pass
+            time.sleep(0.02)
+        if reason:
+            process.kill()
+        try:
+            process.wait(5)
+        except subprocess.TimeoutExpired:
+            pass
+    code = process.returncode if process.returncode is not None else -1
+    stderr = _tail(err_path, 2000)
+    for spelled in {str(folder), str(folder).replace("\\", "/")}:
+        stderr = stderr.replace(spelled, "<job>")
+    return {"returncode": int(code), "stdout": _tail(out_path, 2000), "stderr": stderr, "error": reason}
+
+
+_node_probe: dict[str, bool] = {}
+
+
+def node_strips_types(binary: str) -> bool:
+    """True when this node has module.stripTypeScriptTypes (22.13+ / 23.2+).
+    The probe runs a fixed expression, never job code."""
+    if binary in _node_probe:
+        return _node_probe[binary]
+    folder = Path(tempfile.mkdtemp(prefix="neuro-node-"))
+    try:
+        ran = _run_fixed([binary, "-p", "typeof require('node:module').stripTypeScriptTypes"], folder, NODE_TIMEOUT, 4096)
+        found = not ran["error"] and ran["returncode"] == 0 and ran["stdout"].strip() == "function"
+    except OSError:
+        found = False
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    _node_probe[binary] = found
+    return found
+
+
+def _node_check(binary: str, script: Path, folder: Path, label: str) -> tuple[bool | None, str]:
+    """node --check on one file. (True, "") parsed; (False, why) a syntax
+    error in the code; (None, why) node itself could not give a verdict."""
+    ran = _run_fixed([binary, "--check", str(script)], folder, NODE_TIMEOUT, NODE_OUTPUT_CAP)
+    if ran["error"]:
+        return None, ran["error"]
+    if ran["returncode"] == 0:
+        return True, ""
+    if "SyntaxError" in ran["stderr"]:
+        return False, label + ": " + clip(ran["stderr"].strip(), 1500)
+    if ran["returncode"] == 9:
+        return None, "unavailable: this node does not accept --check"
+    return None, clip(f"node exited {ran['returncode']}: {ran['stderr'].strip()}", 400)
+
+
+# Fixed helper for verify_ts. It reads one .ts file and writes the same code
+# with the types blanked out; it never evaluates the input.
+TS_STRIP_HELPER = r"""'use strict';
+const fs = require('node:fs');
+const mod = require('node:module');
+if (typeof mod.stripTypeScriptTypes !== 'function') process.exit(3);
+let out;
+try {
+  out = mod.stripTypeScriptTypes(fs.readFileSync(process.argv[2], 'utf8'));
+} catch (e) {
+  process.stderr.write(String((e && e.message) || e).slice(0, 1500));
+  process.exit(e && e.code === 'ERR_INVALID_TYPESCRIPT_SYNTAX' ? 2 : e && e.code === 'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX' ? 4 : 5);
+}
+fs.writeFileSync(process.argv[3], out);
+"""
+
+
+def _verify_node_blocks(payload: dict, typescript: bool) -> tuple[bool, dict]:
+    name = "TypeScript" if typescript else "JavaScript"
+    blocks = [block for block in payload.get("blocks") or [] if block.strip()]
+    if not blocks:
+        return True, {"passed": False, "error": f"no {name} code found"}
+    binary = node_path()
+    if not binary:
+        return False, {"error": "unavailable: node is not installed on this computer"}
+    if typescript and not node_strips_types(binary):
+        return False, {"error": "unavailable: this node has no TypeScript parser (needs 22.13+ or 23.2+)"}
+    folder = Path(tempfile.mkdtemp(prefix="neuro-ts-" if typescript else "neuro-js-"))
+    try:
+        # An empty package.json stops node from reading one in a parent
+        # folder; .js files then get node's CommonJS/ES module detection.
+        (folder / "package.json").write_text("{}\n", encoding="utf-8")
+        if typescript:
+            (folder / "strip.cjs").write_text(TS_STRIP_HELPER, encoding="utf-8")
+        for index, code in enumerate(blocks):
+            label = f"block {index + 1}"
+            script = folder / f"block{index}.js"
+            if typescript:
+                source = folder / f"block{index}.ts"
+                source.write_text(code, encoding="utf-8")
+                ran = _run_fixed([binary, str(folder / "strip.cjs"), str(source), str(script)], folder, NODE_TIMEOUT, NODE_OUTPUT_CAP)
+                if ran["error"]:
+                    return False, {"error": ran["error"]}
+                if ran["returncode"] == 2:
+                    return True, {"passed": False, "error": label + ": " + clip(ran["stderr"].strip(), 1500)}
+                if ran["returncode"] == 3:
+                    return False, {"error": "unavailable: this node has no TypeScript parser"}
+                if ran["returncode"] == 4:
+                    # enum / namespace / parameter properties: valid TypeScript
+                    # that node's strip-only parser cannot erase. No verdict.
+                    return False, {"error": "inconclusive: " + clip(ran["stderr"].strip(), 300)}
+                if ran["returncode"] != 0:
+                    return False, {"error": clip(f"TypeScript parser exited {ran['returncode']}: {ran['stderr'].strip()}", 400)}
+            else:
+                script.write_text(code, encoding="utf-8")
+            verdict, why = _node_check(binary, script, folder, label)
+            if verdict is None:
+                return False, {"error": why}
+            if verdict is False:
+                return True, {"passed": False, "error": why}
+        return True, {"passed": True, "detail": f"{len(blocks)} block(s) parsed"}
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def job_verify_js(payload: dict) -> tuple[bool, dict]:
+    return _verify_node_blocks(payload, typescript=False)
+
+
+def job_verify_ts(payload: dict) -> tuple[bool, dict]:
+    return _verify_node_blocks(payload, typescript=True)
+
+
+VOID_TAGS = frozenset(
+    "area base br col embed hr img input link meta param source track wbr keygen command basefont frame isindex".split()
+)
+# Elements whose end tag HTML lets you leave out.
+OPTIONAL_END_TAGS = frozenset(
+    "html head body p li dt dd option optgroup tr td th thead tbody tfoot colgroup caption rb rt rtc rp".split()
+)
+
+
+class _HtmlCheck(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: list[tuple[str, int]] = []
+        self.seen: set[str] = set()
+        self.styles: list[str] = []
+        self.problem = ""
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        self.seen.add(tag)
+        if tag not in VOID_TAGS:
+            self.stack.append((tag, self.getpos()[0]))
+
+    def handle_startendtag(self, tag: str, attrs: list) -> None:
+        self.seen.add(tag)  # <x/>: nothing left open (void or SVG/MathML)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.problem or tag in VOID_TAGS:
+            return
+        line = self.getpos()[0]
+        for depth in range(len(self.stack) - 1, -1, -1):
+            if self.stack[depth][0] == tag:
+                open_inside = [(name, at) for name, at in self.stack[depth + 1:] if name not in OPTIONAL_END_TAGS]
+                if open_inside:
+                    name, at = open_inside[-1]
+                    self.problem = f"</{tag}> on line {line} closes <{tag}> while <{name}> from line {at} is still open"
+                del self.stack[depth:]
+                return
+        self.problem = f"</{tag}> on line {line} has no open <{tag}>"
+
+    def handle_data(self, data: str) -> None:
+        if self.stack and self.stack[-1][0] == "style":
+            self.styles.append(data)
+
+
+def css_problem(css: str) -> str:
+    """Structure of a style sheet: comments and strings end, braces and
+    parentheses balance, and there is at least one rule. "" when fine."""
+    depth = parens = 0
+    rules = 0
+    index, size = 0, len(css)
+    while index < size:
+        char = css[index]
+        if css.startswith("/*", index):
+            end = css.find("*/", index + 2)
+            if end < 0:
+                return "a /* comment is never closed"
+            index = end + 2
+            continue
+        if char in "\"'":
+            index += 1
+            while index < size and css[index] != char:
+                if css[index] == "\\":
+                    index += 1
+                elif css[index] == "\n":
+                    return "a string runs past the end of its line"
+                index += 1
+            if index >= size:
+                return "a string is never closed"
+        elif char == "{":
+            depth += 1
+            rules += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                return "a } has no matching {"
+        elif char == "(":
+            parens += 1
+        elif char == ")":
+            parens -= 1
+            if parens < 0:
+                return "a ) has no matching ("
+        index += 1
+    if depth:
+        return f"{depth} {{ never closed"
+    if parens:
+        return "a ( is never closed"
+    if not rules:
+        return "no CSS rule found"
+    return ""
+
+
+def job_verify_html_css(payload: dict) -> tuple[bool, dict]:
+    """Structure only (html.parser plus a CSS scanner). Nothing is rendered,
+    fetched or run."""
+    html, css = payload.get("html") or "", payload.get("css") or ""
+    if not html.strip() and not css.strip():
+        return True, {"passed": False, "error": "no HTML or CSS code found"}
+    sheets = [css] if css.strip() else []
+    seen: set[str] = set()
+    if html.strip():
+        parser = _HtmlCheck()
+        try:
+            parser.feed(html)
+            raw_text = str(getattr(parser, "rawdata", "") or "")
+            cdata = getattr(parser, "cdata_elem", None)
+            parser.close()
+        except Exception as exc:  # html.parser may raise on hostile markup
+            return True, {"passed": False, "error": clip(f"HTML parser: {type(exc).__name__}: {exc}", 300)}
+        if parser.problem:
+            return True, {"passed": False, "error": parser.problem}
+        unclosed_raw = [(name, at) for name, at in parser.stack if name in ("script", "style")]
+        if cdata or unclosed_raw:
+            name, at = unclosed_raw[0] if unclosed_raw else (str(cdata), 0)
+            return True, {"passed": False, "error": f"<{name}> from line {at} is never closed"}
+        if raw_text.lstrip().startswith("<"):
+            return True, {"passed": False, "error": "the HTML ends inside an unfinished tag or comment"}
+        still_open = [(name, at) for name, at in parser.stack if name not in OPTIONAL_END_TAGS]
+        if still_open:
+            name, at = still_open[-1]
+            return True, {"passed": False, "error": f"<{name}> from line {at} is never closed"}
+        if not parser.seen:
+            return True, {"passed": False, "error": "no HTML tags found"}
+        seen = parser.seen
+        sheets.extend(style for style in parser.styles if style.strip())
+    for number, sheet in enumerate(sheets, 1):
+        problem = css_problem(sheet)
+        if problem:
+            return True, {"passed": False, "error": f"CSS {number}: {problem}"}
+    missing = [tag for tag in payload.get("require_tags") or [] if tag not in seen]
+    if missing:
+        return True, {"passed": False, "error": "missing tags: " + ", ".join(missing)}
+    return True, {"passed": True, "detail": f"{len(seen)} tag names, {len(sheets)} style sheet(s)"}
+
+
+def sqlite_ready() -> bool:
+    try:
+        import sqlite3  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+# Statement heads verify_sql accepts. ATTACH, DETACH, PRAGMA, VACUUM (INTO
+# writes a file), ANALYZE, REINDEX and EXPLAIN itself are refused.
+SQL_HEADS = frozenset("select with values insert replace update delete create drop alter begin commit end rollback savepoint release".split())
+SQL_DDL = frozenset(("create", "drop", "alter"))
+SQL_MAX_STATEMENTS = 200
+_SQL_NAME = r'(?:"[^"]*"|`[^`]*`|\[[^\]]*\]|[\w$]+)'
+_SQL_CTAS = re.compile(r"^\s*create\s+(?:temp\s+|temporary\s+)?table\s+(?:if\s+not\s+exists\s+)?" + _SQL_NAME + r"(?:\s*\.\s*" + _SQL_NAME + r")?\s+as\b", re.I)
+_SQL_BLOCKED_FUNCTIONS = frozenset(("load_extension", "fts3_tokenizer", "readfile", "writefile", "edit"))
+
+
+def _sql_strip_comments(sql: str) -> str:
+    out, index, size = [], 0, len(sql)
+    while index < size:
+        if sql.startswith("--", index):
+            end = sql.find("\n", index)
+            index = size if end < 0 else end + 1
+            out.append(" ")
+        elif sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            index = size if end < 0 else end + 2
+            out.append(" ")
+        elif sql[index] in "'\"`[":
+            close = "]" if sql[index] == "[" else sql[index]
+            end = sql.find(close, index + 1)
+            end = size - 1 if end < 0 else end
+            out.append(sql[index:end + 1])
+            index = end + 1
+        else:
+            out.append(sql[index])
+            index += 1
+    return "".join(out)
+
+
+def sql_statements(code: str) -> tuple[list[str], str]:
+    """Split SQL into complete statements with sqlite3.complete_statement
+    (it knows strings, comments and trigger bodies). Returns (statements,
+    problem); problem is "" or why the text does not split cleanly."""
+    import sqlite3
+
+    statements: list[str] = []
+    buffer = ""
+    pieces = code.split(";")
+    for number, piece in enumerate(pieces):
+        buffer += piece + (";" if number < len(pieces) - 1 else "")
+        if number < len(pieces) - 1 and sqlite3.complete_statement(buffer):
+            if _sql_strip_comments(buffer).strip(" \t\r\n;"):
+                statements.append(buffer.strip())
+            buffer = ""
+    if _sql_strip_comments(buffer).strip(" \t\r\n;"):
+        if sqlite3.complete_statement(buffer + "\n;"):
+            statements.append(buffer.strip() + "\n;")
+        else:
+            return statements, "the SQL ends inside an unfinished statement, string or comment"
+    return statements, ""
+
+
+def job_verify_sql(payload: dict) -> tuple[bool, dict]:
+    """Parse and name-check SQL against SQLite without running queries.
+    DDL (CREATE / DROP / ALTER) builds a throwaway in-memory catalog so later
+    statements can resolve table and column names; every other statement is
+    only compiled with EXPLAIN, which lists the program and never steps it.
+    Write the prompt for SQLite: other dialects can fail here."""
+    try:
+        import sqlite3
+    except ImportError:
+        return False, {"error": "unavailable: this Python has no sqlite3"}
+    statements, problem = sql_statements(payload.get("code") or "")
+    if problem:
+        return True, {"passed": False, "error": problem}
+    if not statements:
+        return True, {"passed": False, "error": "no SQL statement found"}
+    if len(statements) > SQL_MAX_STATEMENTS:
+        return True, {"passed": False, "error": f"more than {SQL_MAX_STATEMENTS} statements"}
+
+    def authorize(action, arg1, arg2, dbname, source):
+        if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_PRAGMA):
+            return sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_FUNCTION and str(arg2 or "").lower() in _SQL_BLOCKED_FUNCTIONS:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    steps = {"n": 0}
+
+    def budget():
+        steps["n"] += 1
+        return 1 if steps["n"] > 2000 else 0  # abort after ~2M VM steps
+
+    db = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        db.set_authorizer(authorize)
+        db.set_progress_handler(budget, 1000)
+        if payload.get("schema"):
+            schema, schema_problem = sql_statements(payload["schema"])
+            if schema_problem:
+                return False, {"error": "the job's schema does not parse: " + schema_problem}
+            for statement in schema:
+                head = (re.match(r"\s*([A-Za-z]+)", _sql_strip_comments(statement)) or [None, ""])[1].lower()
+                if head in SQL_DDL:
+                    try:
+                        db.execute(statement)
+                    except sqlite3.Error as exc:
+                        return False, {"error": clip(f"the job's schema failed: {exc}", 300)}
+        for number, statement in enumerate(statements, 1):
+            plain = _sql_strip_comments(statement)
+            found = re.match(r"\s*([A-Za-z]+)", plain)
+            head = found.group(1).lower() if found else ""
+            if head not in SQL_HEADS:
+                return True, {"passed": False, "error": f"statement {number}: {head.upper() or 'this'} is not allowed here"}
+            try:
+                if head in SQL_DDL and not _SQL_CTAS.match(plain):
+                    db.execute(statement)
+                else:
+                    db.execute("EXPLAIN " + statement).fetchall()
+            except sqlite3.Warning as exc:
+                return True, {"passed": False, "error": clip(f"statement {number}: {exc}", 300)}
+            except sqlite3.Error as exc:
+                return True, {"passed": False, "error": clip(f"statement {number}: {type(exc).__name__}: {exc}", 300)}
+    finally:
+        db.close()
+    return True, {"passed": True, "detail": f"{len(statements)} statement(s) compiled"}
+
+
+def _boxed(text: str) -> str | None:
+    start = text.rfind("\\boxed{")
+    if start < 0:
+        return None
+    depth = 0
+    for index in range(start + len("\\boxed{") - 1, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + len("\\boxed{"):index]
+    return None
+
+
+def final_answer(text: str) -> str:
+    text = strip_thinking(text)
+    boxed = _boxed(text)
+    if boxed is not None:
+        return boxed.strip()
+    marked = re.findall(r"(?:final answer|answer)\s*(?:is)?\s*[:=]?\s*\$?([^\n$]+)", text, flags=re.IGNORECASE)
+    if marked:
+        return marked[-1].strip().rstrip(".")
+    numbers = re.findall(r"-?\d[\d,]*(?:\.\d+)?(?:/\d+)?", text)
+    return numbers[-1] if numbers else text.strip()[-200:]
+
+
+def parse_number(text: str) -> Fraction | None:
+    value = str(text).strip().strip("$").strip()
+    value = re.sub(r"\\text\{[^}]*\}", "", value)
+    value = re.sub(r"\\[dt]?frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1)/(\2)", value)
+    value = value.replace("\\left", "").replace("\\right", "").replace("\\,", "").replace("\\!", "").replace("\\%", "%")
+    value = value.replace(" ", "").replace(",", "").rstrip(".").rstrip("%")
+    if not value or len(value) > 100 or re.search(r"[eE][+-]?\d{4,}", value):
+        return None
+    match = re.fullmatch(r"\(?(-?[0-9.]+(?:[eE][+-]?\d+)?)\)?(?:/\(?(-?[0-9.]+)\)?)?", value)
+    if not match:
+        return None
+    try:
+        number = Fraction(match.group(1))
+        if match.group(2) is not None:
+            number /= Fraction(match.group(2))
+    except (ValueError, ZeroDivisionError):
+        return None
+    return number
+
+
+def job_verify_math(payload: dict) -> tuple[bool, dict]:
+    found = final_answer(payload["answer"])
+    expected = str(payload["expected"])
+    tol = float(payload.get("tol", 1e-6))
+    got_number, want_number = parse_number(found), parse_number(expected)
+    if got_number is not None and want_number is not None:
+        passed = abs(got_number - want_number) <= Fraction(tol) * max(Fraction(1), abs(want_number))
+    else:
+        squash = lambda value: re.sub(r"[\s$]|\\text\{|\}", "", str(value)).lower()  # noqa: E731
+        passed = bool(squash(found)) and squash(found) == squash(expected)
+    return True, {"passed": bool(passed), "found": clip(found, 200)}
+
+
+def normalize_text(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).lower().split())
+
+
+def _minhash_params() -> list[tuple[int, int]]:
+    # Fixed for every computer, so signatures from different workers compare.
+    prime = (1 << 61) - 1
+    params = []
+    for index in range(MINHASH_PERM):
+        digest = hashlib.sha256(f"neuro-minhash-{index}".encode()).digest()
+        params.append((int.from_bytes(digest[:8], "big") % (prime - 1) + 1, int.from_bytes(digest[8:16], "big") % prime))
+    return params
+
+
+_MINHASH = _minhash_params()
+
+
+def minhash(text: str) -> list[int]:
+    prime = (1 << 61) - 1
+    words = normalize_text(text).split()
+    grams = {" ".join(words[i:i + 3]) for i in range(max(1, len(words) - 2))} if words else {""}
+    hashed = [int.from_bytes(hashlib.blake2b(gram.encode("utf-8"), digest_size=8).digest(), "big") for gram in grams]
+    return [min((a * value + b) % prime for value in hashed) for a, b in _MINHASH]
+
+
+def job_dedup_hash(payload: dict) -> tuple[bool, dict]:
+    rows = [
+        {"sha256": hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest(), "minhash": minhash(text)}
+        for text in payload["texts"]
+    ]
+    return True, {"hashes": rows, "num_perm": MINHASH_PERM}
+
+
+JOB_HANDLERS = {
+    "generate": job_generate,
+    "verify_luau": job_verify_luau,
+    "verify_python_syntax": job_verify_python_syntax,
+    "verify_js": job_verify_js,
+    "verify_ts": job_verify_ts,
+    "verify_html_css": job_verify_html_css,
+    "verify_sql": job_verify_sql,
+    "verify_math": job_verify_math,
+    "dedup_hash": job_dedup_hash,
+}
+
+
+def run_job(job: dict) -> tuple[bool, dict]:
+    """Run one leased job with its built-in handler. The payload is checked
+    again here, so a bad queue cannot push past the size caps."""
+    kind = str(job.get("kind") or "")
+    try:
+        payload = validate_job(kind, job.get("payload"))
+        return JOB_HANDLERS[kind](payload)
+    except JobError as exc:
+        return False, {"error": clip(str(exc), 300)}
+    except (OSError, urllib.error.URLError, ValueError, KeyError, TypeError) as exc:
+        return False, {"error": clip(f"{type(exc).__name__}: {exc}", 300)}
+
+
+class JobAuthError(Exception):
+    pass
+
+
+def mesh_url() -> str:
+    raw = os.environ.get("NEURO_MESH_URL", "").strip() or "http://192.168.7.14:8780"
+    try:
+        url = clean_url(raw)
+    except ValueError:
+        return ""
+    host = urlparse(url).hostname or ""
+    return url if private_lan(host) or host == "127.0.0.1" else ""
+
+
+def machine_busy() -> str:
+    pct = cpu_busy_pct()
+    if pct is not None and pct >= 75:
+        return "CPU busy"
+    if int(ram_mib().get("free_mib") or 0) < 1024:
+        return "low memory"
+    if os.name == "nt" and lock_held(GPU_LOCK):
+        return "training holds the GPU"
+    return ""
+
+
+def _mesh_post(base: str, path: str, body: dict, timeout: float) -> tuple[int, object]:
+    request = urllib.request.Request(
+        base + path,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"},
+    )
+    try:
+        with _DIRECT.open(request, timeout=timeout) as response:
+            if response.status == 204:
+                return 204, None
+            return response.status, read_reply(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise JobAuthError() from None
+        return exc.code, None
+
+
+def job_loop() -> None:
+    _job_state["on"] = True
+    base = mesh_url()
+    if not base:
+        _job_state.update({"on": False, "paused": "NEURO_MESH_URL is not a LAN address"})
+        print("Jobs are off: NEURO_MESH_URL is not a LAN address.", flush=True)
+        return
+    node = socket.gethostname()
+    time.sleep(20)
+    while True:
+        wait = 15.0
+        try:
+            busy = machine_busy()
+            kinds = worker_kinds()
+            _job_state["paused"] = busy
+            if kinds and not busy:
+                code, job = _mesh_post(base, "/jobs/next", {"node": node, "kinds": kinds}, 10)
+                if code == 200 and isinstance(job, dict) and job.get("kind") in kinds and job.get("id") and job.get("lease"):
+                    _job_state["current"] = str(job["kind"])
+                    ok, output = run_job(job)
+                    if len(json.dumps(output, ensure_ascii=False)) > JOB_OUTPUT_LIMIT:
+                        ok, output = False, {"error": "output is too large"}
+                    result = {"id": job["id"], "lease": job["lease"], "node": node, "ok": ok, "output": output}
+                    for attempt in range(3):
+                        try:
+                            _mesh_post(base, "/jobs/result", result, 30)
+                            break
+                        except (OSError, urllib.error.URLError, ValueError):
+                            time.sleep(5 * (attempt + 1))
+                    _job_state["done" if ok else "failed"] = int(_job_state.get("done" if ok else "failed") or 0) + 1
+                    _job_state["current"] = ""
+                    wait = 1.0
+        except JobAuthError:
+            # Never print the token. Only say that it does not match.
+            if _job_state.get("paused") != "token":
+                print("Jobs paused: this computer's cluster.token is not the main PC's token.", flush=True)
+            _job_state["paused"] = "token"
+            wait = 600.0
+        except (OSError, urllib.error.URLError, ValueError):
+            wait = 30.0
+        except Exception as exc:
+            print(f"job loop: {type(exc).__name__}", flush=True)
+            wait = 60.0
+        finally:
+            _job_state["current"] = ""
+        time.sleep(wait)
+
+
+def jobs_main(args: list[str]) -> None:
+    usage = (
+        "use: mesh.py jobs add <kind|generate-verify> <file.jsonl> | mesh.py jobs status"
+        " | mesh.py jobs export [--per-prompt N] <name.jsonl> | mesh.py jobs export --pairs <path.jsonl>"
+    )
+    if not args:
+        raise SystemExit(usage)
+    queue = JobQueue()
+    command = args[0]
+    if command == "add" and len(args) == 3:
+        kind = args[1]
+        need_verify = kind == "generate-verify"
+        if need_verify:
+            kind = "generate"
+        if kind not in JOB_KINDS:
+            raise SystemExit("Unknown kind. Use generate-verify or one of " + ", ".join(JOB_KINDS))
+        rows: list[tuple[str, dict]] = []
+        errors: list[str] = []
+        planned = 0
+        try:
+            handle = open(args[2], "r", encoding="utf-8-sig")
+        except OSError as exc:
+            raise SystemExit(f"Cannot read {args[2]}: {exc.strerror}")
+        with handle:
+            for number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                if planned >= 100000:
+                    errors.append(f"line {number}: stopped at 100000 jobs")
+                    break
+                try:
+                    raw = json.loads(line)
+                    if need_verify and not (isinstance(raw, dict) and isinstance(raw.get("verify"), dict)):
+                        raise JobError("generate-verify rows need a verify object")
+                    validate_job(kind, raw)
+                    rows.append((kind, raw))
+                    planned += len(expand_samples(kind, raw))
+                except ValueError as exc:
+                    errors.append(f"line {number}: {exc}")
+        needed = {kind for kind, _ in rows} | {raw["verify"].get("kind") for _, raw in rows if isinstance(raw.get("verify"), dict)}
+        known = serve_job_kinds()
+        if known is not None and not needed <= known:
+            missing = ", ".join(sorted(str(item) for item in needed - known))
+            raise SystemExit(
+                f"mesh.py serve is running an older mesh.py that does not know {missing}. "
+                "Restart serve first, then add these jobs. Nothing was queued."
+            )
+        added = 0
+        for start in range(0, len(rows), 500):
+            added += len(queue.add_many(rows[start:start + 500]))
+        print(f"Queued {added} {args[1]} jobs. Skipped {len(errors)} rows.", flush=True)
+        for error in errors[:10]:
+            print("  " + error, flush=True)
+        return
+    if command == "status" and len(args) == 1:
+        summary = None
+        try:
+            with _DIRECT.open(f"http://127.0.0.1:{DASHBOARD_PORT}/api/jobs", timeout=3) as response:
+                summary = read_reply(response)
+            source = "live from mesh.py serve"
+        except (OSError, urllib.error.URLError, ValueError):
+            summary = None
+        if not isinstance(summary, dict):
+            summary = queue.summary()
+            source = "from jobs/queue.jsonl (serve is not answering, so leases are not shown)"
+        print(f"Jobs {source}")
+        print(f"{'kind':<22}{'queued':>8}{'leased':>8}{'done':>8}{'failed':>8}{'passed':>8}")
+        for kind, row in (summary.get("kinds") or {}).items():
+            print(f"{kind:<22}{row.get('queued', 0):>8}{row.get('leased', 0):>8}{row.get('done', 0):>8}{row.get('failed', 0):>8}{row.get('passed', 0):>8}")
+        for name, row in (summary.get("nodes") or {}).items():
+            print(f"  {name}: done {row.get('done', 0)}, failed {row.get('failed', 0)}" + (f", running {row['now']}" if row.get("now") else ""))
+        print(f"Verified rows ready to export: {summary.get('verified_rows', 0)}")
+        return
+    if command == "export" and len(args) == 3 and args[1] == "--pairs":
+        try:
+            out, count = queue.export_pairs(args[2])
+        except JobError as exc:
+            raise SystemExit(str(exc))
+        print(f"Wrote {count} chosen/rejected pairs to {out}", flush=True)
+        return
+    if command == "export" and len(args) in (2, 4):
+        per_prompt = 1
+        if len(args) == 4:
+            if args[1] != "--per-prompt" or not args[2].isdigit():
+                raise SystemExit(usage)
+            per_prompt = int(args[2])
+        try:
+            out, count = queue.export(args[-1], per_prompt)
+        except JobError as exc:
+            raise SystemExit(str(exc))
+        print(f"Wrote {count} verified rows to {out}", flush=True)
+        return
+    raise SystemExit(usage)
+
+
+def serve_job_kinds() -> set[str] | None:
+    """Job kinds the running `mesh.py serve` on this PC knows, or None when
+    it does not answer. An older serve silently drops jobs of kinds it does
+    not know, so `jobs add` checks first."""
+    try:
+        with _DIRECT.open(f"http://127.0.0.1:{DASHBOARD_PORT}/api/jobs", timeout=3) as response:
+            summary = read_reply(response)
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+    kinds = summary.get("kinds") if isinstance(summary, dict) else None
+    return {str(kind) for kind in kinds} if isinstance(kinds, dict) else None
+
+
 class Handler(BaseHTTPRequestHandler):
     mode = "serve"
 
     def log_message(self, fmt: str, *args) -> None:
         return
 
-    def handle_error(self, request, client_address) -> None:
-        err = sys.exc_info()[1]
-        print(f"request failed: {err}", flush=True)
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        # Both ports listen on 0.0.0.0, so they are also reachable on the VPN
+        # (26.x) and host-only (192.168.56.x) adapters. Only loopback and the
+        # private home LAN get an answer.
+        if not lan_client(self.client_address[0]):
+            self.send_json(403, {"error": "LAN only"})
+            return False
+        if self.mode == "serve" and not browser_host_ok(self.headers.get("Host", "")):
+            self.send_json(403, {"error": "Open this page by its LAN address."})
+            return False
+        if self.command in {"POST", "DELETE", "PUT", "PATCH"} and not origin_ok(self.headers.get("Origin"), self.headers.get("Host")):
+            # Another web site open in a browser on the LAN cannot press Stop.
+            self.send_json(403, {"error": "Requests must come from this page."})
+            return False
+        return True
 
     def send_json(self, code: int, payload: dict) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(raw)
+
+    def send_empty(self, code: int = 204) -> None:
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def read_json(self, limit: int = 10000) -> dict:
         try:
@@ -1321,16 +3679,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
+            # The page has Stop buttons; it must not be framed by another site.
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(raw)
             return
         if path == "/api/mesh":
-            self.send_json(200, mesh_snapshot())
+            try:
+                snapshot_body = mesh_snapshot()
+            except Exception as exc:  # the page must get an answer, not a dropped socket
+                print(f"mesh snapshot failed: {type(exc).__name__}: {exc}", flush=True)
+                self.send_json(500, {"error": "The status could not be read. The page keeps the last one."})
+                return
+            self.send_json(200, snapshot_body)
+            return
+        if path == "/api/jobs":
+            self.send_json(200, job_queue().summary())
             return
         if path == "/api/agents":
-            from agents import snapshot
+            try:
+                from agents import snapshot
 
-            self.send_json(200, snapshot())
+                body = snapshot()
+            except Exception as exc:
+                print(f"agents snapshot failed: {type(exc).__name__}: {exc}", flush=True)
+                self.send_json(500, {"error": "agents unavailable", "workers": []})
+                return
+            self.send_json(200, body)
             return
         if path == "/api/token":
             self.send_json(404, {"error": "not found"})
@@ -1361,12 +3738,17 @@ class Handler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     rounds = 3
                 rounds = max(1, min(rounds, 5))
-                from agents import drill_round
-
                 passed = 0
-                for index in range(1, rounds + 1):
-                    row = drill_round(index)
-                    passed += 1 if row.get("ok") else 0
+                try:
+                    from agents import drill_round
+
+                    for index in range(1, rounds + 1):
+                        row = drill_round(index)
+                        passed += 1 if isinstance(row, dict) and row.get("ok") else 0
+                except Exception as exc:
+                    print(f"agent check failed: {type(exc).__name__}: {exc}", flush=True)
+                    self.send_json(500, {"ok": False, "error": "The agent check could not run on this computer.", "host": socket.gethostname()})
+                    return
                 self.send_json(200, {"ok": passed == rounds, "passed": passed, "rounds": rounds, "host": socket.gethostname()})
                 return
             if path == "/process/stop":
@@ -1387,10 +3769,34 @@ class Handler(BaseHTTPRequestHandler):
                 except RuntimeError as exc:
                     self.send_json(409, {"error": str(exc)})
                     return
+                except OSError:
+                    self.send_json(409, {"error": "ggml-rpc-server could not be started on this machine."})
+                    return
             if not authorized(self.headers.get("Authorization")):
                 self.send_json(401, {"error": "token"})
                 return
             self.send_json(404, {"error": "not found"})
+            return
+        if path in {"/jobs/next", "/jobs/result"}:
+            # Workers pull data-factory jobs. Bearer token required; a job is
+            # data for a built-in handler, never a command.
+            if not authorized(self.headers.get("Authorization")):
+                self.send_json(401, {"error": "token"})
+                return
+            body = self.read_json(JOB_RESULT_LIMIT)
+            if not body:
+                self.send_json(400, {"error": "Send a JSON object."})
+                return
+            queue = job_queue()
+            if path == "/jobs/next":
+                job = queue.lease(str(body.get("node") or ""), body.get("kinds"))
+                if job is None:
+                    self.send_empty(204)
+                    return
+                self.send_json(200, job)
+                return
+            accepted, note = queue.finish(body)
+            self.send_json(200 if accepted else 409, {"accepted": accepted, "note": note})
             return
         try:
             if path == "/api/agents/jobs":
@@ -1425,7 +3831,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(
                     409,
                     {
-                        "error": "Training is already running from the saved checkpoint. No dataset file was changed." if view.get("running") else "Training did not start because the loaded model is using the GPU. No dataset file was changed. " + str(len(view.get("datasets") or [])) + " dataset files are listed on this page.",
+                        "error": "Training is already running from the saved checkpoint. No dataset file was changed." if view.get("running") else "Training did not start. This page cannot read the training log, so it does not start a second run. No dataset file was changed." if view.get("running") is None else "Training did not start because the loaded model is using the GPU. No dataset file was changed. " + str(len(view.get("datasets") or [])) + " dataset files are listed on this page.",
                         "datasets": view.get("datasets") or [],
                     },
                 )
@@ -1464,10 +3870,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/nodes":
                 url = clean_url(str(self.read_json().get("url", "")))
-                nodes = read_nodes()
-                if not any(item["url"] == url for item in nodes):
-                    nodes.append({"url": url})
-                    write_nodes(nodes)
+                if not private_lan(urlparse(url).hostname or ""):
+                    raise ValueError("Only a computer on the home LAN can be added.")
+                add_node(url)
                 self.send_json(200, mesh_snapshot())
                 return
             if path == "/api/local/rpc/start":
@@ -1495,8 +3900,8 @@ class Handler(BaseHTTPRequestHandler):
                         "Content-Type": "application/json",
                     },
                 )
-                with urllib.request.urlopen(request, timeout=5) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
+                with open_limited(request, 5) as response:
+                    payload = read_reply(response)
                 self.send_json(200, payload if isinstance(payload, dict) else {"ok": True})
                 return
         except RuntimeError as exc:
@@ -1516,26 +3921,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         query = parse_qs(urlparse(self.path).query)
         name = (query.get("name") or [""])[0].strip()
-        if name:
-            write_specs([spec for spec in read_specs() if spec.get("name") != name])
-            self.send_json(200, mesh_snapshot())
-            return
-        system = (query.get("os") or [""])[0]
-        if system in {"mac", "linux"}:
-            specs = read_specs()
-            gone = {spec.get("url") for spec in specs if spec.get("os") == system and spec.get("url")}
-            write_specs([spec for spec in specs if spec.get("os") != system])
-            if gone:
-                write_nodes([item for item in read_nodes() if item.get("url") not in gone])
-            self.send_json(200, mesh_snapshot())
-            return
-        url = (query.get("url") or [""])[0]
         try:
-            url = clean_url(url)
+            with _files_lock:
+                if name:
+                    write_specs([spec for spec in read_specs(strict=True) if spec.get("name") != name])
+                else:
+                    system = (query.get("os") or [""])[0]
+                    if system in {"mac", "linux"}:
+                        specs = read_specs(strict=True)
+                        gone = {spec.get("url") for spec in specs if spec.get("os") == system and spec.get("url")}
+                        write_specs([spec for spec in specs if spec.get("os") != system])
+                        if gone:
+                            write_nodes([item for item in read_nodes(strict=True) if item.get("url") not in gone])
+                    else:
+                        url = clean_url((query.get("url") or [""])[0])
+                        write_nodes([item for item in read_nodes(strict=True) if item["url"] != url])
         except ValueError as exc:
             self.send_json(400, {"error": str(exc)})
             return
-        write_nodes([item for item in read_nodes() if item["url"] != url])
+        except (RuntimeError, OSError) as exc:
+            self.send_json(409, {"error": str(exc)})
+            return
         self.send_json(200, mesh_snapshot())
 
 
@@ -1553,6 +3959,8 @@ def serve(mode: str) -> None:
         server = ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), Handler)
         print(f"Neuro worker on port {WORKER_PORT}", flush=True)
         print(f"token id {token_id()}", flush=True)
+        if os.environ.get("NEURO_JOBS", "1").strip() != "0":
+            threading.Thread(target=job_loop, name="neuro-jobs", daemon=True).start()
     token()
     try:
         server.serve_forever()
@@ -1595,8 +4003,11 @@ def main() -> None:
         print(f"seeded {seeded} jobs; started {result['started']} of {result['requested']}", flush=True)
         print("pids " + " ".join(str(pid) for pid in result["pids"]), flush=True)
         return
+    if command == "jobs":
+        jobs_main(sys.argv[2:])
+        return
     if command not in {"serve", "work"}:
-        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py code [TASK] | mesh.py agents [COUNT] | mesh.py drill [ROUNDS]")
+        raise SystemExit("use: mesh.py serve | mesh.py work | mesh.py jobs ... | mesh.py code [TASK] | mesh.py agents [COUNT] | mesh.py drill [ROUNDS]")
     serve(command)
 
 

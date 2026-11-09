@@ -12,10 +12,6 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-if command -v git >/dev/null 2>&1 && [ -d .git ]; then
-  git pull --ff-only || true
-fi
-
 echo "This computer joins the Windows page by itself. Leave that page open."
 lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
 if [ -n "$lan_ip" ]; then
