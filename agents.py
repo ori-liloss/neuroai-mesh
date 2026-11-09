@@ -7,6 +7,7 @@ Only a few of them may generate at once, because the GPU has four slots.
 from __future__ import annotations
 
 import ctypes
+import difflib
 import http.client
 import json
 import locale
@@ -109,6 +110,7 @@ def _env_chars(name: str, default: int) -> int:
 
 CONTEXT_CHARS = _env_chars("NEURO_CONTEXT_CHARS", DEFAULT_CONTEXT_CHARS)
 TOOL_CHARS = 2400
+READ_CHARS = TOOL_CHARS - 200  # a READ fits whole inside one tool_response
 MAX_TURNS = 6
 REAP_AFTER = 180
 SECRET_NAMES = frozenset({"cluster.token", ".env", ".env.local", "token.txt", "nodes.json", "specs.json"})
@@ -118,8 +120,9 @@ OFFLINE_WAIT = "Neuro's model is not running yet, so this task has to wait."
 LOADING_WAIT = "Neuro is still loading the model, so this task has to wait."
 SYSTEM = "You are Neuro. Do the task. One tool call, then stop. Do not explain the tool."
 LAST_STEP = "That was the last tool. Answer the task now in plain text. Do not emit a tool."
-# Stop right after one call, and never let the model invent its own tool result.
-STOPS = ["<tool_response>", "</tool_call>"]
+# Never let the model invent its own tool result. "</tool_call>" is no longer a stop: a turn may
+# carry up to MAX_BATCH read-only calls, and the parser runs only what batch_calls allows.
+STOPS = ["<tool_response>"]
 # The model server is on this machine. A system proxy must never sit in between.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -557,12 +560,27 @@ def chat(
     content = message.get("content") or ""
     if isinstance(content, list):
         content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+    timings = body.get("timings") if isinstance(body.get("timings"), dict) else {}
+    details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
     # reasoning_content is the model's private thinking. It is never shown and never sent back.
     return {
         "content": str(content),
         "tool_calls": message.get("tool_calls") or [],
         "finish": str(choice.get("finish_reason") or ""),
+        "usage": {
+            "prompt": _count(usage.get("prompt_tokens")),
+            "completion": _count(usage.get("completion_tokens")),
+            "cached": _count(details.get("cached_tokens") or timings.get("cache_n")),
+        },
     }
+
+
+def _count(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def ask_model(prompt: str, max_tokens: int = 220) -> str:
@@ -575,6 +593,10 @@ def ask_model(prompt: str, max_tokens: int = 220) -> str:
 
 def secret_name(name: str) -> bool:
     plain = name.strip().rstrip(". ").lower()
+    # Backups and temp copies of a secret are secret too (cluster.token.old, cluster.token.tmp-ab12,
+    # .env.backup, mesh_url.txt is not secret).
+    if any(plain.startswith(base + ".") for base in SECRET_NAMES):
+        return True
     return plain in SECRET_NAMES or plain.endswith(DB_SUFFIXES)
 
 
@@ -614,28 +636,50 @@ def safe_read(relative: str, lines: tuple[int, int] | None = None) -> str:
         return "unreadable"
     if not stat.S_ISREG(info.st_mode):
         return "missing"
+    # Every line comes back numbered ("12: text") so EDIT can quote it exactly. The output stops
+    # before the tool_response clip would cut it, and says which range to READ next.
+    start, end = lines or (1, 10**9)
+    picked: list[str] = []
+    used = 0
+    stopped_at = 0
+    total = 0
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
-            if lines:
-                start, end = lines
-                picked = []
-                for number, line in enumerate(handle, 1):
-                    if number > end:
+            for number, line in enumerate(handle, 1):
+                total = number
+                if stopped_at and number - stopped_at > 100000:
+                    break  # a huge file: no need to count every line
+                if stopped_at or number < start:
+                    continue
+                if number > end:
+                    if not lines:
+                        continue
+                    break
+                row = f"{number}: {line.rstrip(chr(13) + chr(10))[:500]}"
+                if picked and used + len(row) + 1 > READ_CHARS:
+                    stopped_at = number
+                    if lines:
                         break
-                    if number >= start:
-                        picked.append(f"{number}: {line.rstrip()[:500]}")
-                return "\n".join(picked) or "no lines there"
-            text = handle.read(6000)
-            more = bool(handle.read(1))
-        if more:
-            size = path.stat().st_size
-            text += f"\n[file continues, {size} bytes in all. READ {raw} START-END shows other lines]"
+                    continue
+                picked.append(row)
+                used += len(row) + 1
     except OSError:
         return "unreadable"
+    if not picked:
+        return "no lines there" if lines else ""
+    text = "\n".join(picked)
+    if stopped_at:
+        last = end if lines else total
+        size = "more lines" if lines else f"file continues, {total} lines in all"
+        text += f"\n[{size}. READ {raw} {stopped_at}-{min(last, stopped_at + 79)} shows the next ones]"
     return text
 
 
-def read_tool(argument: str) -> str:
+READ_FAILED = frozenset({"missing", "unreadable", "no lines there"})
+
+
+def _read_call(argument: str) -> tuple[str, str]:
+    """READ path [START-END] -> (result, the path text that was read)."""
     text = argument.strip()
     parts = text.rsplit(None, 1)
     if len(parts) == 2:
@@ -643,13 +687,17 @@ def read_tool(argument: str) -> str:
         if match:
             start = max(1, int(match.group(1)))
             end = max(start, min(int(match.group(2)), start + 399))
-            return safe_read(parts[0], (start, end))
+            return safe_read(parts[0], (start, end)), parts[0]
     result = safe_read(text)
     if result == "missing" and " " in text:
         short = tool_path(text)
         if short:
-            return safe_read(short)
-    return result
+            return safe_read(short), short
+    return result, text
+
+
+def read_tool(argument: str) -> str:
+    return _read_call(argument)[0]
 
 
 def workspace_note() -> str:
@@ -695,6 +743,288 @@ def safe_write(relative: str, content: str) -> str:
         except OSError as exc:
             return f"could not write {raw}: {exc.strerror or exc}"
     return "wrote " + raw
+
+
+def path_key(path: Path) -> str:
+    return os.path.normcase(str(path))
+
+
+class TaskState:
+    """What one task has done so far. It lives for one task only."""
+
+    def __init__(self, task: str = "") -> None:
+        self.task = task
+        self.reads: set[str] = set()  # path_key of every file READ (or written) in this task
+        self.read_names: list[str] = []
+        self.changed: list[str] = []
+        self.failures: list[str] = []
+        self.todo: list[tuple[str, str]] = []
+        self.secret = False  # a call touched a secret path or a result held a secret
+
+    def saw(self, raw: str, path: Path) -> None:
+        self.reads.add(path_key(path))
+        if raw not in self.read_names:
+            self.read_names.append(raw)
+
+    def change(self, raw: str, path: Path) -> None:
+        self.saw(raw, path)
+        if raw not in self.changed:
+            self.changed.append(raw)
+
+
+EDIT_OPEN = "<<<<<<< SEARCH"
+EDIT_MID = "======="
+EDIT_CLOSE = ">>>>>>> REPLACE"
+_NUMBERED = re.compile(r"^\s*\d+:(?: |$)")
+
+
+def edit_call(path: str, old: str, new: str) -> str:
+    return f"EDIT {path}\n{EDIT_OPEN}\n{old}\n{EDIT_MID}\n{new}\n{EDIT_CLOSE}"
+
+
+def parse_edit(block: str) -> tuple[str, str, str, bool] | None:
+    """EDIT path / <<<<<<< SEARCH / old / ======= / new / >>>>>>> REPLACE -> (path, old, new, closed)."""
+    lines = block.splitlines()
+    if not lines:
+        return None
+    head = clean_tool_line(lines[0])
+    if not head.startswith("EDIT "):
+        return None
+    path = tool_path(head[5:])
+    opened = next((i for i in range(1, len(lines)) if lines[i].strip().startswith("<<<<<<<")), None)
+    if opened is None:
+        return None
+    mid = next((i for i in range(opened + 1, len(lines)) if re.fullmatch(r"={7,}", lines[i].strip())), None)
+    if mid is None:
+        return None
+    close = next((i for i in range(mid + 1, len(lines)) if lines[i].strip().startswith(">>>>>>>")), None)
+    new_lines = lines[mid + 1 : close if close is not None else len(lines)]
+    if close is None and new_lines and new_lines[-1].strip().startswith("```"):
+        new_lines = new_lines[:-1]
+    return path, "\n".join(lines[opened + 1 : mid]), "\n".join(new_lines), close is not None
+
+
+def _unnumber(text: str) -> str | None:
+    """Old text copied from READ with its "12: " prefixes still on. None when it is not that."""
+    rows = text.split("\n")
+    filled = [row for row in rows if row.strip()]
+    if not filled or not all(_NUMBERED.match(row) for row in filled):
+        return None
+    return "\n".join(re.sub(r"^\s*\d+: ?", "", row) for row in rows)
+
+
+def _edit_diff(raw: str, line: int, old: str, new: str) -> str:
+    body = [row for row in difflib.unified_diff(old.split("\n"), new.split("\n"), lineterm="", n=1)][2:]
+    body = [row for row in body if not row.startswith("@@")]
+    if len(body) > 16:
+        body = body[:16] + [f"... {len(body) - 16} more diff lines"]
+    return clip("\n".join([f"edited {raw} at line {line}", *body]), 1200)
+
+
+def tool_edit(relative: str, old: str, new: str, state: TaskState | None) -> tuple[str, list[str]]:
+    """Replace old with new in an existing file. The same path checks as WRITE, plus: the file was
+    READ in this task, and old matches exactly once."""
+    shown = (relative or "").strip().replace("\\", "/").lstrip("/")
+    found = inside(relative)
+    if found is None:
+        return "blocked " + shown, []
+    raw, path = found
+    if path.is_dir():
+        return "blocked " + raw + " is a folder", []
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return f"missing {raw}: EDIT changes an existing file. Use WRITE for a new file.", []
+    except OSError:
+        return "unreadable", []
+    if not stat.S_ISREG(info.st_mode):
+        return f"missing {raw}: EDIT changes an existing file.", []
+    if state is None or path_key(path) not in state.reads:
+        return f"refused: READ {raw} first, then EDIT it.", []
+    if not old.strip():
+        return "refused: the old text is empty. Copy the exact lines to change from READ.", []
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return "unreadable", []
+    bom = data.startswith(b"\xef\xbb\xbf")
+    try:
+        text = data.decode("utf-8-sig" if bom else "utf-8")
+    except UnicodeDecodeError:
+        return f"refused: {raw} is not UTF-8 text.", []
+    crlf = "\r\n" in text and text.count("\r\n") == text.count("\n")
+    body = text.replace("\r\n", "\n") if crlf else text
+    old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
+    count = body.count(old)
+    if count == 0:
+        plain = _unnumber(old)
+        if plain is not None and body.count(plain) > 0:
+            old, count = plain, body.count(plain)
+            new = _unnumber(new) if _unnumber(new) is not None else new
+    if old == new:
+        return "refused: the old and new text are the same.", []
+    if count == 0:
+        return f"refused: the old text matches 0 times in {raw}. Copy it exactly from READ, without line numbers.", []
+    if count > 1:
+        return f"refused: the old text matches {count} times in {raw}. Add nearby lines so it matches once.", []
+    at = body.index(old)
+    result = body[:at] + new + body[at + len(old) :]
+    if crlf:
+        result = result.replace("\n", "\r\n")
+    encoded = (b"\xef\xbb\xbf" if bom else b"") + result.encode("utf-8")
+    if len(encoded) > 150000:
+        return "too large", []
+    # Same swap as safe_write, so a parallel reader never sees half a file.
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp.write_bytes(encoded)
+        os.replace(temp, path)
+    except OSError:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            path.write_bytes(encoded)
+        except OSError as exc:
+            return f"could not write {raw}: {exc.strerror or exc}", []
+    state.change(raw, path)
+    return _edit_diff(raw, body[:at].count("\n") + 1, old, new), ["edited " + raw]
+
+
+GLOB_LIMIT = 50
+GLOB_WALK = 20000
+
+
+def glob_regex(pattern: str) -> str:
+    out = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if pattern.startswith("**/", index):
+            out.append("(?:[^/]+/)*")
+            index += 3
+            continue
+        if pattern.startswith("**", index):
+            out.append(".*")
+            index += 2
+            continue
+        if char == "*":
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        elif char == "[" and "]" in pattern[index + 2 :]:
+            close = pattern.index("]", index + 2)
+            inner = pattern[index + 1 : close]
+            if inner.startswith("!"):
+                inner = "^" + inner[1:]
+            out.append("[" + inner.replace("\\", "\\\\") + "]")
+            index = close
+        elif char == "{" and "}" in pattern[index:]:
+            close = pattern.index("}", index)
+            out.append("(?:" + "|".join(glob_regex(part) for part in pattern[index + 1 : close].split(",")) + ")")
+            index = close
+        else:
+            out.append(re.escape(char))
+        index += 1
+    return "".join(out)
+
+
+def tool_glob(pattern: str) -> str:
+    """File paths that match a glob under the repo (or workspace/), sorted by path, capped."""
+    text = (pattern or "").strip().strip("`'\"").replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    if (
+        not text or len(text) > 120 or text.startswith("/") or "\0" in text or ":" in text
+        or ".." in text.split("/")
+    ):
+        return "need a relative pattern such as **/*.py"
+    parts = text.split("/")
+    static: list[str] = []
+    for part in parts[:-1]:
+        if any(mark in part for mark in "*?[{"):
+            break
+        static.append(part)
+    start_rel = "/".join(static)
+    if start_rel:
+        found = inside(start_rel)
+        if found is None or not found[1].is_dir():
+            return "no matches"
+        start = found[1]
+        tree = tree_for(found[0]).resolve()
+    else:
+        start = tree = ROOT.resolve()
+    rest = "/".join(parts[len(static) :])
+    anywhere = "/" not in rest
+    try:
+        matcher = re.compile("(?s:" + glob_regex(rest) + r")\Z", re.IGNORECASE if os.name == "nt" else 0)
+    except re.error:
+        return "need a relative pattern such as **/*.py"
+    hits: list[str] = []
+    extra = 0
+    walked = 0
+    for dirpath, dirnames, filenames in os.walk(start):
+        dirnames[:] = sorted(name for name in dirnames if name not in GREP_SKIP_DIRS and not secret_name(name))
+        for name in sorted(filenames):
+            walked += 1
+            if secret_name(name):
+                continue
+            full = Path(dirpath) / name
+            try:
+                target = name if anywhere else full.relative_to(start).as_posix()
+                shown = full.relative_to(tree).as_posix()
+            except ValueError:
+                continue
+            if not matcher.match(target):
+                continue
+            if len(hits) >= GLOB_LIMIT:
+                extra += 1
+                continue
+            hits.append(shown)
+        if walked >= GLOB_WALK:
+            break
+    if extra:
+        hits.append(f"... {extra} more. Narrow the pattern.")
+    return "\n".join(hits) or "no matches"
+
+
+TODO_LINE = re.compile(r"^\s*(?:[-*]\s*)?\[([ xX>~-]?)\]\s*(.+?)\s*$")
+TODO_STATUS = {"": "pending", " ": "pending", "x": "done", "X": "done", ">": "doing", "~": "doing", "-": "doing"}
+TODO_MARK = {"pending": " ", "doing": ">", "done": "x"}
+TODO_LIMIT = 8
+
+
+def parse_todo(block: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for line in block.splitlines()[1:]:
+        match = TODO_LINE.match(line)
+        if not match:
+            if line.strip():
+                break
+            continue
+        items.append((TODO_STATUS[match.group(1)], " ".join(match.group(2).split())[:80]))
+        if len(items) >= TODO_LIMIT:
+            break
+    return items
+
+
+def todo_line(items: list[tuple[str, str]]) -> str:
+    """The checklist on one line. It rides on the newest message only, never in history."""
+    if not items:
+        return ""
+    done = sum(1 for status, _ in items if status == "done")
+    return f"TODO {done}/{len(items)}: " + " | ".join(f"[{TODO_MARK[status]}] {text[:60]}" for status, text in items)
+
+
+def tool_todo(block: str, state: TaskState | None) -> str:
+    items = parse_todo(block)
+    if not items:
+        return "TODO needs item lines: [ ] step, [>] current step, [x] done step"
+    if state is not None:
+        state.todo = items
+    done = sum(1 for status, _ in items if status == "done")
+    return f"todo saved, {done} of {len(items)} done"
 
 
 def apply_actions(answer: str, require_end: bool = False) -> list[str]:
@@ -764,67 +1094,94 @@ def visible_answer(answer: str) -> str:
 
 
 class Budget(NamedTuple):
-    think: bool  # thinking on or off
-    max_tokens: int  # per generation
+    think: bool  # thinking on for the first (planning) turn
+    max_tokens: int  # cap for turns that may WRITE/EDIT (code) and for the final answer
     max_turns: int  # generations per job
-    write: bool  # WRITE and MKDIR allowed
+    write: bool  # WRITE, EDIT and MKDIR allowed
     run: bool  # RUN allowed
-    verify: bool  # after a WRITE, ask once for a checking RUN before "done"
+    verify: bool  # after a WRITE or EDIT, ask once for a checking RUN before "done"
     fixes: int  # repair turns for a tool call that could not be read
 
 
 # The router picks one of these once per job. Safety checks below still apply to every kind.
 KIND_BUDGET: dict[str, Budget] = {
-    "quick": Budget(False, 500, 3, False, False, False, 1),
-    "research": Budget(False, 1200, 6, False, True, False, 2),
+    "quick": Budget(False, 600, 3, False, False, False, 1),
+    "research": Budget(True, 1200, 6, False, True, False, 2),
     "review": Budget(True, 2560, 6, False, True, False, 2),
-    "code": Budget(True, 3072, 10, True, True, True, 2),
+    "code": Budget(True, 3072, 12, True, True, True, 2),
 }
-DEEP_TOKENS = 4096  # /deep forces thinking on with this budget
+TOOL_TOKENS = 700  # a routine tool turn: thinking off, a few calls or a short answer
+THINK_TOKENS = 2048  # a planning or diagnosis turn: room to think, then call
+DEEP_TOKENS = 4096  # /deep forces thinking on every turn with this budget
 DEFAULT_KIND = "research"
-# The model's own syntax. The parser in first_tool / apply_actions expects exactly these lines.
+READ_ONLY = frozenset({"LIST", "GREP", "GLOB", "READ", "SESSIONS", "TODO"})
+MAX_BATCH = 3  # read-only calls that may run together in one turn
+# The model's own syntax. The parsers (text_tools, parse_edit, apply_actions) expect exactly these.
 TOOL_SYNTAX = (
     ("LIST", "LIST relative/dir"),
+    ("GLOB", "GLOB **/*.py"),
     ("GREP", "GREP text"),
     ("READ", "READ relative/path\nREAD relative/path 120-180"),
     ("SESSIONS", "SESSIONS"),
-    ("MKDIR", "MKDIR relative/path"),
+    ("TODO", "TODO\n[x] done step\n[>] current step\n[ ] next step"),
+    ("EDIT", f"EDIT relative/path\n{EDIT_OPEN}\nexact old lines\n{EDIT_MID}\nnew lines\n{EDIT_CLOSE}"),
     ("WRITE", "WRITE relative/path\nthe file contents\nENDWRITE"),
+    ("MKDIR", "MKDIR relative/path"),
     ("RUN", "RUN command"),
 )
 KIND_NOTES = {
-    "quick": "Keep it short. Use a tool only when the answer needs the repo.",
-    "research": "Look with GREP and READ before you answer. Name the files you used.",
-    "review": "Find bugs and risks. Give the file and line for each one. Do not fix them.",
-    "code": "Look first, then WRITE, then RUN a compile or a test before you say it is done.",
+    "quick": "Answer briefly. Use a tool only when the answer needs the repo.",
+    "research": "Look before you answer. Name the files and lines you used.",
+    "review": "Find bugs and risks, with file and line for each. Do not fix them.",
+    "code": "Read first, then EDIT (WRITE only for a new file), then RUN a compile or a test.",
 }
 
 
 def kind_tools(kind: str) -> frozenset[str]:
     budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
-    names = {"LIST", "GREP", "READ", "SESSIONS"}
+    names = {"LIST", "GLOB", "GREP", "READ", "SESSIONS"}
+    if kind in KIND_BUDGET and kind != "quick":
+        names.add("TODO")  # quick tasks do not need a checklist
     if budget.write:
-        names |= {"MKDIR", "WRITE"}
+        names |= {"MKDIR", "WRITE", "EDIT"}
     if budget.run:
         names.add("RUN")
     return frozenset(names)
 
 
 def tool_help(kind: str) -> str:
+    """The whole system prompt for one kind. Stable text only: it is the cached prefix of every turn."""
     allowed = kind_tools(kind)
     budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
-    lines = ["Work in this repo. Emit one tool and stop. No sentence before it or after it."]
+    batch = " ".join(name for name in ("LIST", "GLOB", "GREP", "READ", "SESSIONS", "TODO") if name in allowed)
+    alone = [name for name in ("EDIT", "WRITE", "MKDIR", "RUN") if name in allowed]
+    lines = ["You are Neuro, a careful agent working in a local repo.", "- Understand the task first."]
+    if "TODO" in allowed:
+        lines.append("- For work with 3 or more steps, keep a short TODO and update it as you go.")
+    lines.append("- Never guess what a file says. GLOB, GREP or READ it first.")
+    if budget.write:
+        lines.append("- Make the smallest correct change with EDIT. WRITE is for new files.")
+        lines.append("- After a change, RUN a test or a compile and read the result.")
+    else:
+        lines.append("- This task does not change files.")
+    lines += [
+        "- If a call fails, find the cause before trying again. Never repeat the same call.",
+        "- Do not narrate or explain tools. A turn is tool calls only, or the final answer.",
+        f"Tools, one per line. Up to {MAX_BATCH} of {batch} may go in one turn"
+        + (f"; {', '.join(alone)} {'goes' if len(alone) == 1 else 'go'} alone." if alone else "."),
+    ]
     lines += [syntax for name, syntax in TOOL_SYNTAX if name in allowed]
     if budget.write:
-        lines.append("WRITE under workspace/ is allowed. Do not say you cannot create a file there.")
-    else:
-        lines.append("This task does not change files.")
+        lines.append("WRITE under workspace/ is allowed. READ shows numbered lines; leave the numbers out of EDIT.")
+    lines.append("Results come back inside <tool_response>.")
     lines.append(KIND_NOTES.get(kind, ""))
-    lines += [
-        "Stop when the tool line is done. Do not explain the tool.",
-        "A tool result comes back inside <tool_response>. Read it, then one tool or a plain answer.",
-        "When the task is done, answer in plain text and do not emit a tool.",
-    ]
+    if budget.write:
+        lines.append(
+            "Final answer, plain text, at most 8 lines: what changed (files), how it was checked and the"
+            " result, and anything not done. No tool syntax. Stop when done."
+        )
+    else:
+        lines.append("Final answer: plain text, short and direct, no tool syntax. Stop when done.")
     return "\n".join(line for line in lines if line)
 
 
@@ -834,7 +1191,25 @@ TOOL_HELP = KIND_TOOLS["code"]
 
 
 def agent_system(kind: str) -> str:
-    return SYSTEM + "\n" + KIND_TOOLS.get(kind, KIND_TOOLS["quick"])
+    return KIND_TOOLS.get(kind, KIND_TOOLS["quick"])
+
+
+def turn_budget(
+    kind: str, *, turn: int, deep: bool = False, after_failure: bool = False, writing: bool = False,
+    final_turn: bool = False,
+) -> tuple[bool, int]:
+    """(think, max_tokens) for one turn. Thinking plans the first turn of a real task and
+    diagnoses the turn after a failure; routine tool turns stay short and do not think."""
+    budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
+    if deep:
+        return True, max(budget.max_tokens, DEEP_TOKENS)
+    think = (turn == 0 and budget.think) or after_failure
+    tokens = min(TOOL_TOKENS, budget.max_tokens)
+    if final_turn or (writing and budget.write):
+        tokens = budget.max_tokens
+    if think:
+        tokens = max(tokens, THINK_TOKENS)
+    return think, tokens
 
 
 _HE_PREFIX = r"(?<!\w)[ובהלשמכ]{0,2}"
@@ -1173,11 +1548,19 @@ TOOL_NAMES = {
     "mkdir": "MKDIR", "make_dir": "MKDIR", "create_dir": "MKDIR", "create_directory": "MKDIR",
     "run": "RUN", "shell": "RUN", "run_command": "RUN", "bash": "RUN", "exec": "RUN", "terminal": "RUN",
     "sessions": "SESSIONS", "list_sessions": "SESSIONS", "recent_sessions": "SESSIONS",
+    "edit": "EDIT", "edit_file": "EDIT", "str_replace": "EDIT", "replace_in_file": "EDIT", "apply_edit": "EDIT",
+    "glob": "GLOB", "glob_files": "GLOB", "find_files": "GLOB", "file_search": "GLOB",
+    "todo": "TODO", "todos": "TODO", "todo_write": "TODO", "todowrite": "TODO", "update_todo": "TODO",
+    "update_todos": "TODO", "set_todo": "TODO", "update_plan": "TODO",
 }
 PATH_KEYS = ("path", "file", "file_path", "filepath", "filename", "dir", "directory", "dir_path", "folder", "target")
 QUERY_KEYS = ("query", "pattern", "text", "search", "needle", "regex", "q", "keyword")
 COMMAND_KEYS = ("command", "cmd", "script", "shell", "code")
 BODY_KEYS = ("content", "contents", "body", "text", "data", "file_text")
+OLD_KEYS = ("old_string", "old_str", "old_text", "old", "search", "find", "before", "original")
+NEW_KEYS = ("new_string", "new_str", "new_text", "new", "replace", "replacement", "after", "updated")
+GLOB_KEYS = ("pattern", "glob", "query", "name", "value")
+TODO_KEYS = ("todos", "items", "tasks", "steps", "todo", "list", "plan", "value")
 _JSON = json.JSONDecoder(strict=False)
 
 
@@ -1196,6 +1579,45 @@ def _pick(args: dict, keys: tuple[str, ...]) -> object:
     return None
 
 
+TODO_DONE = {"done", "completed", "complete", "finished", "x"}
+TODO_DOING = {"in_progress", "in-progress", "doing", "active", "current", "started", "working"}
+
+
+def _todo_rows(value: object) -> list[str]:
+    """Native todo arguments (a list of {content, status} or strings) as TODO item lines."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                value = _JSON.decode(text)
+            except ValueError:
+                value = text.splitlines()
+        else:
+            value = text.splitlines()
+    if not isinstance(value, list):
+        return []
+    rows = []
+    for item in value[:TODO_LIMIT]:
+        status = ""
+        if isinstance(item, dict):
+            text = _first_line(
+                item.get("content") or item.get("text") or item.get("task") or item.get("step")
+                or item.get("title") or item.get("description")
+            )
+            status = str(item.get("status") or item.get("state") or "").strip().lower()
+        else:
+            text = _first_line(item)
+            match = TODO_LINE.match(text)
+            if match:
+                rows.append(f"[{match.group(1) or ' '}] {match.group(2)}")
+                continue
+        if not text:
+            continue
+        mark = "x" if status in TODO_DONE else ">" if status in TODO_DOING else " "
+        rows.append(f"[{mark}] {text}")
+    return rows
+
+
 def command_from(name: object, args: object) -> str:
     command = TOOL_NAMES.get(str(name or "").strip().strip("\"'").lower().replace("-", "_"), "")
     if not command:
@@ -1208,6 +1630,22 @@ def command_from(name: object, args: object) -> str:
         args = {}
     args = {str(key).strip().lower(): value for key, value in args.items()}
     only = next(iter(args.values())) if len(args) == 1 else None
+    if command == "EDIT":
+        safe = tool_path(_first_line(_pick(args, PATH_KEYS)))
+        old = next((args[key] for key in OLD_KEYS if key in args and args[key] is not None), None)
+        new = next((args[key] for key in NEW_KEYS if key in args and args[key] is not None), None)
+        if not safe or not isinstance(old, str) or not old or not isinstance(new, str):
+            return ""
+        return edit_call(safe, old, new)
+    if command == "GLOB":
+        pattern = _first_line(_pick(args, GLOB_KEYS))
+        folder = _first_line(_pick(args, PATH_KEYS))
+        if folder and pattern and folder != pattern:
+            pattern = folder.rstrip("/\\") + "/" + pattern
+        return "GLOB " + pattern if pattern else ""
+    if command == "TODO":
+        rows = _todo_rows(_pick(args, TODO_KEYS))
+        return "TODO\n" + "\n".join(rows) if rows else ""
     if command == "WRITE":
         safe = tool_path(_first_line(_pick(args, PATH_KEYS)))
         body = next((args[key] for key in BODY_KEYS if key in args and args[key] is not None), None)
@@ -1318,11 +1756,14 @@ def write_block(answer: str) -> str:
     return ""
 
 
-def pick_tool(answer: str, tool_calls: object = None) -> tuple[str, str]:
-    """Return the first tool call and the text of only that call, for the chat history."""
-    command = openai_tool(tool_calls)
-    if command:
-        item = tool_calls[0] if isinstance(tool_calls, list) else {}
+def openai_tools(tool_calls: object) -> list[tuple[str, str]]:
+    calls: list[tuple[str, str]] = []
+    if not isinstance(tool_calls, list):
+        return calls
+    for item in tool_calls[: MAX_BATCH + 1]:
+        command = tool_from_object(item)
+        if not command:
+            continue
         function = item.get("function") if isinstance(item, dict) and isinstance(item.get("function"), dict) else {}
         args = function.get("arguments", {})
         if isinstance(args, str):
@@ -1331,23 +1772,104 @@ def pick_tool(answer: str, tool_calls: object = None) -> tuple[str, str]:
             except ValueError:
                 pass
         call = {"name": function.get("name") or item.get("name", ""), "arguments": args}
-        return command, "<tool_call>\n" + json.dumps(call, ensure_ascii=False) + "\n</tool_call>"
-    command = native_tool(answer)
+        calls.append((command, "<tool_call>\n" + json.dumps(call, ensure_ascii=False) + "\n</tool_call>"))
+    return calls
+
+
+def native_tools(answer: str) -> list[tuple[str, str]]:
+    """Every call in the model's own format, each with the text of only that call."""
+    calls: list[tuple[str, str]] = []
+    if "<tool_call>" in answer:
+        for piece in answer.split("<tool_call>")[1:]:
+            segment = "<tool_call>" + piece
+            end = segment.find("</tool_call>")
+            segment = segment[: end + len("</tool_call>")] if end >= 0 else segment.rstrip() + "\n</tool_call>"
+            command = native_tool(segment)
+            if command:
+                calls.append((command, segment.strip()))
+        return calls
+    if "<function=" in answer:
+        for piece in answer.split("<function=")[1:]:
+            segment = "<function=" + piece
+            end = segment.find("</function>")
+            if end >= 0:
+                segment = segment[: end + len("</function>")]
+            command = xml_tool(segment)
+            if command:
+                calls.append((command, segment.strip()))
+        return calls
+    command = json_tool(answer)
     if command:
-        at = answer.find("<tool_call>")
-        if at < 0:
-            at = answer.find("<function=") if "<function=" in answer else answer.find("{")
-        segment = answer[max(0, at) :]
-        end = segment.find("</tool_call>")
-        if end >= 0:
-            segment = segment[: end + len("</tool_call>")]
-        elif segment.startswith("<tool_call>"):
-            segment = segment.rstrip() + "\n</tool_call>"
-        return command, segment.strip()
-    command = first_tool(answer)
-    if command:
-        return command, (write_block(answer) or command) if command.startswith("WRITE ") else command
-    return "", ""
+        calls.append((command, answer[max(0, answer.find("{")) :].strip()))
+    return calls
+
+
+SINGLE_HEADS = ("LIST ", "GREP ", "GLOB ", "READ ", "MKDIR ", "RUN ", "SESSIONS ")
+
+
+def text_tools(answer: str) -> list[tuple[str, str]]:
+    """Every call in the plain line syntax. WRITE, EDIT and TODO carry their body lines."""
+    lines = answer.splitlines()
+    calls: list[tuple[str, str]] = []
+    index = 0
+    while index < len(lines):
+        stripped = clean_tool_line(lines[index])
+        if stripped.startswith(("WRITE ", "EDIT ")):
+            is_write = stripped.startswith("WRITE ")
+            block = [stripped]
+            index += 1
+            while index < len(lines):
+                block.append(lines[index])
+                index += 1
+                end = clean_tool_line(block[-1])
+                if (end == "ENDWRITE") if is_write else block[-1].strip().startswith(">>>>>>>"):
+                    break
+            text = "\n".join(block)
+            calls.append((text, text))
+            continue
+        if stripped in {"TODO", "TODO:"}:
+            block = ["TODO"]
+            index += 1
+            while index < len(lines) and (not lines[index].strip() or TODO_LINE.match(lines[index])):
+                if lines[index].strip():
+                    block.append(lines[index].strip())
+                index += 1
+            text = "\n".join(block)
+            calls.append((text, text))
+            continue
+        if stripped == "SESSIONS" or stripped.startswith(SINGLE_HEADS):
+            calls.append((stripped, stripped))
+        elif stripped == "LIST":
+            calls.append(("LIST .", "LIST ."))
+        index += 1
+    return calls
+
+
+def pick_tools(answer: str, tool_calls: object = None) -> list[tuple[str, str]]:
+    """All tool calls in one reply, in order, as (command, text of only that call)."""
+    return openai_tools(tool_calls) or native_tools(answer) or text_tools(answer)
+
+
+def tool_head(command: str) -> str:
+    return command.strip().split(None, 1)[0].upper() if command.strip() else ""
+
+
+def batch_calls(calls: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Up to MAX_BATCH read-only calls run together. WRITE, EDIT, MKDIR and RUN run alone."""
+    if not calls or tool_head(calls[0][0]) not in READ_ONLY:
+        return calls[:1]
+    picked = []
+    for call in calls:
+        if tool_head(call[0]) not in READ_ONLY or len(picked) >= MAX_BATCH:
+            break
+        picked.append(call)
+    return picked
+
+
+def pick_tool(answer: str, tool_calls: object = None) -> tuple[str, str]:
+    """The first tool call and the text of only that call."""
+    calls = pick_tools(answer, tool_calls)
+    return calls[0] if calls else ("", "")
 
 
 def tool_response(text: str) -> str:
@@ -1369,7 +1891,7 @@ def clip(text: str, limit: int) -> str:
 def first_tool(answer: str) -> str:
     for line in answer.splitlines():
         stripped = clean_tool_line(line)
-        if stripped == "SESSIONS" or stripped.startswith(("LIST ", "GREP ", "READ ", "MKDIR ", "RUN ", "WRITE ", "SESSIONS ")):
+        if stripped in {"SESSIONS", "TODO"} or stripped.startswith((*SINGLE_HEADS, "WRITE ", "EDIT ")):
             return stripped
         if stripped == "LIST":
             return "LIST ."
@@ -1379,31 +1901,87 @@ def first_tool(answer: str) -> str:
 def fit_context(messages: list[dict], budget: int = CONTEXT_CHARS) -> None:
     """Fit the chat in budget characters.
 
-    messages[0] (system) and messages[1] (the task) are never touched, and the newest call and
-    its result stay whole. First the oldest tool results are emptied, then old calls are clipped,
-    and only then the oldest assistant+tool pairs are dropped.
+    messages[0] (system), messages[1] (the task) and a running summary at messages[2] are never
+    touched, and the newest call and its result stay whole. First the oldest tool results are
+    emptied, then old calls are clipped, and only then the oldest assistant+tool pairs are dropped.
+    run_agent folds old turns into the summary (compact) before this; this is the last resort.
     """
 
     def size() -> int:
         return sum(len(str(item.get("content") or "")) for item in messages)
 
+    keep = 3 if len(messages) > 2 and is_summary(messages[2]) else 2
     removed = "<tool_response>\n[older result removed to save room]\n</tool_response>"
-    for index in range(2, len(messages) - 2):
+    for index in range(keep, len(messages) - 2):
         if size() <= budget:
             return
         item = messages[index]
         content = str(item.get("content") or "")
         if item.get("role") == "user" and content.startswith("<tool_response>") and content != removed:
             item["content"] = removed
-    for index in range(2, len(messages) - 2):
+    for index in range(keep, len(messages) - 2):
         if size() <= budget:
             return
         item = messages[index]
         content = str(item.get("content") or "")
         if item.get("role") == "assistant" and len(content) > 300:
             item["content"] = clip(content, 300)
-    while size() > budget and len(messages) > 4:
-        del messages[2:4]
+    while size() > budget and len(messages) > keep + 2:
+        del messages[keep : keep + 2]
+
+
+SUMMARY_HEAD = "[summary of earlier turns]"
+KEEP_NEWEST = 4  # the newest two turns (call + result each) always stay whole
+
+
+def is_summary(item: dict) -> bool:
+    return item.get("role") == "user" and str(item.get("content") or "").startswith(SUMMARY_HEAD)
+
+
+def one_line(text: str, limit: int) -> str:
+    return " ".join(str(text or "").split())[:limit]
+
+
+def summary_text(state: TaskState, steps: list[str]) -> str:
+    lines = [SUMMARY_HEAD, "Task: " + one_line(state.task, 160)]
+    if state.read_names:
+        lines.append("Files read: " + ", ".join(state.read_names[-12:]))
+    if state.changed:
+        lines.append("Files changed: " + ", ".join(state.changed[-12:]))
+    if steps:
+        lines.append("Steps so far:")
+        lines += ["- " + step for step in steps[-10:]]
+    if state.failures:
+        lines.append("Failed attempts: " + " | ".join(state.failures[-4:]))
+    if state.todo:
+        lines.append(todo_line(state.todo))
+    return clip("\n".join(lines), 2000)
+
+
+def compact(history: list[dict], budget: int, state: TaskState, reserve: int = 0) -> bool:
+    """Like a long session: when the chat is over budget, fold the oldest turns into one running
+    summary message (messages[2]). System, task, summary and the newest turns are never dropped.
+    It shrinks to about 60% of the budget, so the cached prefix holds for several turns after."""
+
+    def size(items: list[dict]) -> int:
+        return sum(len(str(item.get("content") or "")) for item in items) + reserve
+
+    if size(history) <= budget:
+        return False
+    start = 3 if len(history) > 2 and is_summary(history[2]) else 2
+    steps = list(history[2].get("steps") or []) if start == 3 else []
+    target = budget * 3 // 5
+    fixed = size(history[:2]) + 2000
+    cut = start
+    while len(history) - cut > KEEP_NEWEST and fixed + size(history[cut:]) - reserve > target:
+        cut += 2
+    if cut == start:
+        return False
+    for item in history[start:cut]:
+        if item.get("role") == "assistant":
+            steps.append(one_line(item.get("note") or item.get("content"), 160))
+    history[2:cut] = [{"role": "user", "content": summary_text(state, steps), "steps": steps[-10:]}]
+    return True
 
 
 def deep_request(prompt: str) -> tuple[bool, str]:
@@ -1423,17 +2001,34 @@ def plain_answer(answer: str) -> str:
     return text.strip()
 
 
-def run_tool(command: str, source: str, cut: bool, *, kind: str = "code") -> tuple[str, list[str]]:
+def run_tool(
+    command: str, source: str, cut: bool, *, kind: str = "code", state: TaskState | None = None
+) -> tuple[str, list[str]]:
     # Gates by task kind come first. They only add blocks; every check below still runs.
     budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
-    head = command.strip().split(None, 1)[0].upper() if command.strip() else ""
-    if head in {"WRITE", "MKDIR"} and not budget.write:
+    head = tool_head(command)
+    if head in {"WRITE", "MKDIR", "EDIT"} and not budget.write:
         return "blocked: this task cannot change files. Use LIST, GREP or READ, or answer in plain text.", []
     if head == "RUN" and not budget.run:
         return "blocked: this task cannot RUN commands. Use LIST, GREP or READ, or answer in plain text.", []
     if command.startswith("WRITE "):
         wrote = apply_actions(source, require_end=cut)
+        if state is not None:
+            for item in wrote:
+                found = inside(item[6:]) if item.startswith("wrote ") else None
+                if found:
+                    state.change(found[0], found[1])
         return "\n".join(wrote) or "nothing written", wrote
+    if command.startswith("EDIT "):
+        parsed = parse_edit(command if "\n" in command else source)
+        if cut and (parsed is None or not parsed[3]):
+            name = parsed[0] if parsed else tool_path(command[5:].split("\n", 1)[0])
+            return f"not edited {name}: the call was cut off before {EDIT_CLOSE}. Send a smaller EDIT.", []
+        if parsed is None:
+            return f"EDIT needs: EDIT path, {EDIT_OPEN}, the exact old lines, {EDIT_MID}, the new lines, {EDIT_CLOSE}", []
+        if not parsed[0]:
+            return "blocked path", []
+        return tool_edit(parsed[0], parsed[1], parsed[2], state)
     if command.startswith("MKDIR "):
         made = apply_actions(command)
         return "\n".join(made) or "mkdir", made
@@ -1441,8 +2036,16 @@ def run_tool(command: str, source: str, cut: bool, *, kind: str = "code") -> tup
         return tool_list(command[5:]), []
     if command.startswith("GREP "):
         return tool_grep(command[5:]), []
+    if command.startswith("GLOB "):
+        return tool_glob(command[5:]), []
     if command.startswith("READ "):
-        return read_tool(command[5:]), []
+        result, raw = _read_call(command[5:])
+        found = inside(raw) if state is not None and result not in READ_FAILED else None
+        if found:
+            state.saw(found[0], found[1])
+        return result, []
+    if head == "TODO":
+        return tool_todo(command, state), []
     if command.startswith("RUN "):
         return tool_run(command[4:]), []
     if command.startswith("SESSIONS"):
@@ -1466,7 +2069,7 @@ def ask_fitted(messages: list[dict], think: bool = False, max_tokens: int = 1200
 
 
 # On the last turn these still run once. Their result goes into the answer instead of being lost.
-FINAL_TOOLS = frozenset({"RUN", "READ", "GREP", "LIST", "SESSIONS"})
+FINAL_TOOLS = frozenset({"RUN", "READ", "GREP", "GLOB", "LIST", "SESSIONS"})
 # A RUN that checks written work: a compiler, a test runner, or running the program.
 VERIFY_RUN = re.compile(
     r"\b(?:py_compile|compileall|pytest|unittest|tests?|tsc|mypy|ruff|flake8|pylint|lint|build|check|cargo|go"
@@ -1474,87 +2077,319 @@ VERIFY_RUN = re.compile(
     re.IGNORECASE,
 )
 VERIFY_NUDGE = (
-    "Not done yet: you wrote a file but did not RUN a compile or a test. "
+    "Not done yet: you changed a file but did not RUN a compile or a test. "
     "Send one RUN that checks it, for example RUN python -m py_compile path, "
     "or answer in plain text with the reason no check applies."
 )
+LOOP_NUDGE = (
+    "You sent the same call as last turn, so it did not run again; its result is above. "
+    "Change approach: a different call, a smaller step, or the final answer."
+)
+BATCH_NOTE = (
+    "Only the first {n} call(s) ran. Up to 3 of LIST GLOB GREP READ SESSIONS TODO run together; "
+    "EDIT, WRITE, MKDIR and RUN run alone, one per turn."
+)
+FAIL_STARTS = (
+    "blocked", "refused", "error:", "could not", "not written", "not edited", "unknown tool", "timed out",
+    "missing", "unreadable", "too large", "EDIT needs", "TODO needs", "need a ",
+)
+EXIT_FAIL = re.compile(r"(?:^|\n)exit [1-9]\d*\s*$")
+# Patterns of real credentials. A trajectory that holds one is never saved.
+SECRET_VALUE = re.compile(
+    r"sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_\w{30,}|hf_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}"
+    r"|xox[abp]-[A-Za-z0-9-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+)
+
+
+def tool_failed(result: str) -> bool:
+    text = (result or "").strip()
+    return text.startswith(FAIL_STARTS) or bool(EXIT_FAIL.search(text))
+
+
+def touches_secret(command: str) -> bool:
+    """A call whose path, pattern or command names a secret file (cluster.token, .env, *.db ...)."""
+    head = (command or "").split("\n", 1)[0].lower()
+    return any(part and secret_name(part) for part in re.split(r"[\s/\\'\"`<>|;,&()=:*?\[\]{}]+", head))
+
+
+def secret_values() -> list[str]:
+    """The live secrets on this computer, only to make sure a saved trajectory never holds one.
+    They are compared in memory and never written or shown."""
+    values: list[str] = []
+    for base in {ROOT.resolve(), HOME.resolve()}:
+        for name in ("cluster.token", "token.txt"):
+            try:
+                text = (base / name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            values += [line.strip() for line in text.splitlines() if len(line.strip()) >= 8]
+        for name in (".env", ".env.local"):
+            try:
+                text = (base / name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if "=" in line and not line.lstrip().startswith("#"):
+                    value = line.split("=", 1)[1].strip().strip("'\"")
+                    if len(value) >= 8:
+                        values.append(value)
+    return values
+
+
+def has_secret(text: str, values: list[str]) -> bool:
+    return bool(SECRET_VALUE.search(text or "")) or any(value in (text or "") for value in values)
+
+
+def compose(logs: list[str], tail: str, limit: int = 4000) -> str:
+    """The job result: the step log, then the answer. The answer is kept whole; old steps go first."""
+    tail = (tail or "").strip()[: limit - 300]
+    room = limit - len(tail) - 60
+    kept: list[str] = []
+    for line in reversed(logs):
+        if len(line) + 1 > room:
+            break
+        kept.append(line)
+        room -= len(line) + 1
+    kept.reverse()
+    if len(kept) < len(logs):
+        kept.insert(0, f"[{len(logs) - len(kept)} earlier steps not shown]")
+    return "\n".join([*kept, tail]).strip()
 
 
 def _say_line(line: str) -> None:
     print(line, flush=True)
 
 
-def run_agent(prompt: str, *, ask=None, say=None) -> str:
-    """One job. ask(messages, think, max_tokens) is the model call; drills pass a fake one."""
-    ask = ask or ask_fitted
-    say = say or _say_line
-    kind, prompt = job_kind(prompt)
-    deep, prompt = deep_request(prompt)
-    budget = KIND_BUDGET[kind]
-    think, max_tokens, max_turns = budget.think, budget.max_tokens, budget.max_turns
-    if deep:
-        think, max_tokens = True, max(max_tokens, DEEP_TOKENS)
-    # Stable first (cached by the server for every job of this kind), the task and live files after.
-    first = "Task:\n" + prompt + "\n\n" + workspace_note()
-    messages: list[dict] = [{"role": "system", "content": agent_system(kind)}, {"role": "user", "content": first}]
-    logs: list[str] = []
-    fixes = 0
-    nudged = False
-    wrote = False
-    verified = False
-    for turn in range(max_turns):
-        final_turn = turn == max_turns - 1
-        if final_turn and len(messages) > 2:
-            messages[-1]["content"] = str(messages[-1]["content"]) + "\n" + LAST_STEP
-        reply = ask(messages, think, max_tokens)
-        # Only the visible answer is used. Thinking is never stored or sent back.
-        answer = visible_answer(reply["content"])
-        cut = reply["finish"] == "length"
-        command, call = pick_tool(answer, reply["tool_calls"])
-        if not command:
-            if not answer and cut and think and not final_turn and fixes < budget.fixes:
-                # Every token went to thinking. Ask again with thinking off.
-                fixes += 1
-                think = False
-                continue
-            if looks_like_call(answer) and not final_turn and fixes < budget.fixes:
-                fixes += 1
-                if cut:
-                    note = "The tool call was cut off at the length limit, so nothing ran. Send a shorter call."
-                else:
-                    note = "The tool call could not be read, so nothing ran. Send one complete tool call or a plain answer."
-                messages.append({"role": "assistant", "content": clip(answer, 600)})
-                messages.append({"role": "user", "content": tool_response(note)})
-                continue
-            if budget.verify and wrote and not verified and not nudged and not final_turn:
-                # One nudge only. The next plain answer is accepted as it is.
-                nudged = True
-                messages.append({"role": "assistant", "content": clip(plain_answer(answer), 600)})
-                messages.append({"role": "user", "content": tool_response(VERIFY_NUDGE)})
-                continue
-            return "\n".join([*logs, plain_answer(answer)]).strip()[:4000]
-        head = command.split(None, 1)[0].upper()
-        if final_turn and head not in FINAL_TOOLS:
-            break
-        say("tool " + command.splitlines()[0][:120])
-        source = command if "\n" in command else answer
+class AgentRun:
+    """One job, run the way a long coding session runs: plan, look, change, check, report."""
+
+    def __init__(self, prompt: str, ask, say, log_dir: Path | None, context_chars: int | None) -> None:
+        self.ask = ask or ask_fitted
+        self.say = say or _say_line
+        self.log_dir = log_dir or LOG_DIR
+        self.context = int(context_chars or CONTEXT_CHARS)
+        self.started = time.time()
+        kind, prompt = job_kind(prompt)
+        self.deep, prompt = deep_request(prompt)
+        self.kind = kind
+        self.budget = KIND_BUDGET[kind]
+        self.state = TaskState(prompt)
+        self.secrets = secret_values() if kind == "code" else []
+        # Stable first (cached by the server for every job of this kind), the task and live files after.
+        first = "Task:\n" + prompt + "\n\n" + workspace_note()
+        self.history: list[dict] = [
+            {"role": "system", "content": agent_system(kind)},
+            {"role": "user", "content": first},
+        ]
+        # The full conversation, never compacted. Saved only for verified code tasks.
+        self.transcript: list[dict] = [dict(item) for item in self.history]
+        self.logs: list[str] = []
+        self.usage = {"prompt": 0, "completion": 0, "cached": 0}
+        self.turns = 0
+        self.think_turns = 0
+        self.wrote = self.verified = self.passed = False
+
+    def view(self, suffix: list[str]) -> list[dict]:
+        """What the model sees this turn. The volatile suffix (TODO, last-step note) rides on the
+        newest message only and is never stored in history."""
+        messages = [{"role": item["role"], "content": str(item["content"])} for item in self.history]
+        extra = "\n\n".join(part for part in suffix if part)
+        if extra and len(messages) > 1:
+            messages[-1]["content"] += "\n\n" + extra
+        self.transcript[-1]["content"] = messages[-1]["content"]
+        return messages
+
+    def add_turn(self, call: str, response: str, note: str) -> None:
+        self.history.append({"role": "assistant", "content": clip(call, 1500), "note": note})
+        self.history.append({"role": "user", "content": response})
+        self.transcript.append({"role": "assistant", "content": call})
+        self.transcript.append({"role": "user", "content": response})
+
+    def call_model(self, think: bool, tokens: int, suffix: list[str]) -> dict:
+        compact(self.history, self.context, self.state, reserve=sum(len(part) + 2 for part in suffix))
+        reply = self.ask(self.view(suffix), think, tokens)
+        self.turns += 1
+        self.think_turns += 1 if think else 0
+        used = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
+        for key in self.usage:
+            self.usage[key] += _count(used.get(key))
+        return reply
+
+    def track(self, command: str, result: str) -> None:
+        if touches_secret(command) or has_secret(result, self.secrets):
+            self.state.secret = True
+
+    def finish(self, text: str, outcome: str, answer: str = "") -> str:
+        seconds = round(time.time() - self.started, 1)
+        row = {
+            "t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "kind": self.kind,
+            "outcome": outcome,
+            "turns": self.turns,
+            "think_turns": self.think_turns,
+            "prompt_tokens": self.usage["prompt"],
+            "completion_tokens": self.usage["completion"],
+            "cached_tokens": self.usage["cached"],
+            "seconds": seconds,
+            "changed": len(self.state.changed),
+            "verified": bool(self.verified and self.passed),
+        }
         try:
-            result, made = run_tool(command, source, cut, kind=kind)
-        except Exception as exc:  # a tool failure is a result for the model, not a dead job
-            result, made = f"error: {exc}", []
-        if made:
-            logs.extend(made)
-        else:
-            logs.append(command.splitlines()[0] + " -> " + (result.splitlines()[0] if result else "empty")[:140])
-        if any(item.startswith("wrote ") for item in made):
-            wrote, verified = True, False
-        elif head == "RUN" and wrote and not result.startswith("blocked") and VERIFY_RUN.search(command[4:]):
-            verified = True
-        if final_turn:
-            return "\n".join([*logs, "last tool result:", clip(result, 1500)]).strip()[:4000]
-        messages.append({"role": "assistant", "content": clip(call, 1500)})
-        messages.append({"role": "user", "content": tool_response(result)})
-    return "\n".join(logs)[:4000]
+            append_capped(self.log_dir / "usage.jsonl", json.dumps(row), limit=2_000_000, keep=5000)
+        except OSError:
+            pass
+        self.say(
+            f"usage {self.kind}: {self.turns} turns ({self.think_turns} thinking), prompt {self.usage['prompt']}"
+            f" tokens ({self.usage['cached']} cached), completion {self.usage['completion']}, {seconds}s, {outcome}"
+        )
+        if (
+            self.kind == "code" and outcome == "answered" and answer and self.wrote and self.verified
+            and self.passed and not self.state.secret
+        ):
+            self.save_trajectory(answer)
+        return text
+
+    def save_trajectory(self, answer: str) -> bool:
+        messages = [{"role": item["role"], "content": item["content"]} for item in self.transcript]
+        messages.append({"role": "assistant", "content": answer})
+        row = {
+            "t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "kind": self.kind,
+            "turns": self.turns,
+            "changed": self.state.changed,
+            "messages": messages,
+        }
+        line = json.dumps(row, ensure_ascii=False)
+        if self.state.secret or has_secret(line, self.secrets):
+            return False
+        try:
+            append_capped(self.log_dir / "trajectories.jsonl", line, limit=50_000_000, keep=2000)
+        except OSError:
+            return False
+        return True
+
+    def run(self) -> str:
+        budget, state, logs = self.budget, self.state, self.logs
+        fixes = 0
+        nudged = False
+        after_failure = False
+        writing = True  # the first turn of a code task may WRITE at once
+        no_think = False
+        retry_tokens = 0
+        last_sig = ""
+        repeats = 0
+        for turn in range(budget.max_turns):
+            final_turn = turn == budget.max_turns - 1
+            think, tokens = turn_budget(
+                self.kind, turn=turn, deep=self.deep, after_failure=after_failure, writing=writing,
+                final_turn=final_turn,
+            )
+            if no_think:
+                think, no_think = False, False
+            if retry_tokens:
+                tokens, retry_tokens = max(tokens, retry_tokens), 0
+            suffix = [todo_line(state.todo)]
+            if final_turn and len(self.history) > 2:
+                suffix.append(LAST_STEP)
+            reply = self.call_model(think, tokens, suffix)
+            # Only the visible answer is used. Thinking is never stored or sent back.
+            answer = visible_answer(reply.get("content") or "")
+            cut = reply.get("finish") == "length"
+            calls = pick_tools(answer, reply.get("tool_calls"))
+            after_failure = writing = False
+            if not calls:
+                if not answer and cut and think and not final_turn and fixes < budget.fixes:
+                    # Every token went to thinking. Ask again with thinking off.
+                    fixes += 1
+                    no_think = True
+                    continue
+                if looks_like_call(answer) and not final_turn and fixes < budget.fixes:
+                    fixes += 1
+                    if cut:
+                        note = "The tool call was cut off at the length limit, so nothing ran. Send a shorter call."
+                    else:
+                        note = "The tool call could not be read, so nothing ran. Send one complete tool call or a plain answer."
+                    self.add_turn(clip(answer, 600), tool_response(note), "unreadable tool call")
+                    after_failure, writing = True, cut
+                    continue
+                if cut and answer and tokens < budget.max_tokens and not final_turn and fixes < budget.fixes:
+                    # The answer hit the small tool-turn cap. Ask again with room for a whole answer.
+                    fixes += 1
+                    retry_tokens = budget.max_tokens
+                    continue
+                if budget.verify and self.wrote and not self.verified and not nudged and not final_turn:
+                    # One nudge only. The next plain answer is accepted as it is.
+                    nudged = True
+                    self.add_turn(clip(plain_answer(answer), 600), tool_response(VERIFY_NUDGE), "answered before a check")
+                    continue
+                final = plain_answer(answer)
+                return self.finish(compose(logs, final), "answered", final)
+            batch = batch_calls(calls)
+            heads = [tool_head(command) for command, _ in batch]
+            if final_turn and any(head not in FINAL_TOOLS for head in heads):
+                break
+            signature = "\n".join(command for command, _ in batch)
+            repeats = repeats + 1 if signature == last_sig else 1
+            last_sig = signature
+            call_text = "\n".join(text for _, text in batch)
+            first_line = batch[0][0].splitlines()[0][:120]
+            if repeats >= 3:
+                note = (
+                    f"Stopped: the same call ({first_line}) came three times in a row with no progress. "
+                    "The task is not finished."
+                )
+                return self.finish(compose(logs, note), "loop")
+            if repeats == 2:
+                self.add_turn(call_text, tool_response(LOOP_NUDGE), "repeated " + first_line)
+                after_failure = True
+                continue
+            results: list[str] = []
+            notes: list[str] = []
+            for command, _ in batch:
+                head = tool_head(command)
+                self.say("tool " + command.splitlines()[0][:120])
+                source = command if "\n" in command else answer
+                try:
+                    result, made = run_tool(command, source, cut, kind=self.kind, state=state)
+                except Exception as exc:  # a tool failure is a result for the model, not a dead job
+                    result, made = f"error: {exc}", []
+                self.track(command, result)
+                line = command.splitlines()[0] + " -> " + (result.splitlines()[0] if result else "empty")[:140]
+                if made:
+                    logs.extend(made)
+                else:
+                    logs.append(line)
+                notes.append(one_line(line, 160))
+                if any(item.startswith(("wrote ", "edited ")) for item in made):
+                    self.wrote, self.verified, self.passed = True, False, False
+                elif head == "RUN" and self.wrote and not result.startswith("blocked") and VERIFY_RUN.search(command[4:]):
+                    self.verified, self.passed = True, not tool_failed(result)
+                if tool_failed(result):
+                    after_failure = True
+                    tail = result.strip().splitlines()[-1] if result.strip() else ""
+                    state.failures.append(one_line(command.splitlines()[0] + " -> " + tail, 160))
+                if head in {"READ", "EDIT"} or (head == "RUN" and tool_failed(result)) or result.startswith(("not written", "not edited")):
+                    writing = True  # the next turn may well be an EDIT or a WRITE
+                results.append(result)
+            if final_turn:
+                return self.finish(compose(logs, "last tool result:\n" + clip("\n".join(results), 1500)), "last_turn")
+            response = "\n".join(tool_response(result) for result in results)
+            if len(calls) > len(batch):
+                response += "\n" + tool_response(BATCH_NOTE.format(n=len(batch)))
+            self.add_turn(call_text, response, "; ".join(notes))
+        return self.finish(compose(logs, "[stopped: out of turns before a final answer]"), "out_of_turns")
+
+
+def run_agent(prompt: str, *, ask=None, say=None, log_dir: Path | None = None, context_chars: int | None = None) -> str:
+    """One job. ask(messages, think, max_tokens) is the model call; drills pass a fake one."""
+    job = AgentRun(prompt, ask, say, log_dir, context_chars)
+    try:
+        return job.run()
+    except ModelWait:
+        raise  # the job goes back to the queue; it did not finish
+    except Exception as exc:
+        job.finish("", "error " + type(exc).__name__)
+        raise
 
 
 def worker_main() -> None:
@@ -1848,7 +2683,7 @@ def code_screen(snap: dict, typed: str, note: str, beat: int = 0) -> tuple[str, 
             f"free {snap.get('free_mib', 0)} MB"
         )
     )
-    lines.append(row("  LIST  GREP  READ  WRITE  RUN  SESSIONS"))
+    lines.append(row("  LIST  GLOB  GREP  READ  EDIT  WRITE  RUN  TODO"))
     jobs = list(reversed(snap["jobs"][:6]))
     if not jobs:
         lines.append(row("  waiting for a task"))
@@ -1992,8 +2827,9 @@ ROUTER_CASES = (
 )
 
 
-def _scripted(replies: list[str]):
-    """A fake model for drills: returns replies in order and records each call."""
+def _scripted(replies: list):
+    """A fake model for drills: returns replies in order and records each call.
+    A reply is the text, or a dict with content, tool_calls, finish and usage."""
     seen: list[dict] = []
 
     def ask(messages: list[dict], think: bool, max_tokens: int) -> dict:
@@ -2005,10 +2841,18 @@ def _scripted(replies: list[str]):
                 "task": messages[1]["content"],
                 "last": str(messages[-1]["content"]),
                 "count": len(messages),
+                "messages": [dict(item) for item in messages],
             }
         )
-        text = replies[min(len(seen) - 1, len(replies) - 1)]
-        return {"content": text, "tool_calls": [], "finish": "stop"}
+        item = replies[min(len(seen) - 1, len(replies) - 1)]
+        if isinstance(item, dict):
+            return {
+                "content": item.get("content", ""),
+                "tool_calls": item.get("tool_calls", []),
+                "finish": item.get("finish", "stop"),
+                "usage": item.get("usage", {}),
+            }
+        return {"content": item, "tool_calls": [], "finish": "stop"}
 
     return ask, seen
 
@@ -2033,6 +2877,11 @@ def router_drill(round_file: str, round_text: str) -> dict:
     pid = os.getpid()
     quiet = lambda _line: None  # noqa: E731
     checks: dict[str, bool] = {}
+    drill_logs = LOG_DIR / "drill" / f"logs-{pid}"
+
+    def drill_agent(prompt: str, **options) -> str:
+        return run_agent(prompt, log_dir=drill_logs, **options)
+
     missed = [(text, want, classify_task(text)) for text, want in ROUTER_CASES if classify_task(text) != want]
     checks["router"] = not missed
     checks["router_kinds"] = set(KIND_BUDGET) == {"quick", "research", "review", "code"} and all(
@@ -2055,6 +2904,11 @@ def router_drill(round_file: str, round_text: str) -> dict:
         and "WRITE relative/path\nthe file contents\nENDWRITE" in KIND_TOOLS["code"]
         and "READ relative/path 120-180" in KIND_TOOLS["quick"]
         and all(first_tool(line) for line in ("LIST relative/dir", "GREP text", "READ relative/path", "SESSIONS", "MKDIR relative/path", "RUN command"))
+        and "EDIT relative/path" in KIND_TOOLS["code"] and "EDIT" not in KIND_TOOLS["research"]
+        and "EDIT" not in KIND_TOOLS["quick"] and "GLOB **/*.py" in KIND_TOOLS["quick"]
+        and "TODO" not in KIND_TOOLS["quick"] and "TODO\n[x]" in KIND_TOOLS["code"]
+        and all(first_tool(line) for line in ("GLOB **/*.py", "EDIT a.py", "TODO"))
+        and "at most 8 lines" in KIND_TOOLS["code"] and len(KIND_TOOLS["code"]) < 2400
     )
     # Gates by kind. They add to the safety checks and never replace them.
     gate_file = f"workspace/agent-check/drill-gate-{pid}.txt"
@@ -2077,13 +2931,13 @@ def router_drill(round_file: str, round_text: str) -> dict:
     checks["gate_secret_code"] = run_tool("WRITE cluster.token\nx\nENDWRITE", "WRITE cluster.token\nx\nENDWRITE", False, kind="code")[0].startswith("blocked")
     # Budgets reach the model call, and the system prompt stays the same across jobs of a kind.
     ask, seen = _scripted(["hello"])
-    quick_out = run_agent("[kind:quick]\nsay hello", ask=ask, say=quiet)
+    quick_out = drill_agent("[kind:quick]\nsay hello", ask=ask, say=quiet)
     ask_deep, seen_deep = _scripted(["hi"])
-    run_agent("[kind:quick]\n/deep say hi", ask=ask_deep, say=quiet)
+    drill_agent("[kind:quick]\n/deep say hi", ask=ask_deep, say=quiet)
     ask_a, seen_a = _scripted(["fine"])
     ask_b, seen_b = _scripted(["fine"])
-    run_agent("[kind:code]\nfix the first thing", ask=ask_a, say=quiet)
-    run_agent("[kind:code]\nfix another thing", ask=ask_b, say=quiet)
+    drill_agent("[kind:code]\nfix the first thing", ask=ask_a, say=quiet)
+    drill_agent("[kind:code]\nfix another thing", ask=ask_b, say=quiet)
     checks["budget"] = (
         quick_out == "hello"
         and seen[0]["think"] is False and seen[0]["max_tokens"] == KIND_BUDGET["quick"].max_tokens
@@ -2101,39 +2955,40 @@ def router_drill(round_file: str, round_text: str) -> dict:
     verify_file = f"workspace/agent-check/drill-verify-{pid}.txt"
     write_call = f"WRITE {verify_file}\nok\nENDWRITE"
     ask, seen = _scripted([write_call, "Done.", "RUN echo check verify-ok", "Done and checked."])
-    out = run_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
+    out = drill_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
     checks["verify_nudge"] = (
         len(seen) == 4 and "did not RUN a compile" in seen[2]["last"]
         and out.endswith("Done and checked.") and f"wrote {verify_file}" in out
     )
     ask, seen = _scripted([write_call, "Done.", "Still done.", "never asked"])
-    out = run_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
+    out = drill_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
     checks["verify_once"] = len(seen) == 3 and out.endswith("Still done.")
     ask, seen = _scripted([write_call, "RUN echo check verify-ok", "Done."])
-    out = run_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
+    out = drill_agent("[kind:code]\nmake a drill file", ask=ask, say=quiet)
     checks["verify_skip"] = len(seen) == 3 and out.endswith("Done.") and all("did not RUN" not in item["last"] for item in seen)
     ask, seen = _scripted([write_call, "Done."])
-    run_agent("[kind:research]\nlook at a drill file", ask=ask, say=quiet)
+    drill_agent("[kind:research]\nlook at a drill file", ask=ask, say=quiet)
     checks["verify_code_only"] = len(seen) == 2
     # A gated WRITE inside a job is blocked and reported to the model.
     gated_file = f"workspace/agent-check/drill-gate-job-{pid}.txt"
     ask, seen = _scripted([f"WRITE {gated_file}\nno\nENDWRITE", "ok"])
-    out = run_agent("[kind:research]\nlook around", ask=ask, say=quiet)
+    out = drill_agent("[kind:research]\nlook around", ask=ask, say=quiet)
     checks["gate_job"] = safe_read(gated_file) == "missing" and "cannot change files" in seen[1]["last"] and out.endswith("ok")
     # Final turn: a cheap read still runs once and its result is kept.
-    ask, seen = _scripted(["LIST agent-logs/drill", "LIST agent-logs/drill", f"READ {round_file}"])
-    out = run_agent("[kind:quick]\nsay hello", ask=ask, say=quiet)
+    ask, seen = _scripted(["LIST agent-logs/drill", "LIST agent-logs", f"READ {round_file}"])
+    out = drill_agent("[kind:quick]\nsay hello", ask=ask, say=quiet)
     checks["final_tool"] = len(seen) == 3 and LAST_STEP in seen[2]["last"] and "last tool result:" in out and round_text in out
     turns = KIND_BUDGET["research"].max_turns
-    ask, seen = _scripted(["LIST agent-logs/drill"] * (turns - 1) + ["RUN rm -rf /"])
-    out = run_agent("[kind:research]\nsay hello", ask=ask, say=quiet)
+    # Alternating calls are not a loop; only the same call back to back is.
+    ask, seen = _scripted([("LIST agent-logs/drill", "LIST agent-logs")[n % 2] for n in range(turns - 1)] + ["RUN rm -rf /"])
+    out = drill_agent("[kind:research]\nsay hello", ask=ask, say=quiet)
     checks["final_tool_run"] = len(seen) == turns and out.endswith("last tool result:\nblocked") and "RUN rm -rf / -> blocked" in out
     # Malformed calls: one repair turn for quick, two otherwise.
     bad = '<tool_call>{"name": "read_file", "arguments": {"path": '
     ask_q, seen_q = _scripted([bad])
     ask_r, seen_r = _scripted([bad])
-    run_agent("[kind:quick]\nsay hello", ask=ask_q, say=quiet)
-    run_agent("[kind:research]\nsay hello", ask=ask_r, say=quiet)
+    drill_agent("[kind:quick]\nsay hello", ask=ask_q, say=quiet)
+    drill_agent("[kind:research]\nsay hello", ask=ask_r, say=quiet)
     checks["fixes"] = len(seen_q) == 2 and len(seen_r) == 3
     # Retries: hard 500 once, 503 still ends in ModelWait.
     no_sleep = lambda _s: None  # noqa: E731
@@ -2194,8 +3049,244 @@ def router_drill(round_file: str, round_text: str) -> dict:
                 found[1].unlink(missing_ok=True)
             except OSError:
                 pass
+    shutil.rmtree(drill_logs, ignore_errors=True)
     if missed:
         print("router missed: " + "; ".join(f"{text[:40]!r} want {want} got {got}" for text, want, got in missed), flush=True)
+    return checks
+
+
+def session_drill(round_file: str) -> dict:
+    """EDIT, GLOB, TODO, batches, thinking, compaction, loop breaker, usage and trajectories.
+    Mocked model only. Every file it makes is under workspace/agent-check or agent-logs/drill."""
+    pid = os.getpid()
+    quiet = lambda _line: None  # noqa: E731
+    checks: dict[str, bool] = {}
+    logs = LOG_DIR / "drill" / f"session-{pid}"
+    shutil.rmtree(logs, ignore_errors=True)
+    logs.mkdir(parents=True, exist_ok=True)
+
+    def agent(prompt: str, replies: list, **options) -> tuple[str, list[dict]]:
+        ask, seen = _scripted(replies)
+        return run_agent(prompt, ask=ask, say=quiet, log_dir=logs, **options), seen
+
+    def lines_of(name: str) -> list[str]:
+        try:
+            return [line for line in (logs / name).read_text(encoding="utf-8").splitlines() if line.strip()]
+        except OSError:
+            return []
+
+    target = f"workspace/agent-check/drill-edit-{pid}.py"
+    big = f"workspace/agent-check/drill-big-{pid}.txt"
+    made_file = f"workspace/agent-check/drill-traj-{pid}.txt"
+    path = inside(target)[1]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = b"a = 1\r\nb = 1\r\nc = 2\r\n"
+    path.write_bytes(original)
+    inside(big)[1].write_text("\n".join(f"line {n} " + "x" * 40 for n in range(1, 301)) + "\n", encoding="utf-8")
+
+    def edit(old: str, new: str, where: str = target) -> str:
+        return edit_call(where, old, new)
+
+    # EDIT: refused before READ, refused when ambiguous or absent, exact once works and keeps CRLF.
+    state = TaskState("drill")
+    unread = run_tool(edit("a = 1", "a = 5"), "", False, kind="code", state=state)[0]
+    checks["edit_unread"] = unread.startswith("refused: READ") and path.read_bytes() == original
+    numbered = run_tool(f"READ {target}", "", False, kind="code", state=state)[0]
+    checks["read_numbered"] = numbered.splitlines() == ["1: a = 1", "2: b = 1", "3: c = 2"]
+    long_read = read_tool(big)
+    ranged = read_tool(big + " 290-400")
+    checks["read_budget"] = (
+        long_read.startswith("1: line 1 ") and len(long_read) <= TOOL_CHARS and "300 lines in all" in long_read
+        and f"READ {big} " in long_read and ranged.splitlines()[0].startswith("290: ") and "300: line 300" in ranged
+    )
+    ambiguous = run_tool(edit("= 1", "= 9"), "", False, kind="code", state=state)[0]
+    absent = run_tool(edit("zzz = 0", "y = 1"), "", False, kind="code", state=state)[0]
+    checks["edit_ambiguous"] = ambiguous.startswith("refused") and "matches 2 times" in ambiguous and path.read_bytes() == original
+    checks["edit_absent"] = absent.startswith("refused") and "matches 0 times" in absent
+    done, made = run_tool(edit("a = 1", "a = 5"), "", False, kind="code", state=state)
+    checks["edit_unique"] = (
+        made == [f"edited {target}"] and "-a = 1" in done and "+a = 5" in done and "line 1" in done
+        and path.read_bytes() == b"a = 5\r\nb = 1\r\nc = 2\r\n" and state.changed == [target]
+    )
+    renumbered = run_tool(edit("2: b = 1", "2: b = 7"), "", False, kind="code", state=state)[1]
+    checks["edit_numbers"] = renumbered == [f"edited {target}"] and path.read_bytes() == b"a = 5\r\nb = 7\r\nc = 2\r\n"
+    cut_edit = run_tool(f"EDIT {target}\n{EDIT_OPEN}\nb = 7\n{EDIT_MID}\nb = 8", "", True, kind="code", state=state)[0]
+    checks["edit_safety"] = (
+        run_tool(edit("x", "y", "cluster.token"), "", False, kind="code", state=state)[0].startswith("blocked")
+        and run_tool(edit("x", "y", "../outside.txt"), "", False, kind="code", state=state)[0].startswith("blocked")
+        and run_tool(edit("x", "y", "agents.db"), "", False, kind="code", state=state)[0].startswith("blocked")
+        and run_tool(edit("b = 7", "b = 8"), "", False, kind="research", state=state)[0].startswith("blocked")
+        and run_tool(edit("b = 7", "b = 8"), "", False, kind="quick", state=state)[0].startswith("blocked")
+        and cut_edit.startswith("not edited") and b"b = 7" in path.read_bytes()
+        and run_tool(edit("x", "y", f"workspace/agent-check/none-{pid}.py"), "", False, kind="code", state=state)[0].startswith("missing")
+    )
+    checks["edit_native"] = (
+        native_tool('<tool_call>{"name": "edit_file", "arguments": {"path": "workspace/a.py", "old_string": "x = 1", "new_string": "x = 2"}}</tool_call>')
+        == edit_call("workspace/a.py", "x = 1", "x = 2")
+        and parse_edit(edit_call("w/a.py", "one\ntwo", "")) == ("w/a.py", "one\ntwo", "", True)
+    )
+    # GLOB: patterns under the repo or workspace, never a secret, never outside.
+    globbed = tool_glob(f"workspace/agent-check/drill-edit-{pid}.*")
+    checks["glob"] = (
+        globbed == target and "agents.py" in tool_glob("*.py").splitlines()
+        and tool_glob("../*").startswith("need") and tool_glob("C:/Windows/*").startswith("need")
+        and tool_glob("*.token") == "no matches" and tool_glob("**/nodes.json") == "no matches"
+        and target in tool_glob("workspace/**/*.{py,md}")
+        and native_tool('<tool_call>{"name": "glob", "arguments": {"pattern": "**/*.py"}}</tool_call>') == "GLOB **/*.py"
+    )
+    # TODO: kept by the agent, shown on the newest message only, never stored in history.
+    todo_call = "TODO\n[>] read the file\n[ ] edit it\n[ ] run a check"
+    out, seen = agent("[kind:code]\nlook at the drill file", [todo_call, f"READ {target}", "GLOB workspace/agent-check/*.py", "Looked."])
+    pin = "TODO 0/3: [>] read the file | [ ] edit it | [ ] run a check"
+    checks["todo_pinned"] = (
+        len(seen) == 4 and pin not in seen[0]["last"] and pin in seen[1]["last"] and pin in seen[3]["last"]
+        and all(pin not in item["content"] for item in seen[3]["messages"][:-1])
+        and native_tool('<tool_call>{"name": "todo_write", "arguments": {"todos": [{"content": "a", "status": "completed"}, {"content": "b", "status": "in_progress"}]}}</tool_call>')
+        == "TODO\n[x] a\n[>] b"
+    )
+    # Batches: up to 3 read-only calls run together; WRITE/EDIT/RUN go alone.
+    four = f"READ {target}\nLIST workspace/agent-check\nGLOB workspace/agent-check/drill-edit-{pid}.*\nGREP drill_marker_never"
+    out, seen = agent("[kind:research]\nlook at the drill file", [four, "Read them."])
+    last = seen[1]["last"]
+    checks["batch_reads"] = (
+        last.count("<tool_response>") == 4 and "1: a = 5" in last and f"drill-edit-{pid}.py" in last
+        and "Only the first 3" in last and "GREP drill_marker_never" not in out and out.endswith("Read them.")
+    )
+    out, seen = agent("[kind:research]\nlook", [f"READ {target}\nRUN echo batch-never", "ok"])
+    out2, seen2 = agent("[kind:research]\nlook", [f"RUN echo solo-ok\nREAD {target}", "ok"])
+    native_two = (
+        f'<tool_call>\n{{"name": "read_file", "arguments": {{"path": "{target}"}}}}\n</tool_call>\n'
+        '<tool_call>\n{"name": "list_dir", "arguments": {"path": "workspace/agent-check"}}\n</tool_call>'
+    )
+    out3, seen3 = agent("[kind:research]\nlook", [native_two, "ok"])
+    checks["batch_alone"] = (
+        "batch-never" not in seen[1]["last"] and "Only the first 1" in seen[1]["last"]
+        and "solo-ok" in seen2[1]["last"] and "1: a = 5" not in seen2[1]["last"]
+        and seen3[1]["last"].count("<tool_response>") == 2 and "1: a = 5" in seen3[1]["last"]
+    )
+    # Thinking: on to plan the first turn, off for routine turns, on right after a failure.
+    fail_run = "echo check & exit 3" if os.name == "nt" else "echo check; exit 3"
+    out, seen = agent("[kind:code]\nlook at the drill file", [f"READ {target}", f"RUN {fail_run}", "GLOB workspace/agent-check/*.py", "Done."])
+    checks["think_first"] = seen[0]["think"] is True and seen[0]["max_tokens"] == KIND_BUDGET["code"].max_tokens
+    checks["think_routine"] = seen[1]["think"] is False and seen[3]["think"] is False
+    checks["think_after_failure"] = seen[2]["think"] is True
+    out, seen = agent("[kind:research]\nwhere is drill", ["GREP drill_marker_never", "LIST workspace", "Nowhere."])
+    out_q, seen_q = agent("[kind:quick]\nsay hi", ["hi"])
+    out_d, seen_d = agent("[kind:research]\n/deep where is drill", ["LIST workspace", "ok"])
+    checks["think_tokens"] = (
+        seen[0]["think"] is True and seen[1]["think"] is False and seen[1]["max_tokens"] == TOOL_TOKENS
+        and seen[2]["max_tokens"] == TOOL_TOKENS and seen_q[0]["think"] is False
+        and all(item["think"] for item in seen_d) and seen_d[1]["max_tokens"] == DEEP_TOKENS
+    )
+    cut_answer = {"content": "a long answer that", "finish": "length"}
+    out, seen = agent("[kind:research]\nexplain the drill", ["LIST workspace", cut_answer, "Whole answer."])
+    checks["final_tokens"] = len(seen) == 3 and seen[2]["max_tokens"] == KIND_BUDGET["research"].max_tokens and out.endswith("Whole answer.")
+    # Compaction: the oldest turns fold into one summary; system, task, summary, newest stay.
+    task_state = TaskState("compact drill task")
+    task_state.read_names, task_state.changed = ["a.py"], ["b.py"]
+    task_state.failures, task_state.todo = ["RUN x -> exit 1"], [("doing", "fix b")]
+    history = [{"role": "system", "content": "S" * 300}, {"role": "user", "content": "Task:\n" + "T" * 400}]
+    for number in range(10):
+        history.append({"role": "assistant", "content": f"READ f{number} " + "c" * 200, "note": f"READ f{number} -> ok{number}"})
+        history.append({"role": "user", "content": tool_response(f"r{number} " + "y" * 1500)})
+    compact(history, 9000, task_state)
+    first_summary = history[2]["content"] if len(history) > 2 else ""
+    for number in range(10, 16):
+        history.append({"role": "assistant", "content": f"READ f{number} " + "c" * 200, "note": f"READ f{number} -> ok{number}"})
+        history.append({"role": "user", "content": tool_response(f"r{number} " + "y" * 1500)})
+    compact(history, 9000, task_state)
+    view = [{"role": item["role"], "content": item["content"]} for item in history]
+    fit_context(view, 3000)
+    checks["compact"] = (
+        history[0]["content"] == "S" * 300 and history[1]["content"] == "Task:\n" + "T" * 400
+        and first_summary.startswith(SUMMARY_HEAD) and "READ f0 -> ok0" in first_summary
+        and "Files read: a.py" in first_summary and "Files changed: b.py" in first_summary
+        and "Failed attempts:" in first_summary and "TODO 0/1: [>] fix b" in first_summary
+        and is_summary(history[2]) and sum(1 for item in history if is_summary(item)) == 1
+        and "READ f9 -> ok9" in history[2]["content"]
+        and history[-2]["content"].startswith("READ f15") and "r15 " in history[-1]["content"]
+        and "r14 " in history[-3]["content"] and sum(len(item["content"]) for item in history) <= 9000
+        and is_summary(view[2]) and view[1]["content"] == history[1]["content"] and "r15 " in view[-1]["content"]
+    )
+    reads = [f"READ {big}", f"READ {big} 60-140", f"READ {big} 140-220", f"READ {big} 220-300", "LIST workspace/agent-check", "Done."]
+    out, seen = agent("[kind:research]\nread the big drill file", reads, context_chars=9000)
+    final_view = seen[-1]["messages"]
+    checks["compact_agent"] = (
+        is_summary(final_view[2]) and final_view[1]["content"].startswith("Task:\nread the big drill file")
+        and final_view[0]["content"] == agent_system("research") and "Files read: " + big in final_view[2]["content"]
+        and f"drill-edit-{pid}.py" in final_view[-1]["content"] and final_view[-2]["role"] == "assistant"
+    )
+    # Loop breaker: the same call twice gets a nudge, three times ends the job honestly.
+    out, seen = agent("[kind:research]\nlook", [f"READ {target}"] * 5)
+    checks["loop_breaker"] = (
+        len(seen) == 3 and "same call as last turn" in seen[2]["last"] and "Stopped:" in out
+        and "three times" in out and "not finished" in out
+    )
+    # Usage: one line per finished task, with the API's token counts.
+    before = len(lines_of("usage.jsonl"))
+    replies = [
+        {"content": "LIST workspace", "usage": {"prompt": 120, "completion": 7, "cached": 100}},
+        {"content": "hello", "usage": {"prompt": 130, "completion": 3, "cached": 120}},
+    ]
+    agent("[kind:quick]\nsay hello", replies)
+    rows = lines_of("usage.jsonl")
+    row = json.loads(rows[-1]) if rows else {}
+    usage_body = (
+        b'{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],'
+        b'"usage":{"prompt_tokens":11,"completion_tokens":2},"timings":{"cache_n":5}}'
+    )
+    import io
+
+    parsed = chat([{"role": "user", "content": "x"}], _open=lambda request, timeout=0: io.BytesIO(usage_body), _sleep=lambda _s: None)
+    checks["usage_line"] = (
+        len(rows) == before + 1 and row.get("prompt_tokens") == 250 and row.get("completion_tokens") == 10
+        and row.get("cached_tokens") == 220 and row.get("turns") == 2 and row.get("kind") == "quick"
+        and row.get("outcome") == "answered" and parsed["usage"] == {"prompt": 11, "completion": 2, "cached": 5}
+    )
+    # Trajectories: only a code task whose last check passed, and never one that touched a secret.
+    write = f"WRITE {made_file}\nok\nENDWRITE"
+    agent("[kind:code]\nmake a drill file", [write, "RUN echo check traj-ok", "Wrote the file. Check passed."])
+    saved = lines_of("trajectories.jsonl")
+    good = json.loads(saved[-1]) if saved else {}
+    messages = good.get("messages") or [{}]
+    agent("[kind:code]\nmake a drill file", [write, f"RUN {fail_run}", "Done, but the check failed."])
+    agent("[kind:code]\nmake a drill file", [write, "Done.", "Still done."])
+    agent("[kind:code]\nmake a drill file", ["READ cluster.token", write, "RUN echo check traj-ok", "Done."])
+    agent("[kind:code]\nmake a drill file", [write, "RUN echo check sk-" + "a" * 24, "Done."])
+    agent("[kind:code]\nmake a drill file", ["GREP nodes.json", write, "RUN echo check traj-ok", "Done."])
+    agent("[kind:research]\nlook", ["RUN echo check traj-ok", "Done."])
+    after = lines_of("trajectories.jsonl")
+    whole = "\n".join(after)
+    checks["trajectory"] = (
+        len(saved) == 1 and len(after) == 1 and messages[0].get("role") == "system"
+        and messages[0].get("content") == agent_system("code")
+        and str(messages[1].get("content", "")).startswith("Task:\nmake a drill file")
+        and any(item.get("role") == "assistant" and "ENDWRITE" in item.get("content", "") for item in messages)
+        and any(item.get("role") == "user" and "traj-ok" in item.get("content", "") for item in messages)
+        and messages[-1] == {"role": "assistant", "content": "Wrote the file. Check passed."}
+    )
+    checks["trajectory_secret"] = "cluster.token" not in whole and "sk-aaaa" not in whole and "nodes.json" not in whole
+    # Public repo: peers come from the env or nodes.json, optional watchers never need the scripts.
+    peers_file = logs / "peers.json"
+    peers_file.write_text(json.dumps([{"url": "http://10.0.0.5:8781/"}, {"url": 5}, {"name": "x"}]), encoding="utf-8")
+    missing = logs / "no-such-script.py"
+    checks["peers_env"] = (
+        peer_urls({"NEURO_PEER_URLS": " http://a:1/, ,ftp://x, http://b:2"}) == ("http://a:1", "http://b:2")
+        and peer_urls({"NEURO_PEER_URLS": ""}) == ()
+        and peer_urls({}, nodes=peers_file) == ("http://10.0.0.5:8781",)
+        and peer_urls({}, nodes=logs / "none.json") == ()
+    )
+    checks["optional_watchers"] = all(
+        "optional watcher" in watch_report(role, {role: missing}) for role in ("train", "night", "brain")
+    )
+    for leftover in (target, big, made_file):
+        found = inside(leftover)
+        if found:
+            try:
+                found[1].unlink(missing_ok=True)
+            except OSError:
+                pass
+    shutil.rmtree(logs, ignore_errors=True)
     return checks
 
 
@@ -2268,6 +3359,10 @@ def drill_round(index: int) -> dict:
     except Exception as exc:  # a broken drill is a failed check, not a dead fleet loop
         checks["router_drill_" + type(exc).__name__] = False
     try:
+        checks.update(session_drill(relative))
+    except Exception as exc:
+        checks["session_drill_" + type(exc).__name__] = False
+    try:
         (folder / name).unlink(missing_ok=True)
     except OSError:
         pass
@@ -2311,11 +3406,45 @@ NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" el
 
 WATCH_ROLES = ("train", "lock", "night", "mesh", "peers", "drill", "review", "brain")
 WATCH_STOP = HOME / "watch.stop"
-PEER_URLS = (
-    "http://192.168.7.169:8781",
-    "http://192.168.7.31:8781",
-    "http://192.168.7.247:8781",
-)
+# Optional watchers. The training run, the night loop and the brain server exist only on some
+# computers; where the script is absent the watcher says so instead of looking for a process.
+TRAIN_SCRIPT = Path(os.environ.get("NEURO_TRAIN_SCRIPT") or (HOME.parent / "ml" / "training" / "train.py"))
+NIGHT_SCRIPT = Path(os.environ.get("NEURO_NIGHT_SCRIPT") or (HOME / "night-loop.ps1"))
+BRAIN_SCRIPT = Path(os.environ.get("NEURO_BRAIN_SCRIPT") or (HOME.parent / "brain" / "server.py"))
+OPTIONAL_SCRIPTS = {"train": TRAIN_SCRIPT, "night": NIGHT_SCRIPT, "brain": BRAIN_SCRIPT}
+
+
+def optional_script(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def peer_urls(env=None, nodes: Path | None = None) -> tuple[str, ...]:
+    """Other computers to glance at. NEURO_PEER_URLS (comma-separated) wins; when it is unset,
+    the saved computers in nodes.json next to mesh.py; otherwise none."""
+    source = os.environ if env is None else env
+    raw = source.get("NEURO_PEER_URLS")
+    items: list[str] = []
+    if raw is not None:
+        items = raw.split(",")
+    else:
+        path = nodes if nodes is not None else (ROOT / "nodes.json" if _mesh_state(ROOT) == "file" else None)
+        data: object = []
+        if path is not None:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = []
+        if isinstance(data, list):
+            items = [item["url"] for item in data if isinstance(item, dict) and isinstance(item.get("url"), str)]
+    urls: list[str] = []
+    for item in items:
+        url = item.strip().rstrip("/")
+        if re.fullmatch(r"https?://[^\s/]+(?:/[^\s]*)?", url) and url not in urls:
+            urls.append(url)
+    return tuple(urls[:16])
 
 
 def matching_pids(fragment: str) -> list[int]:
@@ -2344,10 +3473,13 @@ def matching_pids(fragment: str) -> list[int]:
     return found
 
 
-def watch_report(role: str) -> str:
+def watch_report(role: str, scripts: dict[str, Path] | None = None) -> str:
+    scripts = OPTIONAL_SCRIPTS if scripts is None else scripts
+    if role in scripts and not optional_script(scripts[role]):
+        return f"{role}: no script at {scripts[role].name} on this computer (optional watcher)"
     if role == "train":
         try:
-            found = matching_pids(r"ml\training\train.py")
+            found = matching_pids(str(Path(*TRAIN_SCRIPT.parts[-3:])))
         except (OSError, subprocess.TimeoutExpired):
             return "could not list processes. resume not attempted"
         if not found:
@@ -2363,7 +3495,7 @@ def watch_report(role: str) -> str:
         return "gpu lock present, treated as busy. resume not attempted"
     if role == "night":
         try:
-            found = matching_pids("night-loop.ps1")
+            found = matching_pids(NIGHT_SCRIPT.name)
         except (OSError, subprocess.TimeoutExpired):
             return "could not list the night loop"
         tail = ""
@@ -2382,7 +3514,7 @@ def watch_report(role: str) -> str:
         return "mesh serve alive pid " + str(found[0]) if found else "mesh serve missing"
     if role == "peers":
         parts = []
-        for url in PEER_URLS:
+        for url in peer_urls():
             try:
                 request = urllib.request.Request(url + "/hello", method="GET")
                 with _OPENER.open(request, timeout=4) as response:
@@ -2406,7 +3538,7 @@ def watch_report(role: str) -> str:
         return "review cursor " + (raw[:20] if raw.isdigit() else "unreadable")
     if role == "brain":
         try:
-            found = matching_pids(r"brain\server.py")
+            found = matching_pids(str(Path(*BRAIN_SCRIPT.parts[-2:])))
         except (OSError, subprocess.TimeoutExpired):
             return "could not list the brain server"
         return "brain server alive pid " + str(found[0]) if found else "brain server missing"
@@ -2468,7 +3600,7 @@ def fleet_main() -> None:
             if drill_round(index + 1).get("ok"):
                 local_ok += 1
         peer_bits = []
-        for url in PEER_URLS:
+        for url in peer_urls():
             try:
                 request = urllib.request.Request(url + "/hello", method="GET")
                 with _OPENER.open(request, timeout=5) as response:
