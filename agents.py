@@ -1105,6 +1105,7 @@ def _stop_tree(process: subprocess.Popen) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     else:
         import signal
@@ -1675,6 +1676,7 @@ def stop_workers() -> dict:
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         else:
             try:
@@ -2302,6 +2304,11 @@ def terminal(workers: int = 4) -> None:
         stop_workers()
 
 
+# Detached agents and watchers have no console. Any console program they start (powershell,
+# taskkill) would otherwise open a new visible window every time it runs.
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
 WATCH_ROLES = ("train", "lock", "night", "mesh", "peers", "drill", "review", "brain")
 WATCH_STOP = HOME / "watch.stop"
 PEER_URLS = (
@@ -2325,6 +2332,7 @@ def matching_pids(fragment: str) -> list[int]:
         timeout=40,
         env={**os.environ, "WATCH_MATCH": f"*{fragment}*"},
         check=False,
+        **NO_WINDOW,
     )
     if completed.returncode != 0:
         raise OSError("process list failed")
