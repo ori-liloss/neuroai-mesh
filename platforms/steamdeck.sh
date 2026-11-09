@@ -28,6 +28,11 @@ MODEL_DIR="$HOME/models"
 MODEL="$MODEL_DIR/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 LOG="$HOME/llama-server.log"
+# Parallel slots: llama-server answers NEURO_MODEL_SLOTS requests at once (1-8, default 2),
+# 8k context each, and the worker runs one generate job per slot.
+MODEL_SLOTS="${NEURO_MODEL_SLOTS:-2}"
+case "$MODEL_SLOTS" in 1|2|3|4|5|6|7|8) ;; *) MODEL_SLOTS=2 ;; esac
+MODEL_CTX=$((MODEL_SLOTS * 8192))
 
 model_up() { curl -s -m 2 http://127.0.0.1:8080/health >/dev/null 2>&1; }
 
@@ -73,7 +78,7 @@ else
   fi
 
   echo "[3/4] Starting the model on 127.0.0.1:8080 (log: $LOG)..."
-  ( cd "$(dirname "$SERVER")" && exec "$SERVER" -m "$MODEL" --host 127.0.0.1 --port 8080 -c 8192 --jinja -ngl 99 ) >"$LOG" 2>&1 &
+  ( cd "$(dirname "$SERVER")" && exec "$SERVER" -m "$MODEL" --host 127.0.0.1 --port 8080 -np "$MODEL_SLOTS" --kv-unified -c "$MODEL_CTX" --jinja -ngl 99 ) >"$LOG" 2>&1 &
   LLAMA_PID=$!
   waited=0
   until model_up; do

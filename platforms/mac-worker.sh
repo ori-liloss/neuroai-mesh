@@ -11,6 +11,11 @@ cd "$(dirname "$0")/.." || exit 1
 
 model_up() { curl -s -m 2 http://127.0.0.1:8080/health >/dev/null 2>&1; }
 LOG="$HOME/llama-server.log"
+# Parallel slots: llama-server answers NEURO_MODEL_SLOTS requests at once (1-8, default 2),
+# 8k context each, and the worker runs one generate job per slot.
+MODEL_SLOTS="${NEURO_MODEL_SLOTS:-2}"
+case "$MODEL_SLOTS" in 1|2|3|4|5|6|7|8) ;; *) MODEL_SLOTS=2 ;; esac
+MODEL_CTX=$((MODEL_SLOTS * 8192))
 LLAMA_PID=""
 cleanup() {
   if [ -n "$LLAMA_PID" ]; then
@@ -25,7 +30,7 @@ if model_up; then
 else
   command -v llama-server >/dev/null 2>&1 || { echo "llama-server was not found. Run: brew install llama.cpp"; exit 1; }
   echo "[1/2] Starting the model on 127.0.0.1:8080 (first time downloads ~2.9 GB; log: $LOG)..."
-  llama-server -hf unsloth/Qwen3.5-4B-GGUF:UD-Q4_K_XL --host 127.0.0.1 --port 8080 -c 8192 --jinja >"$LOG" 2>&1 &
+  llama-server -hf unsloth/Qwen3.5-4B-GGUF:UD-Q4_K_XL --host 127.0.0.1 --port 8080 -np "$MODEL_SLOTS" --kv-unified -c "$MODEL_CTX" --jinja >"$LOG" 2>&1 &
   LLAMA_PID=$!
   waited=0
   until model_up; do

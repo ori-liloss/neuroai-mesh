@@ -252,7 +252,15 @@ Another port: set `NEURO_LOCAL_LLM=8090` for the worker.
 
 ## 6. The data factory
 
-The main PC keeps a queue in `jobs/` (gitignored). Idle workers pull one job at a time.
+The main PC keeps a queue in `jobs/` (gitignored). Idle workers pull jobs into job slots.
+
+**Job slots.** Each worker runs several jobs at once: generate slots (as many as its local
+`llama-server` serves in parallel, read from `/props` or `/slots`, at most 4; 1 if it does not say)
+and check slots for `verify_*`, `cross_tests` and `dedup_hash` (one per 4 CPU cores, 1 to 4).
+Every slot leases its own job; a busy CPU, low memory or the GPU lock pauses new leases, and the
+GPU lock pauses only generate. Override with `NEURO_GEN_SLOTS` and `NEURO_CPU_SLOTS` (0 to 8).
+The `platforms/` scripts start the model with `-np 2 --kv-unified -c 16384` (2 slots of 8k
+context; `NEURO_MODEL_SLOTS` changes the count). The Jobs page shows e.g. `generating 2/2 · checking 1/3`.
 
 | Job kind | Checks | Notes |
 | --- | --- | --- |
@@ -452,6 +460,8 @@ fixed benchmark (pass@1 and tokens per task) → a second round on verified answ
 | `NEURO_MESH_URL` | worker | The main PC's page, e.g. `http://192.168.1.20:8780`. Normally found by itself. |
 | `NEURO_JOBS=0` | worker | Take no data jobs. |
 | `NEURO_LOCAL_LLM` | worker | Port of the local model server (default 8080). |
+| `NEURO_GEN_SLOTS`, `NEURO_CPU_SLOTS` | worker | Parallel generate / check job slots (default: the model server's slot count up to 4; cores/4, 1 to 4). |
+| `NEURO_MODEL_SLOTS` | `platforms/` scripts | Parallel slots the started `llama-server` gets (default 2, 8k context each). |
 | `NEURO_LUAU` | worker | Path to the `luau` binary for `verify_luau`. |
 | `NEURO_RUN_TESTS=1` | Linux/macOS worker | Allow `verify_tests` / `cross_tests` (runs model-written code under rlimits; network not blocked). Windows uses a Job Object and needs no switch. |
 | `NEURO_RPC_BIN` | any | Path to `ggml-rpc-server` for memory sharing. |

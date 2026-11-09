@@ -31,6 +31,8 @@ The worker finds the main PC on the local network by itself and remembers it in 
 
 Chat and generate jobs use a llama.cpp `llama-server` you run yourself on `127.0.0.1:8080`. The Steam Deck, Mac and Windows-laptop scripts in `platforms/` can download and start one for you.
 
+Each worker runs several jobs at once in job slots: generate slots (as many parallel slots as its `llama-server` reports, at most 4) and check slots for the verifiers (one per 4 CPU cores, 1 to 4). Override with `NEURO_GEN_SLOTS` and `NEURO_CPU_SLOTS`. The `platforms/` scripts start the model with 2 slots of 8k context (`-np 2 --kv-unified -c 16384`; `NEURO_MODEL_SLOTS` changes it).
+
 ## The page
 
 | Tab | Shows |

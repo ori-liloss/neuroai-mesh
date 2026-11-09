@@ -35,6 +35,12 @@ $ModelUrl = 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5
 $ReleasesUrl = 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1'
 $Log = Join-Path $NeuroDir 'llama-server.log'
 $ErrLog = Join-Path $NeuroDir 'llama-server.err.log'
+# Parallel slots: llama-server answers NEURO_MODEL_SLOTS requests at once (1-8, default 2),
+# 8k context each, and the worker runs one generate job per slot.
+$ModelSlots = 2
+$slotsRaw = "$env:NEURO_MODEL_SLOTS".Trim()
+if ($slotsRaw -match '^[1-8]$') { $ModelSlots = [int]$slotsRaw }
+$ModelCtx = $ModelSlots * 8192
 $UserAgent = 'neuro-windows-worker'
 
 # ---------------------------------------------------------------- helpers
@@ -246,7 +252,7 @@ function Test-OutOfMemory {
 # Returns the started process when /health answers, $null otherwise. Sets $script:LastOom.
 function Start-Model([string]$Server, [int]$Ngl) {
   $script:LastOom = $false
-  $argLine = "-m `"$Model`" --host 127.0.0.1 --port 8080 -c 8192 --jinja -ngl $Ngl"
+  $argLine = "-m `"$Model`" --host 127.0.0.1 --port 8080 -np $ModelSlots --kv-unified -c $ModelCtx --jinja -ngl $Ngl"
   try {
     $proc = Start-Process -FilePath $Server -ArgumentList $argLine -WorkingDirectory (Split-Path -Parent $Server) `
       -WindowStyle Hidden -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru -ErrorAction Stop

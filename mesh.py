@@ -1850,6 +1850,7 @@ def user_luau_path() -> Path | None:
 
 
 _cpu_sample: dict = {"at": 0.0, "idle": 0, "total": 0, "pct": None}
+_cpu_lock = threading.Lock()
 
 
 def cpu_busy_pct() -> int | None:
@@ -1862,18 +1863,20 @@ def cpu_busy_pct() -> int | None:
             return None
         if not ok:
             return None
-        now = time.time()
-        if now - float(_cpu_sample["at"]) < 1.0:
+        # The worker's job slots ask from several threads at once.
+        with _cpu_lock:
+            now = time.time()
+            if now - float(_cpu_sample["at"]) < 1.0:
+                return _cpu_sample["pct"]
+            # Kernel time includes idle time on Windows.
+            total = kernel.value + user.value
+            now_idle = idle.value
+            last_total, last_idle = int(_cpu_sample["total"]), int(_cpu_sample["idle"])
+            _cpu_sample.update({"at": now, "total": total, "idle": now_idle})
+            span = total - last_total
+            if last_total and span > 0:
+                _cpu_sample["pct"] = max(0, min(100, round(100 * (1 - (now_idle - last_idle) / span))))
             return _cpu_sample["pct"]
-        # Kernel time includes idle time on Windows.
-        total = kernel.value + user.value
-        now_idle = idle.value
-        last_total, last_idle = int(_cpu_sample["total"]), int(_cpu_sample["idle"])
-        _cpu_sample.update({"at": now, "total": total, "idle": now_idle})
-        span = total - last_total
-        if last_total and span > 0:
-            _cpu_sample["pct"] = max(0, min(100, round(100 * (1 - (now_idle - last_idle) / span))))
-        return _cpu_sample["pct"]
     try:
         load = os.getloadavg()[0]
     except (OSError, AttributeError):
@@ -1950,13 +1953,9 @@ def capabilities(cards: list[dict], ram: dict, chat: bool, rpc_ready: bool) -> d
         # cross_tests). Network access is not blocked for them.
         "tests": ({"langs": sorted(sandbox_status()["langs"]), "note": sandbox_status()["note"]}
                   if _job_state.get("on") else None),
-        "jobs": {
-            "on": bool(_job_state.get("on")),
-            "done": int(_job_state.get("done") or 0),
-            "failed": int(_job_state.get("failed") or 0),
-            "paused": str(_job_state.get("paused") or ""),
-            "current": str(_job_state.get("current") or ""),
-        },
+        # done/failed/paused/current as before, plus "running" (every kind
+        # the job slots run now) and "slots" (busy/total per slot sort).
+        "jobs": job_state_view(),
     }
 
 
@@ -3005,6 +3004,10 @@ AGREEMENT_MIN = 0.5
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX16 = re.compile(r"^[0-9a-f]{16}$")
 SKILLS = {"general", "code", "math", "luau"}
+# Worker job slots: "g0".."g7" lease generate, "c0".."c7" lease checks.
+_SLOT_ID = re.compile(r"[gc][0-7]")
+SLOT_CAP = 8
+GEN_SLOT_DEFAULT_CAP = 4
 
 
 class JobError(ValueError):
@@ -3582,8 +3585,8 @@ class JobQueue:
             job["passed"] = event.get("passed") if isinstance(event.get("passed"), bool) else None
             job["node"] = str(event.get("node") or "")
             held = self.leases.pop(jid, None)
-            if held and self.by_node.get(held["node"]) == jid:
-                self.by_node.pop(held["node"], None)
+            if held and self.by_node.get(held.get("key", held["node"])) == jid:
+                self.by_node.pop(held.get("key", held["node"]), None)
             if job["node"]:
                 bucket = self.node_done.setdefault(job["node"], {"done": 0, "failed": 0})
                 bucket["done" if job["state"] == "done" else "failed"] += 1
@@ -3609,8 +3612,8 @@ class JobQueue:
             if held["until"] > now:
                 continue
             self.leases.pop(jid, None)
-            if self.by_node.get(held["node"]) == jid:
-                self.by_node.pop(held["node"], None)
+            if self.by_node.get(held.get("key", held["node"])) == jid:
+                self.by_node.pop(held.get("key", held["node"]), None)
             job = self.jobs.get(jid)
             if job is None or job["state"] != "leased":
                 continue
@@ -3645,10 +3648,14 @@ class JobQueue:
         return ids
 
     def lease(self, node: str, kinds: object, now: float | None = None, gen_max: object = None,
-              test_langs: object = None) -> dict | None:
+              test_langs: object = None, slot: object = None) -> dict | None:
         node = machine_key({"name": node, "os": ""})[0]
         if not node or not isinstance(kinds, list):
             return None
+        # A worker with job slots names the slot ("g0".."g7" generate,
+        # "c0".."c7" checks), so it holds at most one job per slot and at most
+        # 16 at once. A worker that sends no slot keeps one job at a time.
+        key = node + "/" + slot if isinstance(slot, str) and _SLOT_ID.fullmatch(slot) else node
         wanted = {kind for kind in kinds if kind in JOB_KINDS}
         if not wanted:
             return None
@@ -3663,10 +3670,10 @@ class JobQueue:
         with self.lock:
             self.sync()
             self._expire(now)
-            current = self.by_node.get(node)
+            current = self.by_node.get(key)
             if current and current in self.leases:
-                # One job per worker at a time: a worker that restarted gets
-                # the same job back instead of a second one.
+                # One job per worker slot at a time: a worker that restarted
+                # gets the same job back instead of a second one.
                 return self._view(current)
             for jid in self.order:
                 job = self.jobs[jid]
@@ -3679,8 +3686,8 @@ class JobQueue:
                 job["state"] = "leased"
                 job["attempts"] += 1
                 job["node"] = node
-                self.leases[jid] = {"lease": secrets.token_hex(12), "node": node, "until": now + LEASE_SECONDS[job["kind"]]}
-                self.by_node[node] = jid
+                self.leases[jid] = {"lease": secrets.token_hex(12), "node": node, "key": key, "until": now + LEASE_SECONDS[job["kind"]]}
+                self.by_node[key] = jid
                 return self._view(jid)
         return None
 
@@ -3826,12 +3833,18 @@ class JobQueue:
                     spec = job["payload"].get("verify")
                     if isinstance(spec, dict) and spec.get("kind") in coming:
                         coming[spec["kind"]] += 1
-            empty = {"done": 0, "failed": 0, "now": "", "hour_done": 0, "hour_failed": 0, "last_s": None}
+            empty = {"done": 0, "failed": 0, "now": "", "running": [], "hour_done": 0, "hour_failed": 0, "last_s": None}
             nodes = {}
             for name, bucket in self.node_done.items():
-                nodes[name] = dict(empty, done=bucket["done"], failed=bucket["failed"])
+                nodes[name] = dict(empty, done=bucket["done"], failed=bucket["failed"], running=[])
             for jid, held in self.leases.items():
-                nodes.setdefault(held["node"], dict(empty))["now"] = self.jobs[jid]["kind"]
+                row = nodes.setdefault(held["node"], dict(empty, running=[]))
+                row["running"].append(self.jobs[jid]["kind"])
+            for row in nodes.values():
+                # "now" stays one kind for older pages; "running" has every
+                # job a computer's slots hold now.
+                row["running"].sort(key=lambda kind: (kind != "generate", kind))
+                row["now"] = row["running"][0] if row["running"] else ""
             hour = {kind: 0 for kind in JOB_KINDS}
             for at, node, kind, good in reversed(self.finished):
                 age = now - at
@@ -4219,7 +4232,101 @@ def luau_path() -> str | None:
 
 
 _kinds_cache: dict = {"at": 0.0, "kinds": []}
-_job_state: dict = {"on": False, "done": 0, "failed": 0, "paused": "", "current": ""}
+# The worker's job slots run in parallel threads. Everything below is read by
+# the /hello thread too, so it is only touched under _job_lock.
+_job_lock = threading.Lock()
+_job_state: dict = {"on": False, "done": 0, "failed": 0, "paused": "", "current": "", "told": ""}
+_job_running: dict[str, str] = {}   # slot id -> kind it runs now
+_job_held: set[str] = set()         # job ids the slots run now
+_job_paused: dict[str, str] = {}    # slot id -> why it does not lease now
+_slot_cache: dict = {"at": 0.0, "gen": 0, "cpu": 0}
+
+
+def job_state_view() -> dict:
+    """The worker's job state for /hello: counters, the kinds its slots run
+    now, and how many slots of each sort are busy."""
+    with _job_lock:
+        running = sorted(_job_running.items())
+        gen_busy = sum(1 for slot, _ in running if slot.startswith("g"))
+        kinds = sorted((kind for _, kind in running), key=lambda kind: (kind != "generate", kind))
+        reasons = sorted({why for slot, why in _job_paused.items() if why and slot not in _job_running})
+        return {
+            "on": bool(_job_state.get("on")),
+            "done": int(_job_state.get("done") or 0),
+            "failed": int(_job_state.get("failed") or 0),
+            "paused": "; ".join(reasons) if reasons else str(_job_state.get("paused") or ""),
+            "current": kinds[0] if kinds else "",
+            "running": kinds,
+            "slots": {
+                "generate": {"busy": gen_busy, "total": max(gen_busy, int(_slot_cache["gen"]))},
+                "check": {"busy": len(running) - gen_busy, "total": max(len(running) - gen_busy, int(_slot_cache["cpu"]))},
+            },
+        }
+
+
+def _slot_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    return min(int(raw), SLOT_CAP) if raw.isdigit() else None
+
+
+def _int_field(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def model_parallel_slots() -> int | None:
+    """How many requests the local llama-server serves at once: GET /props
+    (total_slots), else the length of GET /slots. None when it does not say."""
+    base = local_llm_base()
+    try:
+        with _DIRECT.open(base + "/props", timeout=2) as response:
+            props = read_reply(response)
+        if isinstance(props, dict):
+            settings = props.get("default_generation_settings")
+            settings = settings if isinstance(settings, dict) else {}
+            for value in (props.get("total_slots"), settings.get("total_slots"), settings.get("n_slots")):
+                if _int_field(value):
+                    return value
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+    try:
+        with _DIRECT.open(base + "/slots", timeout=2) as response:
+            slots = read_reply(response)
+        if isinstance(slots, list) and slots:
+            return len(slots)
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+    return None
+
+
+def gen_slot_count(model_slots: int | None) -> int:
+    """NEURO_GEN_SLOTS, else the model server's own slot count capped at 4, else 1."""
+    override = _slot_env("NEURO_GEN_SLOTS")
+    if override is not None:
+        return override
+    return max(1, min(GEN_SLOT_DEFAULT_CAP, model_slots)) if model_slots else 1
+
+
+def cpu_slot_count(cpus: int | None = None) -> int:
+    """NEURO_CPU_SLOTS, else one check slot per 4 cores, 1 to 4."""
+    override = _slot_env("NEURO_CPU_SLOTS")
+    if override is not None:
+        return override
+    return max(1, min(4, int(cpus or os.cpu_count() or 1) // 4))
+
+
+def slot_plan(refresh: bool = False) -> dict:
+    """How many generate and check slots lease jobs now. Asked again every
+    minute, so a model started later gets its generate slots."""
+    now = time.time()
+    with _job_lock:
+        if not refresh and now - float(_slot_cache["at"]) < 60:
+            return {"gen": int(_slot_cache["gen"]), "cpu": int(_slot_cache["cpu"])}
+    kinds = worker_kinds()
+    gen = gen_slot_count(model_parallel_slots()) if "generate" in kinds else 0
+    cpu = cpu_slot_count() if any(kind != "generate" for kind in kinds) else 0
+    with _job_lock:
+        _slot_cache.update({"at": now, "gen": gen, "cpu": cpu})
+    return {"gen": gen, "cpu": cpu}
 
 
 def worker_kinds() -> list[str]:
@@ -5909,13 +6016,16 @@ def mesh_url() -> str:
         return _mesh_url_cache["url"]
 
 
-def machine_busy() -> str:
+def machine_busy(gpu: bool = True) -> str:
+    """Why this computer should not take another job now, or "". Asked
+    before every lease. gpu=False (a check slot): the GPU lock does not
+    matter, only generate pauses while training holds the GPU."""
     pct = cpu_busy_pct()
     if pct is not None and pct >= 75:
         return "CPU busy"
     if int(ram_mib().get("free_mib") or 0) < 1024:
         return "low memory"
-    if os.name == "nt" and lock_held(GPU_LOCK):
+    if gpu and os.name == "nt" and lock_held(GPU_LOCK):
         return "training holds the GPU"
     return ""
 
@@ -5943,66 +6053,137 @@ def _mesh_post(base: str, path: str, body: dict, timeout: float) -> tuple[int, o
         return exc.code, None
 
 
-def job_loop() -> None:
-    _job_state["on"] = True
-    base = mesh_url()
-    if not base:
-        _job_state.update({"on": False, "paused": "no main PC address (set NEURO_MESH_URL to a LAN address)"})
-        print("Jobs are off: no main PC address. Set NEURO_MESH_URL to the main PC's LAN address.", flush=True)
-        return
-    node = socket.gethostname()
-    print("Tests: " + sandbox_status()["note"], flush=True)
-    time.sleep(20)
-    while True:
-        wait = 15.0
+def slot_kinds(slot: str) -> list[str]:
+    """The kinds one slot leases: generate slots only generate, check slots
+    every other kind this worker runs."""
+    gen = slot.startswith("g")
+    return [kind for kind in worker_kinds() if (kind == "generate") == gen]
+
+
+def _slot_pause(slot: str, why: str) -> None:
+    with _job_lock:
+        if why:
+            _job_paused[slot] = why
+        else:
+            _job_paused.pop(slot, None)
+
+
+def slot_once(slot: str, base: str, node: str, post=_mesh_post, run=run_job, sleep=time.sleep) -> float:
+    """One lease-run-report round of one job slot. Returns the seconds to
+    wait before the next round. Leases with the same protocol as before,
+    plus the slot id, so serve gives each slot its own job."""
+    gen = slot.startswith("g")
+    plan = slot_plan()
+    if int(slot[1:]) >= (plan["gen"] if gen else plan["cpu"]):
+        _slot_pause(slot, "")  # this slot is not in use now
+        return 60.0
+    kinds = slot_kinds(slot)
+    busy = machine_busy(gpu=gen)
+    _slot_pause(slot, busy)
+    if not kinds or busy:
+        return 15.0
+    body = {"node": node, "slot": slot, "kinds": kinds, "gen_max": GENERATE_MAX_TOKENS,
+            "test_langs": sorted(sandbox_status()["langs"])}
+    code, job = post(base, "/jobs/next", body, 10)
+    with _job_lock:
+        _job_state["told"] = ""
+    if not (code == 200 and isinstance(job, dict) and job.get("kind") in kinds and job.get("id") and job.get("lease")):
+        return 15.0
+    jid, kind = str(job["id"]), str(job["kind"])
+    with _job_lock:
+        if jid in _job_held:
+            # An older serve gives every slot of a computer the same job.
+            # One slot runs it; the others wait.
+            return 15.0
+        _job_held.add(jid)
+        _job_running[slot] = kind
+    try:
         try:
-            busy = machine_busy()
-            kinds = worker_kinds()
-            _job_state["paused"] = busy
-            if kinds and not busy:
-                body = {"node": node, "kinds": kinds, "gen_max": GENERATE_MAX_TOKENS,
-                        "test_langs": sorted(sandbox_status()["langs"])}
-                code, job = _mesh_post(base, "/jobs/next", body, 10)
-                _job_state["told"] = ""
-                if code == 200 and isinstance(job, dict) and job.get("kind") in kinds and job.get("id") and job.get("lease"):
-                    _job_state["current"] = str(job["kind"])
-                    ok, output = run_job(job)
-                    if len(json.dumps(output, ensure_ascii=False)) > JOB_OUTPUT_LIMIT:
-                        ok, output = False, {"error": "output is too large"}
-                    result = {"id": job["id"], "lease": job["lease"], "node": node, "ok": ok, "output": output}
-                    for attempt in range(3):
-                        try:
-                            _mesh_post(base, "/jobs/result", result, 30)
-                            break
-                        except (OSError, urllib.error.URLError, ValueError):
-                            time.sleep(5 * (attempt + 1))
-                    _job_state["done" if ok else "failed"] = int(_job_state.get("done" if ok else "failed") or 0) + 1
-                    _job_state["current"] = ""
-                    wait = 1.0
+            ok, output = run(job)
+        except Exception as exc:  # a handler bug fails this job, not the slot
+            ok, output = False, {"error": clip(f"{type(exc).__name__} in the worker", 300)}
+        if len(json.dumps(output, ensure_ascii=False)) > JOB_OUTPUT_LIMIT:
+            ok, output = False, {"error": "output is too large"}
+        result = {"id": job["id"], "lease": job["lease"], "node": node, "ok": ok, "output": output}
+        for attempt in range(3):
+            try:
+                post(base, "/jobs/result", result, 30)
+                break
+            except (OSError, urllib.error.URLError, ValueError):
+                sleep(5 * (attempt + 1))
+        with _job_lock:
+            _job_state["done" if ok else "failed"] = int(_job_state.get("done" if ok else "failed") or 0) + 1
+    finally:
+        with _job_lock:
+            _job_held.discard(jid)
+            _job_running.pop(slot, None)
+    return 1.0
+
+
+def slot_loop(slot: str, base: str, node: str, rounds: int | None = None) -> None:
+    """One job slot, forever (or `rounds` rounds in tests). Every error stays
+    inside this slot: the other slots keep working."""
+    done = 0
+    while rounds is None or done < rounds:
+        done += 1
+        try:
+            wait = slot_once(slot, base, node)
         except JobAuthError as exc:
             # Never print the token. Only say that it is missing or does not match.
             state = "no token" if exc.missing else "token"
-            if _job_state.get("told") != state:
+            with _job_lock:
+                first = _job_state.get("told") != state
                 _job_state["told"] = state
+                _job_paused[slot] = state
+            if first:
                 print(
                     "Jobs paused: this computer has no cluster.token. Pairing with the main PC starts."
                     if exc.missing
                     else "Jobs paused: this computer's cluster.token is not the main PC's token. Pairing with the main PC starts.",
                     flush=True,
                 )
-            _job_state["paused"] = state
             want_pairing()
             wait = 600.0
         except (OSError, urllib.error.URLError, ValueError):
             wait = 30.0
         except Exception as exc:
-            print(f"job loop: {type(exc).__name__}", flush=True)
+            print(f"job slot {slot}: {type(exc).__name__}", flush=True)
             wait = 60.0
-        finally:
-            _job_state["current"] = ""
-        # A finished pairing wakes the loop at once, without a restart.
+        if rounds is not None and done >= rounds:
+            return
+        # A finished pairing wakes every waiting slot at once, without a restart.
         if _token_changed.wait(wait):
+            time.sleep(0.5)  # let every waiting slot see it before it is cleared
             _token_changed.clear()
+
+
+def job_loop() -> None:
+    with _job_lock:
+        _job_state["on"] = True
+    base = mesh_url()
+    if not base:
+        with _job_lock:
+            _job_state.update({"on": False, "paused": "no main PC address (set NEURO_MESH_URL to a LAN address)"})
+        print("Jobs are off: no main PC address. Set NEURO_MESH_URL to the main PC's LAN address.", flush=True)
+        return
+    node = socket.gethostname()
+    print("Tests: " + sandbox_status()["note"], flush=True)
+    time.sleep(20)
+    plan = slot_plan(refresh=True)
+    # Generate threads: NEURO_GEN_SLOTS, else up to 4; those above the model
+    # server's slot count stay idle until slot_plan() says otherwise.
+    gen_threads = _slot_env("NEURO_GEN_SLOTS")
+    gen_threads = GEN_SLOT_DEFAULT_CAP if gen_threads is None else gen_threads
+    cpu_threads = cpu_slot_count()
+    if not gen_threads and not cpu_threads:
+        with _job_lock:
+            _job_state.update({"on": False, "paused": "no job slots (NEURO_GEN_SLOTS and NEURO_CPU_SLOTS are 0)"})
+        print("Jobs are off: NEURO_GEN_SLOTS and NEURO_CPU_SLOTS are both 0.", flush=True)
+        return
+    print(f"Job slots: generate {plan['gen']} (up to {gen_threads}), checks {cpu_threads}.", flush=True)
+    slots = [f"g{index}" for index in range(gen_threads)] + [f"c{index}" for index in range(cpu_threads)]
+    for slot in slots:
+        threading.Thread(target=slot_loop, args=(slot, base, node), name=f"neuro-job-{slot}", daemon=True).start()
 
 
 def read_job_file(kind_arg: str, path: str) -> tuple[list[tuple[str, dict]], list[str]]:
@@ -6082,7 +6263,8 @@ def jobs_main(args: list[str]) -> None:
         for kind, row in (summary.get("kinds") or {}).items():
             print(f"{kind:<22}{row.get('queued', 0):>8}{row.get('leased', 0):>8}{row.get('done', 0):>8}{row.get('failed', 0):>8}{row.get('passed', 0):>8}")
         for name, row in (summary.get("nodes") or {}).items():
-            print(f"  {name}: done {row.get('done', 0)}, failed {row.get('failed', 0)}" + (f", running {row['now']}" if row.get("now") else ""))
+            running = ", ".join(str(kind) for kind in row.get("running") or []) or str(row.get("now") or "")
+            print(f"  {name}: done {row.get('done', 0)}, failed {row.get('failed', 0)}" + (f", running {running}" if running else ""))
         print(f"Verified rows ready to export: {summary.get('verified_rows', 0)}")
         return
     if command == "export" and len(args) == 3 and args[1] == "--pairs":
@@ -6430,7 +6612,7 @@ class Handler(BaseHTTPRequestHandler):
             queue = job_queue()
             if path == "/jobs/next":
                 job = queue.lease(str(body.get("node") or ""), body.get("kinds"), gen_max=body.get("gen_max"),
-                                  test_langs=body.get("test_langs"))
+                                  test_langs=body.get("test_langs"), slot=body.get("slot"))
                 if job is None:
                     self.send_empty(204)
                     return

@@ -890,15 +890,36 @@ function activity(item, index) {
     if (ts.state === "error") return { label: "training error", tone: "bad", why: String(t.error || "The training log ends with an error.") };
     return { label: "idle", tone: "muted", why: "Holds the job queue and this page." };
   }
+  const slots = slotLine(jobs);
+  if (slots && (slots.gen || slots.cpu)) {
+    const gen = slots.gen > 0;
+    return { label: gen ? "generating" : "checking", tone: gen ? "info" : "violet", why: slots.text + ". Running " + slots.kinds + "." };
+  }
   const current = String((jobs && jobs.on && jobs.current) || done.now || "");
   if (current === "generate") return { label: "generating", tone: "info", why: "Writing an answer with its own local model." };
   if (current.startsWith("verify")) return { label: "checking", tone: "violet", why: "Running " + current.replace("verify_", "") + " checks on its processor." };
   if (current) return { label: "working", tone: "violet", why: "Running a " + current + " job." };
   if (jobs && jobs.on && jobs.paused) return { label: "paused", tone: "warn", why: "Paused: " + String(jobs.paused) + "." };
   if (status.rpc_listening) return { label: "lending memory", tone: "ok", why: "Listening on port 50052 for one llama.cpp run." };
-  if (jobs && jobs.on) return { label: "idle", tone: "muted", why: "Waiting for a job it can run." };
+  if (jobs && jobs.on) return { label: "idle", tone: "muted", why: "Waiting for a job it can run" + (slots ? " · " + slots.text : "") + "." };
   if (caps.job_kinds === undefined) return { label: "idle", tone: "muted", why: "Older worker: it does not report jobs. git pull and restart it." };
   return { label: "jobs off", tone: "muted", why: "Jobs are turned off on this computer (NEURO_JOBS=0)." };
+}
+// Busy job slots of one worker, e.g. "generating 2/2 · checking 1/3".
+// null for an older worker that does not report slots.
+function slotLine(jobs) {
+  const slots = jobs && jobs.on && jobs.slots && typeof jobs.slots === "object" ? jobs.slots : null;
+  if (!slots) return null;
+  const count = (value) => { const n = Math.floor(Number(value)); return Number.isFinite(n) && n > 0 ? Math.min(n, 99) : 0; };
+  const g = slots.generate || {}, c = slots.check || {};
+  const gTotal = count(g.total), cTotal = count(c.total);
+  const gBusy = Math.min(count(g.busy), gTotal), cBusy = Math.min(count(c.busy), cTotal);
+  const parts = [];
+  if (gTotal) parts.push("generating " + gBusy + "/" + gTotal);
+  if (cTotal) parts.push("checking " + cBusy + "/" + cTotal);
+  if (!parts.length) return null;
+  const running = Array.isArray(jobs.running) ? jobs.running.map(String).slice(0, 16) : [];
+  return { text: parts.join(" · "), gen: gBusy, cpu: cBusy, kinds: running.length ? running.join(", ") : String(jobs.current || "jobs") };
 }
 function memoryLine(status) {
   const ram = (status && status.ram) || {};
@@ -1380,6 +1401,9 @@ function modelLine(item) {
 function nowLine(item, done) {
   const caps = (item && item.status && item.status.caps) || {};
   const jobs = caps.jobs || null;
+  const slots = slotLine(jobs);
+  if (slots && (slots.gen || slots.cpu)) return slots.text + " · running " + slots.kinds;
+  if (done && Array.isArray(done.running) && done.running.length) return "running " + done.running.map(String).slice(0, 16).join(", ");
   if (done && done.now) return "running " + String(done.now);
   if (jobs && jobs.on && jobs.current) return "running " + String(jobs.current);
   if (jobs && jobs.on && jobs.paused) return "paused: " + String(jobs.paused);
@@ -1408,7 +1432,9 @@ function factoryRow(box, name, item, done, index) {
   const caps = (item && item.status && item.status.caps) || {};
   const kinds = (caps.job_kinds || []).map(String);
   const tests = caps.tests && Array.isArray(caps.tests.langs) && caps.tests.langs.length ? "runs tests: " + caps.tests.langs.map(String).join(", ") + " (sandboxed, network not blocked)" : "";
-  const meta = [act ? act.why : "", model ? model.text : "", kinds.length ? kinds.length + " job kinds" : "", tests].filter(Boolean).join(" · ");
+  const slots = slotLine(caps.jobs || null);
+  const slotText = slots && !(act && act.why.includes(slots.text)) ? slots.text : "";
+  const meta = [act ? act.why : "", slotText, model ? model.text : "", kinds.length ? kinds.length + " job kinds" : "", tests].filter(Boolean).join(" · ");
   const sub = meta ? cell(row, meta, "span", "sub") : null;
   if (sub && caps.tests && caps.tests.note) sub.title = String(caps.tests.note);
   box.append(row);
