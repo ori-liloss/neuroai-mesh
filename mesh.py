@@ -1415,6 +1415,172 @@ def parse_training_log(head: str, tail: str = "", max_steps_hint: int = 0) -> di
     return info
 
 
+# Full-run loss curve. The log is read incrementally: the cache remembers the
+# file, the byte offset already parsed and the points found so far, so each
+# call reads only the bytes added since the last one.
+LOSS_POINTS_CAP = 5000
+LOSS_SERIES_POINTS = 400
+LOSS_READ_CHUNK = 4_000_000
+LOSS_READ_BUDGET = 32_000_000
+_STEPS_PER_EPOCH = re.compile(r"[\"']optimizer_steps_per_epoch[\"']\s*:\s*" + _NUM)
+_loss_cache: dict = {}
+_loss_lock = threading.Lock()
+
+
+def _loss_state(path: str, fingerprint: bytes = b"") -> dict:
+    return {"path": path, "offset": 0, "encoding": None, "fingerprint": fingerprint, "loss": [], "eval": [],
+            "bar_step": None, "bar_total": 0, "steps_per_epoch": None}
+
+
+def _last_break(raw: bytes, encoding: str) -> int:
+    """Index just past the last line break in raw, or 0 when there is none."""
+    if encoding == "utf-16-le":
+        best = -1
+        for mark in (b"\n\x00", b"\r\x00"):
+            at = raw.rfind(mark)
+            while at >= 0 and at % 2:
+                at = raw.rfind(mark, 0, at)
+            best = max(best, at)
+        return best + 2 if best >= 0 else 0
+    best = max(raw.rfind(b"\n"), raw.rfind(b"\r"))
+    return best + 1 if best >= 0 else 0
+
+
+def _thin(points: list, cap: int) -> None:
+    """Halve a point list in place (keeping the first and the newest point) until it fits the cap."""
+    while len(points) > cap:
+        points[:] = points[:-1:2] + [points[-1]]
+
+
+def _parse_loss_text(state: dict, text: str, max_steps_hint: int = 0, cap: int = LOSS_POINTS_CAP) -> None:
+    for segment in re.split(r"[\r\n]+", text):
+        line = segment.strip()
+        if not line:
+            continue
+        runner = _RUNNER.match(line)
+        if runner:
+            if runner.group(2).strip().lower().startswith("start"):
+                # A new run in the same log: its curve starts over.
+                state.update(loss=[], eval=[], bar_step=None, bar_total=0, steps_per_epoch=None)
+            continue
+        spe = _num(_STEPS_PER_EPOCH, line)
+        if spe and spe > 0:
+            state["steps_per_epoch"] = spe
+        matches = list(_BAR.finditer(segment))
+        if matches:
+            match = matches[-1]
+            if not segment[: match.start()].strip():
+                total = int(match.group("total"))
+                if total > 0 and (total == max_steps_hint or total >= state["bar_total"]):
+                    state["bar_total"] = max(state["bar_total"], total)
+                    state["bar_step"] = int(match.group("n"))
+        loss = _num(_LOSS, line)
+        if loss is not None:
+            state["loss"].append([_num(_EPOCH, line), state["bar_step"], round(loss, 4)])
+            if len(state["loss"]) > cap:
+                _thin(state["loss"], cap)
+        eval_loss = _num(_EVAL_LOSS, line)
+        if eval_loss is not None:
+            state["eval"].append([_num(_EPOCH, line), state["bar_step"], round(eval_loss, 4)])
+            if len(state["eval"]) > cap:
+                _thin(state["eval"], cap)
+
+
+def update_loss_cache(path: Path, max_steps_hint: int = 0, cache: dict | None = None,
+                      cap: int = LOSS_POINTS_CAP, budget: int = LOSS_READ_BUDGET) -> dict:
+    """Parse only the bytes added to `path` since the last call. Starts over
+    when the path changes, the file shrank, or its first bytes changed."""
+    cache = _loss_cache if cache is None else cache
+    key = str(path)
+    try:
+        with path.open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            fingerprint = handle.read(64)
+            state = cache.get("state")
+            if (not state or state["path"] != key or size < state["offset"]
+                    or fingerprint[: len(state["fingerprint"])] != state["fingerprint"]):
+                state = _loss_state(key, fingerprint)
+                cache["state"] = state
+            if len(state["fingerprint"]) < 64 and len(fingerprint) > len(state["fingerprint"]):
+                state["fingerprint"] = fingerprint
+            read = 0
+            while state["offset"] < size and read < budget:
+                handle.seek(state["offset"])
+                raw = handle.read(min(LOSS_READ_CHUNK, size - state["offset"]))
+                if not raw:
+                    break
+                if state["encoding"] is None:
+                    state["encoding"] = "utf-16-le" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in raw[:80] else "utf-8"
+                cut = _last_break(raw, state["encoding"])
+                if not cut:
+                    if len(raw) < LOSS_READ_CHUNK:
+                        break  # an unfinished line: wait for its end
+                    cut = len(raw) - (len(raw) % 2 if state["encoding"] == "utf-16-le" else 0)
+                text = raw[:cut].decode(state["encoding"], errors="replace").lstrip("﻿")
+                _parse_loss_text(state, text, max_steps_hint, cap)
+                state["offset"] += cut
+                read += cut
+            return state
+    except OSError:
+        return cache.get("state") or _loss_state(key)
+
+
+def downsample(points: list, limit: int = LOSS_SERIES_POINTS) -> list:
+    """At most `limit` [x, y] points: each bucket becomes its mean, the newest point stays exact."""
+    if len(points) <= limit:
+        return [list(point) for point in points]
+    size = len(points) / (limit - 1)
+    out = []
+    for index in range(limit - 1):
+        bucket = points[int(index * size): max(int((index + 1) * size), int(index * size) + 1)]
+        bucket = bucket or [points[-2]]
+        out.append([round(sum(p[0] for p in bucket) / len(bucket)), round(sum(p[1] for p in bucket) / len(bucket), 4)])
+    out.append(list(points[-1]))
+    return out
+
+
+def _series_steps(points: list, steps_per_epoch: float | None, max_steps: int, fallback_spe: float | None = None) -> list:
+    out = []
+    for index, (epoch, bar_step, value) in enumerate(points):
+        if epoch is not None and steps_per_epoch:
+            x = round(epoch * steps_per_epoch)
+        elif bar_step is not None:
+            x = bar_step
+        elif epoch is not None and fallback_spe:
+            x = round(epoch * fallback_spe)
+        else:
+            x = index + 1
+        if max_steps:
+            x = min(x, max_steps)
+        out.append([x, value])
+    return out
+
+
+def loss_series(state: dict, max_steps: int = 0, step: int | None = None, epoch: float | None = None,
+                limit: int = LOSS_SERIES_POINTS) -> dict:
+    """Downsampled [[step, loss], ...] and [[step, eval_loss], ...] for the page.
+    Epochs become steps with the log's optimizer_steps_per_epoch, else with the
+    training bar step seen next to each loss, else with step / epoch now."""
+    spe = state.get("steps_per_epoch")
+    pairs = [(e, s) for e, s, _ in state.get("loss", []) + state.get("eval", []) if e and s]
+    if pairs:
+        fallback = pairs[-1][1] / pairs[-1][0]
+    elif step and epoch:
+        fallback = step / epoch
+    else:
+        fallback = None
+    return {"loss_series": downsample(_series_steps(state.get("loss", []), spe, max_steps, fallback), limit),
+            "eval_series": downsample(_series_steps(state.get("eval", []), spe, max_steps, fallback), limit)}
+
+
+def full_loss_series(log: str, max_steps: int = 0, step: int | None = None, epoch: float | None = None) -> dict:
+    if not log:
+        return {"loss_series": [], "eval_series": []}
+    with _loss_lock:
+        state = update_loss_cache(Path(log), max_steps)
+        return loss_series(state, max_steps, step, epoch)
+
+
 def parse_log_tail(tail: str) -> dict:
     """Older, smaller view of parse_training_log: step, max_steps, loss."""
     info = parse_training_log("", tail)
@@ -1620,6 +1786,7 @@ def training_view() -> dict:
         "history": history,
         "eval_loss": live["eval_loss"],
         "eval_history": live["eval_history"],
+        **full_loss_series(live["log"], int(max_steps or 0), step, live["epoch"]),
         "epoch": live["epoch"],
         "learning_rate": live["learning_rate"],
         "s_per_it": live["s_per_it"],
