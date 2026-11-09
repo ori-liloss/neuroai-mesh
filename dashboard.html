@@ -89,6 +89,10 @@
     .go, .quiet { border-radius: 999px; padding: 10px 16px; }
     .go { background: var(--gold); color: #23180a; border: 0; font-weight: 700; }
     .quiet { background: transparent; border: 1px solid var(--line); }
+    .pair { border-color: var(--gold); margin-bottom: 16px; }
+    .pair .code { font-family: var(--mono); font-size: 26px; letter-spacing: 0.12em; color: var(--gold); }
+    .pair .ask { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; }
+    .pair .who-asks { flex: 1 1 220px; }
     .losses { display: flex; align-items: end; gap: 8px; height: 120px; margin: 18px 0; }
     .losses i { flex: 1; border-radius: 8px 8px 0 0; background: var(--gold); display: block; }
     form { display: flex; gap: 8px; margin-top: 14px; }
@@ -116,6 +120,12 @@
       <p class="muted" id="page-state"></p>
     </aside>
     <main>
+      <article class="card pair" id="pair-card" hidden>
+        <div class="k">NEW COMPUTER WANTS TO JOIN</div>
+        <p class="muted">Approve only if the code below matches the code on that computer's own screen. Approving gives it this PC's cluster token.</p>
+        <div id="pair-list"></div>
+        <p class="muted" id="pair-note"></p>
+      </article>
       <section class="view" id="view-machines">
         <div class="glance">
           <p><b id="g-model">Model</b><span id="g-model-sub">–</span></p>
@@ -912,6 +922,83 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 4000);
+// Pairing requests. Only the page open on the main PC itself gets the list
+// (the server answers 403 elsewhere), so the card stays hidden on other
+// computers. Everything is rendered with textContent.
+let pairBusy = false;
+function paintPairs(rows) {
+  const card = document.getElementById("pair-card");
+  const list = document.getElementById("pair-list");
+  if (!card || !list) return;
+  list.replaceChildren();
+  const note = document.getElementById("pair-note");
+  card.hidden = !rows.length && !(note && note.textContent);
+  for (const item of rows.slice(0, 8)) {
+    const row = document.createElement("div");
+    row.className = "ask";
+    const who = document.createElement("div");
+    who.className = "who-asks";
+    const name = document.createElement("b");
+    name.textContent = String(item.name || "A computer").slice(0, 64);
+    const where = document.createElement("p");
+    where.className = "muted";
+    where.textContent = "from " + String(item.ip || "?").slice(0, 64) + " · expires in " + Math.max(0, Math.round(Number(item.expires_in || 0) / 60)) + " min";
+    who.append(name, where);
+    const code = document.createElement("span");
+    code.className = "code";
+    const digits = String(item.code || "").replace(/[^0-9]/g, "").slice(0, 6);
+    code.textContent = digits.slice(0, 3) + " " + digits.slice(3);
+    const approve = document.createElement("button");
+    approve.type = "button";
+    approve.className = "go";
+    approve.textContent = "Approve";
+    approve.onclick = () => decidePair(item.id, true, name.textContent, code.textContent);
+    const deny = document.createElement("button");
+    deny.type = "button";
+    deny.className = "quiet";
+    deny.textContent = "Deny";
+    deny.onclick = () => decidePair(item.id, false, name.textContent, code.textContent);
+    row.append(who, code, approve, deny);
+    list.append(row);
+  }
+}
+async function refreshPairs() {
+  try {
+    const response = await fetch("/api/pair", { cache: "no-store" });
+    if (!response.ok) { paintPairs([]); return; }
+    const body = await readJsonLimited(response, 20000);
+    paintPairs(body && Array.isArray(body.pending) ? body.pending : []);
+  } catch (error) {
+    paintPairs([]);
+  }
+}
+async function decidePair(id, approve, name, code) {
+  if (pairBusy) return;
+  if (approve && !window.confirm("Approve " + name + "? Only if its screen shows the code " + code + ".")) return;
+  pairBusy = true;
+  let note = "The main PC did not answer.";
+  try {
+    const response = await fetch(approve ? "/api/pair/approve" : "/api/pair/deny", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: String(id || "") }),
+    });
+    const body = await readJsonLimited(response, 20000);
+    if (body && typeof body === "object") {
+      note = body.error ? String(body.error) : (approve ? "Approved " : "Denied ") + String(body.name || name) + ". It joins within a few seconds.";
+      if (!approve && !body.error) note = "Denied " + String(body.name || name) + ".";
+    }
+  } catch (error) {
+    note = "The main PC did not answer.";
+  }
+  pairBusy = false;
+  const box = document.getElementById("pair-note");
+  if (box) box.textContent = note.slice(0, 300);
+  setTimeout(() => { if (box) box.textContent = ""; refreshPairs(); }, 15000);
+  refreshPairs();
+}
+refreshPairs();
+setInterval(refreshPairs, 4000);
 </script>
 </body>
 </html>

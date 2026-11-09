@@ -12,3 +12,5 @@ jobs/
 *.json.tmp
 __pycache__/
 *.pyc
+cluster.token.old
+cluster.token.tmp-*

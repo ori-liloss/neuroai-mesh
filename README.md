@@ -22,7 +22,7 @@ Or double-click `start-dashboard.cmd`. That starts the page without a PowerShell
 
 Open [http://127.0.0.1:8780](http://127.0.0.1:8780).
 
-The first launch creates `cluster.token` next to `mesh.py`. That file is the shared password for workers. It is gitignored. Do not commit it and do not send it to the public internet.
+The first launch of `mesh.py serve` creates `cluster.token` next to `mesh.py`. That file is the shared password for workers; they get it by pairing (see below). It is gitignored. Do not commit it and do not send it to the public internet.
 
 You should see:
 
@@ -122,9 +122,13 @@ The **Jobs** page shows queued, leased, done and failed counts per kind and per 
 
 ### Each worker, once
 
-1. `git pull`, then stop and start `mesh.py work` again (Mac: `bash platforms/start-mac.sh`).
-2. Copy `cluster.token` from the main PC into the worker's folder by hand (USB stick or a private copy). The job endpoints need the main PC's token; the page never sends it. The worker's control routes (Stop, RPC start/stop, agent check) also need it, and `mesh.py serve` adds it for the page, but only after that computer answers a fresh challenge (`/hello/proof`) proving it already holds the same token; a computer that cannot prove it never receives the token. Without it the worker says "Jobs paused", refuses those controls with a clear message, and still answers `/hello`.
-3. If the main PC is not `192.168.7.14`, set `NEURO_MESH_URL=http://<main PC>:8780` before starting the worker. `NEURO_JOBS=0` turns jobs off.
+1. If the main PC is not `192.168.7.14`, set `NEURO_MESH_URL=http://<main PC>:8780` first. `NEURO_JOBS=0` turns jobs off.
+2. `git pull`, then start `mesh.py work` (Mac: `bash platforms/start-mac.sh`). A worker with no `cluster.token`, or with one the main PC rejects, starts pairing by itself and prints `Pairing code: 482 913`.
+3. On the main PC, open its own Neuro page (http://127.0.0.1:8780). A **New computer wants to join** card shows the name, address and code. Press **Approve** only if the code matches the one on that computer's screen. The worker saves the token as `cluster.token` (an old one is kept as `cluster.token.old`) and its jobs resume without a restart. An unapproved code expires after 15 minutes; the worker then asks again with a new code.
+
+Fallback: copy `cluster.token` from the main PC into the worker's folder by hand (USB stick or a private copy), then restart the worker.
+
+How the token is used: the job endpoints need the main PC's token, and the worker's control routes (Stop, RPC start/stop, agent check) need it too. `mesh.py serve` adds it for the page, only after that computer answers a fresh challenge (`/hello/proof`) proving it already holds the same token. A worker never makes up its own token. Approval works only from the page on the main PC itself, and the token is handed out once, to the computer that asked, and only with its pairing secret. Like all Bearer traffic in this project it travels over plain HTTP on the home LAN, so anyone who can watch that LAN can see it; keep these ports off the internet.
 
 A worker takes no job while its CPU is above 75 %, it has under 1 GB free memory, or the GPU lock is held.
 

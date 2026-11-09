@@ -149,10 +149,17 @@ def machine_key(status: dict) -> tuple[str, str]:
     return (name, str(status.get("os") or "").strip().lower())
 
 
+# "serve" (the main PC) may make cluster.token on first launch. A worker
+# ("work") never does: it pairs with the main PC or uses a hand-copied file.
+_ROLE = {"name": "serve"}
+
+
 def token() -> str:
     try:
         TOKEN_PATH.stat()
     except FileNotFoundError:
+        if _ROLE["name"] == "work":
+            raise RuntimeError("This worker has no cluster.token yet.") from None
         try:
             with TOKEN_PATH.open("x", encoding="utf-8") as handle:
                 handle.write(os.urandom(24).hex())
@@ -186,7 +193,7 @@ def authorized(header: str | None, secret: str | None = None) -> bool:
 
 NO_TOKEN_NOTE = (
     "This computer has no cluster.token, so it refuses remote controls. "
-    "Copy cluster.token from the main PC into this worker's folder, next to mesh.py."
+    "It pairs with the main PC by itself: approve its code on the main PC's page (or copy cluster.token by hand)."
 )
 
 
@@ -217,8 +224,8 @@ _HEX64_PROOF = re.compile(r"^[0-9a-f]{64}$")
 _proof_lock = threading.Lock()
 _proofs: dict[str, float] = {}
 _proof_hits: dict[str, list[float]] = {}
-PROOF_MISSING_NOTE = "That computer has no cluster.token, so this PC did not send its token. Copy cluster.token there by hand."
-PROOF_MISMATCH_NOTE = "That computer has no matching cluster.token, so this PC did not send its token. Copy cluster.token there by hand."
+PROOF_MISSING_NOTE = "That computer has no cluster.token, so this PC did not send its token. Approve its pairing code on this page (or copy cluster.token there by hand)."
+PROOF_MISMATCH_NOTE = "That computer has no matching cluster.token, so this PC did not send its token. Restart mesh.py work there and approve its pairing code on this page (or copy cluster.token by hand)."
 PROOF_OLD_NOTE = "That computer is running an older worker, so this PC did not send its token. Pull and start it again."
 
 
@@ -242,19 +249,24 @@ def proof_ok(secret: str, nonce: str, address: str, answer: object) -> bool:
     return hmac.compare_digest(proof_digest(secret, nonce, address).encode("ascii"), answer.encode("ascii"))
 
 
-def proof_rate_ok(client: str, now: float | None = None) -> bool:
+def _rate_ok(hits_by_client: dict, client: str, rule: tuple[int, float], now: float | None = None) -> bool:
+    """Sliding-window limit: at most rule[0] hits per rule[1] seconds."""
     now = time.time() if now is None else now
-    limit, window = PROOF_RATE
+    limit, window = rule
     with _proof_lock:
-        hits = [at for at in _proof_hits.get(client, []) if now - at < window]
+        hits = [at for at in hits_by_client.get(client, []) if now - at < window]
         allowed = len(hits) < limit
         if allowed:
             hits.append(now)
-        _proof_hits[client] = hits
-        if len(_proof_hits) > 1024:
-            for key in [key for key, value in _proof_hits.items() if not value]:
-                _proof_hits.pop(key, None)
+        hits_by_client[client] = hits
+        if len(hits_by_client) > 1024:
+            for key in [key for key, value in hits_by_client.items() if not value]:
+                hits_by_client.pop(key, None)
     return allowed
+
+
+def proof_rate_ok(client: str, now: float | None = None) -> bool:
+    return _rate_ok(_proof_hits, client, PROOF_RATE, now)
 
 
 def forget_proof(url: str) -> None:
@@ -320,6 +332,235 @@ def worker_call(url: str, path: str, body: dict | None = None, timeout: float = 
         raise
 
 
+# --- pairing: a new computer joins without copying cluster.token -------------
+# Like Bluetooth or Syncthing approval. The worker makes a random pair_secret
+# and a 6-digit code, shows the code on its own screen, and sends serve only
+# the code and sha256(pair_secret). The person approves on the main PC's own
+# page after checking that the codes match. The worker then fetches the token
+# once with the pair_secret, from the same LAN address it asked from.
+PAIR_TTL = 900.0
+PAIR_MAX_PENDING = 8
+PAIR_REQUEST_RATE = (5, 600.0)
+PAIR_STATUS_RATE = (120, 60.0)
+PAIR_POLL_SECONDS = 4.0
+PAIR_RETRY_SECONDS = 120.0
+PAIR_DENIED_RETRY_SECONDS = 1800.0
+_PAIR_ID = re.compile(r"^[0-9a-f]{16}$")
+_PAIR_CODE = re.compile(r"^[0-9]{6}$")
+_TOKEN_TEXT = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
+_pair_lock = threading.Lock()
+_pairs: dict[str, dict] = {}
+_pair_hits: dict[str, list[float]] = {}
+PAIR_NOTE_UNKNOWN = "No such pairing request. It expired or was already used. The worker starts a new one."
+
+
+def _pair_prune(now: float) -> None:
+    for key in [key for key, item in _pairs.items() if item["expires"] <= now]:
+        _pairs.pop(key, None)
+
+
+def pair_request(client: str, body: dict, now: float | None = None) -> tuple[int, dict]:
+    """POST /pair/request from a worker. Stores only sha256(pair_secret)."""
+    now = time.time() if now is None else now
+    if not _rate_ok(_pair_hits, "request:" + client, PAIR_REQUEST_RATE, now):
+        return 429, {"error": "Too many pairing requests from this computer. Wait a few minutes."}
+    code = str(body.get("code") or "")
+    digest = str(body.get("secret_sha256") or "")
+    if not _PAIR_CODE.match(code) or not _HEX64_PROOF.match(digest):
+        return 400, {"error": "Send code (6 digits) and secret_sha256 (64 hex characters)."}
+    # Shown on the page and in the console: printable characters only.
+    name = "".join(ch for ch in clip(body.get("name"), 64) if ch.isprintable()).strip() or "computer at " + client
+    key = "".join(ch for ch in clip(body.get("machine_key"), 80) if ch.isprintable()).strip()
+    with _pair_lock:
+        _pair_prune(now)
+        # A new code from the same computer replaces its older request.
+        for old in [old for old, item in _pairs.items() if item["ip"] == client]:
+            _pairs.pop(old, None)
+        if sum(1 for item in _pairs.values() if item["state"] == "pending") >= PAIR_MAX_PENDING:
+            return 429, {"error": "Too many computers are waiting. Approve or deny them on the main PC first."}
+        pair_id = secrets.token_hex(8)
+        _pairs[pair_id] = {
+            "id": pair_id, "ip": client, "name": name, "machine_key": key, "code": code,
+            "hash": digest, "state": "pending", "created": now, "expires": now + PAIR_TTL,
+        }
+    return 200, {"id": pair_id, "expires_in": int(PAIR_TTL), "state": "pending"}
+
+
+def pair_status(client: str, body: dict, now: float | None = None) -> tuple[int, dict]:
+    """POST /pair/status. The token leaves only for an approved request, the
+    matching pair_secret, and the same client address; then the request is gone."""
+    now = time.time() if now is None else now
+    if not _rate_ok(_pair_hits, "status:" + client, PAIR_STATUS_RATE, now):
+        return 429, {"state": "wait", "error": "Asking too often. Slow down."}
+    pair_id = str(body.get("id") or "")
+    secret = str(body.get("secret") or "")
+    if not _PAIR_ID.match(pair_id) or not _HEX64_PROOF.match(secret):
+        return 400, {"state": "bad", "error": "Send id and secret."}
+    with _pair_lock:
+        item = _pairs.get(pair_id)
+        if item is None:
+            return 404, {"state": "unknown", "error": PAIR_NOTE_UNKNOWN}
+        if item["expires"] <= now:
+            _pairs.pop(pair_id, None)
+            return 410, {"state": "expired", "error": "This pairing request expired. The worker starts a new one."}
+        given = hashlib.sha256(secret.encode("ascii")).hexdigest().encode("ascii")
+        if item["ip"] != client or not hmac.compare_digest(given, item["hash"].encode("ascii")):
+            return 403, {"state": "refused", "error": "This pairing request belongs to another computer."}
+        if item["state"] == "pending":
+            return 200, {"state": "pending"}
+        _pairs.pop(pair_id, None)
+        if item["state"] == "denied":
+            return 200, {"state": "denied", "error": "The main PC denied this computer."}
+    secret_token = token()
+    print(f"Paired {item['name']} at {client}.", flush=True)
+    return 200, {"state": "approved", "token": secret_token}
+
+
+def pair_list(now: float | None = None) -> list[dict]:
+    """Pending requests for the main PC's own page (never the hash)."""
+    now = time.time() if now is None else now
+    with _pair_lock:
+        _pair_prune(now)
+        rows = [item for item in _pairs.values() if item["state"] == "pending"]
+        return [
+            {"id": item["id"], "name": item["name"], "ip": item["ip"], "code": item["code"],
+             "machine_key": item["machine_key"], "expires_in": int(item["expires"] - now)}
+            for item in sorted(rows, key=lambda row: row["created"])
+        ]
+
+
+def pair_decide(pair_id: str, approve: bool, now: float | None = None) -> tuple[int, dict]:
+    now = time.time() if now is None else now
+    with _pair_lock:
+        _pair_prune(now)
+        item = _pairs.get(str(pair_id or ""))
+        if item is None or item["state"] != "pending":
+            return 404, {"error": "That request is gone. It expired or was already answered."}
+        item["state"] = "approved" if approve else "denied"
+        # Leave the worker time to fetch the answer.
+        item["expires"] = max(item["expires"], now + 120.0)
+        name = item["name"]
+    return 200, {"ok": True, "state": item["state"], "name": name, "pending": pair_list(now)}
+
+
+def write_token(value: str) -> None:
+    """Replace cluster.token atomically; the old one is kept as
+    cluster.token.old. Never prints the token."""
+    if not isinstance(value, str) or not _TOKEN_TEXT.match(value):
+        raise ValueError("The main PC sent a token in an unexpected form.")
+    folder = TOKEN_PATH.parent
+    temp = folder / f"{TOKEN_PATH.name}.tmp-{secrets.token_hex(4)}"
+    try:
+        with open(temp, "x", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(temp, 0o600)
+        if file_state(TOKEN_PATH) == "file":
+            old = folder / (TOKEN_PATH.name + ".old")
+            shutil.copy2(TOKEN_PATH, old)
+        os.replace(temp, TOKEN_PATH)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+_pair_wanted = threading.Event()
+_token_changed = threading.Event()
+_pair_view: dict = {"code": "", "state": ""}
+
+
+def want_pairing() -> None:
+    _pair_wanted.set()
+
+
+def _pair_post(base: str, path: str, body: dict, timeout: float = 10.0) -> tuple[int, dict]:
+    request = urllib.request.Request(
+        base + path,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with _DIRECT.open(request, timeout=timeout) as response:
+            reply = read_reply(response)
+            return response.status, reply if isinstance(reply, dict) else {}
+    except urllib.error.HTTPError as exc:
+        try:
+            reply = json.loads(exc.read(4096).decode("utf-8", errors="replace"))
+        except (OSError, ValueError):
+            reply = {}
+        return exc.code, reply if isinstance(reply, dict) else {}
+
+
+def pair_once(base: str, post=_pair_post, sleep=time.sleep, clock=time.time) -> str:
+    """One pairing attempt from a worker. Returns "paired", "denied" or
+    "retry". The token is written to cluster.token, never printed."""
+    secret = secrets.token_hex(32)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    key = local_key()
+    body = {
+        "name": socket.gethostname()[:64],
+        "machine_key": "/".join(key),
+        "code": code,
+        "secret_sha256": hashlib.sha256(secret.encode("ascii")).hexdigest(),
+    }
+    try:
+        status, reply = post(base, "/pair/request", body)
+    except (OSError, urllib.error.URLError, ValueError):
+        print("Pairing: the main PC did not answer. Trying again later.", flush=True)
+        return "retry"
+    pair_id = str(reply.get("id") or "")
+    if status != 200 or not _PAIR_ID.match(pair_id):
+        print("Pairing: " + clip(reply.get("error") or f"the main PC said http {status}", 200), flush=True)
+        return "retry"
+    _pair_view.update({"code": code, "state": "waiting"})
+    print(
+        f"\nPairing code: {code[:3]} {code[3:]} - approve this computer on the main PC's Neuro page ({base}).\n"
+        "Approve it only if the page shows the same code.\n",
+        flush=True,
+    )
+    deadline = clock() + PAIR_TTL
+    try:
+        while clock() < deadline:
+            sleep(PAIR_POLL_SECONDS)
+            try:
+                status, reply = post(base, "/pair/status", {"id": pair_id, "secret": secret})
+            except (OSError, urllib.error.URLError, ValueError):
+                continue
+            state = reply.get("state")
+            if status == 200 and state == "approved":
+                try:
+                    write_token(reply.get("token"))
+                except (ValueError, OSError) as exc:
+                    print(f"Pairing: approved, but cluster.token could not be saved ({type(exc).__name__}).", flush=True)
+                    return "retry"
+                print(f"Paired with the main PC. token id {token_id()}. Jobs resume now.", flush=True)
+                return "paired"
+            if state == "denied":
+                print("Pairing: the main PC denied this computer.", flush=True)
+                return "denied"
+            if state in ("expired", "unknown", "refused", "bad"):
+                print("Pairing: " + clip(reply.get("error") or str(state), 200), flush=True)
+                return "retry"
+        print("Pairing: nobody approved the code in 15 minutes. A new code comes later.", flush=True)
+        return "retry"
+    finally:
+        _pair_view.update({"code": "", "state": ""})
+
+
+def pair_loop(base: str) -> None:
+    """Worker thread: pairs whenever want_pairing() was called."""
+    while True:
+        _pair_wanted.wait()
+        result = pair_once(base)
+        if result == "paired":
+            _pair_wanted.clear()
+            _token_changed.set()
+            continue
+        time.sleep(PAIR_DENIED_RETRY_SECONDS if result == "denied" else PAIR_RETRY_SECONDS)
+
+
 def worker_refusal(exc: urllib.error.HTTPError) -> str:
     """Plain words for a worker that refused a control request."""
     detail = error_detail(exc)
@@ -327,11 +568,11 @@ def worker_refusal(exc: urllib.error.HTTPError) -> str:
         return "That computer is running an older worker. Pull and start it again."
     if exc.code == 401:
         return (
-            "That computer did not accept this PC's cluster.token. Copy cluster.token from this PC "
-            "into its folder (or pull and restart an older worker)."
+            "That computer did not accept this PC's cluster.token. Approve its pairing code on this page "
+            "(or copy cluster.token by hand, or pull and restart an older worker)."
         )
     if exc.code == 403 and "cluster.token" in detail:
-        return "That computer has no cluster.token yet. Copy cluster.token from this PC into its folder."
+        return "That computer has no cluster.token yet. Approve its pairing code on this page (or copy cluster.token by hand)."
     return detail or f"http {exc.code}"
 
 
@@ -3631,13 +3872,14 @@ def job_loop() -> None:
             if _job_state.get("told") != state:
                 _job_state["told"] = state
                 print(
-                    "Jobs paused: this computer has no cluster.token. Copy it from the main PC."
+                    "Jobs paused: this computer has no cluster.token. Pairing with the main PC starts."
                     if exc.missing
-                    else "Jobs paused: this computer's cluster.token is not the main PC's token.",
+                    else "Jobs paused: this computer's cluster.token is not the main PC's token. Pairing with the main PC starts.",
                     flush=True,
                 )
             _job_state["paused"] = state
-            wait = 60.0 if exc.missing else 600.0
+            want_pairing()
+            wait = 600.0
         except (OSError, urllib.error.URLError, ValueError):
             wait = 30.0
         except Exception as exc:
@@ -3645,7 +3887,9 @@ def job_loop() -> None:
             wait = 60.0
         finally:
             _job_state["current"] = ""
-        time.sleep(wait)
+        # A finished pairing wakes the loop at once, without a restart.
+        if _token_changed.wait(wait):
+            _token_changed.clear()
 
 
 def read_job_file(kind_arg: str, path: str) -> tuple[list[tuple[str, dict]], list[str]]:
@@ -3802,6 +4046,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def main_pc_page(self) -> bool:
+        """The request comes from a browser on the main PC itself (loopback
+        or this PC's own LAN address), never from another computer."""
+        raw = str(self.client_address[0]).split("%", 1)[0]
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            return False
+        if addr.version == 6 and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        if addr.is_loopback:
+            return True
+        own = lan_host()
+        return bool(own) and str(addr) == own
+
     def worker_token_ok(self) -> bool:
         """Worker side: the request must carry `Authorization: Bearer
         <cluster.token>`. Sends the refusal and returns False otherwise. A
@@ -3901,6 +4160,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/token":
             self.send_json(404, {"error": "not found"})
             return
+        if path == "/api/pair":
+            if not self.main_pc_page():
+                self.send_json(403, {"error": "Only the main PC's own page lists new computers.", "pending": []})
+                return
+            self.send_json(200, {"pending": pair_list()})
+            return
         if path.startswith("/platforms/"):
             name = Path(path).name
             if name not in {"start-mac.sh", "start-linux.sh"}:
@@ -3966,6 +4231,23 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(409, {"error": "ggml-rpc-server could not be started on this machine."})
                     return
             self.send_json(404, {"error": "not found"})
+            return
+        if path in {"/pair/request", "/pair/status"}:
+            # Worker-facing, no token yet: LAN-only, Host and Origin checks
+            # already ran in parse_request. Rate-limited per client address.
+            client = str(self.client_address[0])
+            body = self.read_json(4000)
+            handler = pair_request if path == "/pair/request" else pair_status
+            code, payload = handler(client, body)
+            self.send_json(code, payload)
+            return
+        if path in {"/api/pair/approve", "/api/pair/deny"}:
+            # Only the page open on the main PC itself may approve.
+            if not self.main_pc_page():
+                self.send_json(403, {"error": "Approve new computers on the main PC's own page."})
+                return
+            code, payload = pair_decide(str(self.read_json().get("id") or ""), path.endswith("/approve"))
+            self.send_json(code, payload)
             return
         if path in {"/jobs/next", "/jobs/result"}:
             # Workers pull data-factory jobs. Bearer token required; a job is
@@ -4134,6 +4416,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(mode: str) -> None:
     Handler.mode = mode
+    _ROLE["name"] = mode
     if mode == "serve":
         server = ThreadingHTTPServer(("0.0.0.0", DASHBOARD_PORT), Handler)
         print(f"Neuro dashboard http://127.0.0.1:{DASHBOARD_PORT}", flush=True)
@@ -4145,10 +4428,16 @@ def serve(mode: str) -> None:
     else:
         server = ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), Handler)
         print(f"Neuro worker on port {WORKER_PORT}", flush=True)
-        # A worker never makes its own token: it must use the main PC's.
+        # A worker never makes its own token: it pairs with the main PC.
         if saved_token():
             print(f"token id {token_id()}", flush=True)
-        else:
+        base = mesh_url()
+        if base:
+            threading.Thread(target=pair_loop, args=(base,), name="neuro-pair", daemon=True).start()
+            if not saved_token():
+                print("This computer has no cluster.token yet. Pairing with the main PC starts.", flush=True)
+                want_pairing()
+        elif not saved_token():
             print(NO_TOKEN_NOTE, flush=True)
         if os.environ.get("NEURO_JOBS", "1").strip() != "0":
             threading.Thread(target=job_loop, name="neuro-jobs", daemon=True).start()
