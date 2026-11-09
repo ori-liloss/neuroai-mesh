@@ -113,6 +113,30 @@ If `python` is missing, use `py -3 -u mesh.py work`. Leave the window open. Once
 netsh advfirewall firewall add rule name="Neuro worker" dir=in action=allow protocol=TCP localport=8781 profile=private
 ```
 
+### Windows laptop with an NVIDIA GPU (one command)
+
+For a laptop that should also generate (for example an RTX 3050 Ti with 4 GB). Needs Git and
+Python 3.10+ (`winget install Git.Git` and `winget install Python.Python.3.14`, then a new CMD
+window). Plug it in, then in CMD:
+
+```bat
+git clone https://github.com/ori-liloss/neuroai-mesh.git %USERPROFILE%\neuro-cluster
+%USERPROFILE%\neuro-cluster\platforms\windows-worker.cmd
+```
+
+It downloads llama.cpp (CUDA 12 build; Vulkan if `nvidia-smi` is missing) and a 2.9 GB model once
+into `%LOCALAPPDATA%\Neuro`, starts the model hidden on `127.0.0.1:8080` (with part of it on the
+GPU if 4 GB is not enough), adds the firewall rule when run as Administrator (otherwise it prints
+the command), starts the worker and keeps the laptop awake. A pairing code appears after about
+30 seconds; approve it on the main PC (section 3). Ctrl+C stops the worker and the model it
+started. Next time, and for updates:
+
+```bat
+cd /d %USERPROFILE%\neuro-cluster && git pull && platforms\windows-worker.cmd
+```
+
+Another main PC address: run `set NEURO_MESH_URL=http://192.168.1.20:8780` first, in the same window.
+
 ### Mac
 
 ```bash
