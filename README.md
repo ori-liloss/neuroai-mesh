@@ -74,7 +74,7 @@ Once, in a second window opened as Administrator:
 netsh advfirewall firewall add rule name="Neuro worker" dir=in action=allow protocol=TCP localport=8781 profile=private
 ```
 
-Laptop with an NVIDIA GPU (it also runs a small model and generates): one command does everything, `git clone https://github.com/ori-liloss/neuroai-mesh.git %USERPROFILE%\neuro-cluster` then `%USERPROFILE%\neuro-cluster\platforms\windows-worker.cmd` (details in [docs/GUIDE.md](docs/GUIDE.md) section 4).
+Laptop with an NVIDIA GPU (it also runs a small model and generates): one command does everything, `git clone https://github.com/ori-liloss/neuroai-mesh.git %USERPROFILE%\neuroai-mesh` then `%USERPROFILE%\neuroai-mesh\platforms\windows-worker.cmd` (details in [docs/GUIDE.md](docs/GUIDE.md) section 4).
 
 The Windows page adds the laptop by the computer name Windows already uses. Nothing is typed into the page. The laptop stays off the page until this command is running. A second laptop uses the same command in its own copy of the folder. Its own computer name is added beside the first. There is no empty seat waiting for a computer that is not here. The weight update stays on the NVIDIA PC.
 

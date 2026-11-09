@@ -120,8 +120,8 @@ Python 3.10+ (`winget install Git.Git` and `winget install Python.Python.3.14`, 
 window). Plug it in, then in CMD:
 
 ```bat
-git clone https://github.com/ori-liloss/neuroai-mesh.git %USERPROFILE%\neuro-cluster
-%USERPROFILE%\neuro-cluster\platforms\windows-worker.cmd
+git clone https://github.com/ori-liloss/neuroai-mesh.git %USERPROFILE%\neuroai-mesh
+%USERPROFILE%\neuroai-mesh\platforms\windows-worker.cmd
 ```
 
 It downloads llama.cpp (CUDA 12 build; Vulkan if `nvidia-smi` is missing) and a 2.9 GB model once
@@ -132,7 +132,7 @@ the command), starts the worker and keeps the laptop awake. A pairing code appea
 started. Next time, and for updates:
 
 ```bat
-cd /d %USERPROFILE%\neuro-cluster && git pull && platforms\windows-worker.cmd
+cd /d %USERPROFILE%\neuroai-mesh && git pull && platforms\windows-worker.cmd
 ```
 
 Another main PC address: run `set NEURO_MESH_URL=http://192.168.1.20:8780` first, in the same window.
@@ -167,7 +167,7 @@ generation. It is too weak for training.
 open **Konsole** (start menu) and paste (Ctrl+Shift+V):
 
 ```bash
-git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuro-cluster && sh ~/neuro-cluster/platforms/steamdeck.sh
+git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuroai-mesh && sh ~/neuroai-mesh/platforms/steamdeck.sh
 ```
 
 It downloads llama.cpp (Vulkan) and a 2.9 GB model once, starts the model on `127.0.0.1:8080`,
@@ -175,7 +175,7 @@ starts the worker, and keeps the Deck awake. A pairing code appears after about 
 approve it on the main PC (section 3). Ctrl+C stops everything. Next time, and for updates:
 
 ```bash
-cd ~/neuro-cluster && git pull && sh platforms/steamdeck.sh
+cd ~/neuroai-mesh && git pull && sh platforms/steamdeck.sh
 ```
 
 Another main PC address: `NEURO_MESH_URL=http://192.168.1.20:8780 sh platforms/steamdeck.sh`.
@@ -187,7 +187,7 @@ Another main PC address: `NEURO_MESH_URL=http://192.168.1.20:8780 sh platforms/s
 2. Download the project:
 
 ```bash
-git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuro-cluster
+git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuroai-mesh
 ```
 
 3. Download llama.cpp built for the Deck's GPU (Vulkan). Use the releases *list*, not
@@ -214,7 +214,7 @@ cd "$(dirname "$(find ~/llama -name llama-server -type f | head -1)")" && chmod 
 5. New tab (Ctrl+Shift+T):
 
 ```bash
-cd ~/neuro-cluster && export NEURO_MESH_URL=http://192.168.1.20:8780 && systemd-inhibit --what=sleep:idle sh platforms/start-linux.sh
+cd ~/neuroai-mesh && export NEURO_MESH_URL=http://192.168.1.20:8780 && systemd-inhibit --what=sleep:idle sh platforms/start-linux.sh
 ```
 
 6. A pairing code appears after about 30 seconds. Approve it on the main PC (section 3).

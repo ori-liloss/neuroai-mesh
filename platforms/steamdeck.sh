@@ -5,9 +5,9 @@
 #   3. starts the model on 127.0.0.1:8080 (this computer only), unless one is already running
 #   4. starts the Neuro worker and shows the pairing code
 # Run it in Desktop mode, from Konsole:
-#   git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuro-cluster && sh ~/neuro-cluster/platforms/steamdeck.sh
-# Next time:  sh ~/neuro-cluster/platforms/steamdeck.sh
-# Another main PC address:  NEURO_MESH_URL=http://192.168.1.20:8780 sh ~/neuro-cluster/platforms/steamdeck.sh
+#   git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuroai-mesh && sh ~/neuroai-mesh/platforms/steamdeck.sh
+# Next time:  sh ~/neuroai-mesh/platforms/steamdeck.sh
+# Another main PC address:  NEURO_MESH_URL=http://192.168.1.20:8780 sh ~/neuroai-mesh/platforms/steamdeck.sh
 # Ctrl+C stops the worker and the model it started. Nothing is installed system-wide.
 set -eu
 

@@ -5,8 +5,8 @@
 #   4. starts the model on 127.0.0.1:8080 (this computer only), unless one is already running
 #   5. starts the Neuro worker and shows the pairing code
 # Run it from CMD:
-#   git clone https://github.com/ori-liloss/neuroai-mesh.git %USERPROFILE%\neuro-cluster
-#   %USERPROFILE%\neuro-cluster\platforms\windows-worker.cmd
+#   git clone https://github.com/ori-liloss/neuroai-mesh.git %USERPROFILE%\neuroai-mesh
+#   %USERPROFILE%\neuroai-mesh\platforms\windows-worker.cmd
 # Another main PC address:  set NEURO_MESH_URL=http://192.168.1.20:8780  before the command.
 # Files go to %LOCALAPPDATA%\Neuro. Nothing is installed system-wide.
 # Ctrl+C stops the worker and the model this script started. If the window is closed instead,
