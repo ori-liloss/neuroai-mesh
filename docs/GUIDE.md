@@ -170,7 +170,7 @@ git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuro-cluster
    `releases/latest` — for llama.cpp `latest` points to a release without binaries:
 
 ```bash
-mkdir -p ~/llama && cd ~/llama && URL=$(curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1" | grep -oE 'https://[^"]*ubuntu-vulkan-x64\.tar\.gz' | head -1) && echo "$URL" && curl -L -o pkg.tar.gz "$URL" && tar xzf pkg.tar.gz && rm pkg.tar.gz && echo READY
+mkdir -p ~/llama && cd ~/llama && URL=$(curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1" | grep -oE '"browser_download_url": *"[^"]*ubuntu-vulkan-x64\.tar\.gz"' | head -1 | grep -oE 'https://[^"]*') && echo "$URL" && curl -L -o pkg.tar.gz "$URL" && tar xzf pkg.tar.gz && rm pkg.tar.gz && echo READY
 ```
 
    It must print a URL ending in `ubuntu-vulkan-x64.tar.gz` and then `READY`.

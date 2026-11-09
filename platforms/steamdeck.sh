@@ -50,8 +50,10 @@ else
     echo "[1/4] Downloading llama.cpp (Vulkan build)..."
     mkdir -p "$LLAMA_DIR"
     # The releases list, not releases/latest: for llama.cpp "latest" has no binaries.
+    # Only the browser_download_url fields: the release notes also contain links.
     URL=$(curl -s -m 30 "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1" \
-      | grep -oE 'https://[^"]*ubuntu-vulkan-x64\.tar\.gz' | head -1)
+      | grep -oE '"browser_download_url": *"[^"]*ubuntu-vulkan-x64\.tar\.gz"' | head -1 \
+      | grep -oE 'https://[^"]*' || true)
     [ -n "$URL" ] || { echo "Could not find the llama.cpp download. Check the internet and run again."; exit 1; }
     echo "      $URL"
     curl -L -f -o "$LLAMA_DIR/pkg.tar.gz" "$URL"
