@@ -601,6 +601,21 @@ def ram_mib() -> dict:
         }
     if sys.platform == "darwin":
         return darwin_ram()
+    # Linux: MemAvailable, not MemFree. The kernel keeps "free" memory as page cache (a
+    # memory-mapped model file lives there), so MemFree looks near zero on a busy worker even
+    # when gigabytes can be reclaimed. That paused every job on a Steam Deck as "low memory".
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            info = {}
+            for line in handle:
+                key, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts and parts[0].isdigit():
+                    info[key] = int(parts[0])
+        if "MemTotal" in info and "MemAvailable" in info:
+            return {"total_mib": info["MemTotal"] // 1024, "free_mib": info["MemAvailable"] // 1024}
+    except (OSError, ValueError):
+        pass
     try:
         page = os.sysconf("SC_PAGE_SIZE")
         total = os.sysconf("SC_PHYS_PAGES") * page // (1024 * 1024)
