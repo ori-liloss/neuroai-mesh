@@ -139,6 +139,25 @@ sh platforms/start-linux.sh
 A Steam Deck is a good extra worker: it can run a small model and double the speed of data
 generation. It is too weak for training.
 
+**One command (recommended).** Hold the power button, choose **Switch to Desktop**, plug it in,
+open **Konsole** (start menu) and paste (Ctrl+Shift+V):
+
+```bash
+git clone https://github.com/ori-liloss/neuroai-mesh.git ~/neuro-cluster && sh ~/neuro-cluster/platforms/steamdeck.sh
+```
+
+It downloads llama.cpp (Vulkan) and a 2.9 GB model once, starts the model on `127.0.0.1:8080`,
+starts the worker, and keeps the Deck awake. A pairing code appears after about 30 seconds;
+approve it on the main PC (section 3). Ctrl+C stops everything. Next time, and for updates:
+
+```bash
+cd ~/neuro-cluster && git pull && sh platforms/steamdeck.sh
+```
+
+Another main PC address: `NEURO_MESH_URL=http://192.168.1.20:8780 sh platforms/steamdeck.sh`.
+
+**Step by step (what the script does):**
+
 1. Hold the power button, choose **Switch to Desktop**. Plug it in. In *System Settings → Power
    Management* set suspend and screen saving to *Never*. Open **Konsole** (start menu).
 2. Download the project:
