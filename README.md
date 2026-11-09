@@ -4,6 +4,8 @@ A local console for one Windows GPU machine plus Mac and Linux workers. The dash
 
 People use this the way they use other local AI screens: one page, the machines in front of them, one command to join, and a chat box.
 
+**New here? Read the step-by-step [guide](docs/GUIDE.md)**: setup, pairing a computer, Steam Deck, the data factory, training and troubleshooting.
+
 ## What you need
 
 - Python 3 on every machine. No pip packages.
@@ -40,7 +42,7 @@ cd neuroai-mesh
 bash platforms/start-mac.sh
 ```
 
-The next time, only `bash platforms/start-mac.sh`. The script updates itself and starts the worker. The Windows page finds the machine. On the Mac, do not open 127.0.0.1. That address is the Mac itself. Open the Windows address shown on the Share page, which looks like http://192.168.7.14:8780. There is no file to copy and no address to paste into the worker.
+The next time, `git pull` when there is a new version, then `bash platforms/start-mac.sh`. The script does not update the code by itself. The Windows page finds the machine. On the Mac, do not open 127.0.0.1. That address is the Mac itself. Open the Windows address shown on the Share page, which looks like http://192.168.7.14:8780. There is no file to copy and no address to paste into the worker.
 
 `mesh.py serve` belongs on Windows. macOS has no `python` command. The script uses `python3`. If Python is missing: `brew install python`, then run the script again.
 
