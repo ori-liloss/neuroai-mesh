@@ -102,7 +102,7 @@ One training run stays on the NVIDIA PC. A 7B model cannot be trained across the
 
 | Kind | What it does | Runs on |
 | --- | --- | --- |
-| `generate` | Asks the worker's own local model at `http://127.0.0.1:8080/v1` (or the port in `NEURO_LOCAL_LLM`). Thinking off, at most 2048 tokens. Never sent to another host. | A computer with a local llama-server |
+| `generate` | Asks the worker's own local model at `http://127.0.0.1:8080/v1` (or the port in `NEURO_LOCAL_LLM`). Thinking off, at most 4096 tokens. A reply cut off by the token limit gets one retry with 4096 tokens instead of a check; if it is still cut off it is kept as truncated and never exported. Never sent to another host. | A computer with a local llama-server |
 | `verify_luau` | Runs the code with `luau` (on PATH or `NEURO_LUAU`), 10 s limit, 1 MB output limit. | A computer with luau |
 | `verify_python_syntax` | `compile()` only. The code is never run. | Every worker |
 | `verify_math` | Compares the final or `\boxed{}` answer with the expected one. | Every worker |

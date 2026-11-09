@@ -107,6 +107,52 @@ EOF
   echo "      Added a 'Neuro Worker' icon to the Desktop. Next time, double-click it."
 fi
 
+# verify_luau jobs need the luau command line tool. If it is missing, fetch the official
+# release once into ~/.local/share/neuro/luau (where mesh.py looks after NEURO_LUAU and PATH).
+# Opt out with NEURO_NO_LUAU_DOWNLOAD=1. Any failure only means no verify_luau jobs here.
+LUAU_DIR="$HOME/.local/share/neuro/luau"
+get_luau() {
+  [ -n "${NEURO_NO_LUAU_DOWNLOAD:-}" ] && [ "${NEURO_NO_LUAU_DOWNLOAD}" != "0" ] && return 0
+  [ -n "${NEURO_LUAU:-}" ] && [ -f "${NEURO_LUAU}" ] && return 0
+  command -v luau >/dev/null 2>&1 && return 0
+  [ -s "$LUAU_DIR/luau" ] && return 0
+  echo "      luau was not found. Downloading the official release for verify_luau jobs (NEURO_NO_LUAU_DOWNLOAD=1 skips)..."
+  # Only assets[].browser_download_url, read as JSON: the release notes are never searched.
+  url=$(curl -s -m 30 -H "User-Agent: neuro-worker" "https://api.github.com/repos/luau-lang/luau/releases?per_page=1" \
+    | python3 -c '
+import json, re, sys
+try:
+    releases = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for release in releases if isinstance(releases, list) else []:
+    for asset in release.get("assets") or []:
+        url = str(asset.get("browser_download_url") or "")
+        if re.fullmatch(r"https://github\.com/luau-lang/luau/releases/download/[^/]+/luau-ubuntu\.zip", url):
+            print(url)
+            sys.exit(0)
+') || return 1
+  [ -n "$url" ] || { echo "      No luau-ubuntu.zip in the latest release."; return 1; }
+  echo "      $url"
+  tmp=$(mktemp -d) || return 1
+  if curl -L -f -s -m 120 -o "$tmp/luau.zip" "$url" \
+    && python3 -m zipfile -e "$tmp/luau.zip" "$tmp/x" \
+    && found=$(find "$tmp/x" -name luau -type f | head -n 1) \
+    && [ -n "$found" ] \
+    && mkdir -p "$LUAU_DIR" \
+    && mv "$found" "$LUAU_DIR/luau.part" \
+    && chmod +x "$LUAU_DIR/luau.part" \
+    && mv "$LUAU_DIR/luau.part" "$LUAU_DIR/luau"; then
+    rm -rf "$tmp"
+    echo "      luau is in $LUAU_DIR/luau"
+    return 0
+  fi
+  rm -rf "$tmp"
+  rm -f "$LUAU_DIR/luau.part"
+  return 1
+}
+get_luau || echo "      luau download skipped. The worker runs without verify_luau jobs."
+
 echo "[4/4] Starting the Neuro worker. Main PC: $NEURO_MESH_URL"
 echo "      A pairing code (Pairing code: ### ###) appears in about 30 seconds."
 echo "      Approve it on the main PC's Neuro page. Ctrl+C stops everything."

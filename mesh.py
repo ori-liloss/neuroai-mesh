@@ -1321,7 +1321,25 @@ def luau_binary() -> str | None:
             return None
         if state == "file":
             return str(candidate)
-    return shutil.which("luau")
+    found = shutil.which("luau")
+    if found:
+        return found
+    # Where start-worker.ps1, platforms/windows-worker.ps1 and
+    # platforms/steamdeck.sh put the official release binary.
+    home = user_luau_path()
+    return str(home) if home and file_state(home) == "file" else None
+
+
+def user_luau_path() -> Path | None:
+    """%LOCALAPPDATA%\\Neuro\\luau\\luau.exe on Windows,
+    ~/.local/share/neuro/luau/luau elsewhere."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA", "").strip()
+        return Path(base) / "Neuro" / "luau" / "luau.exe" if base else None
+    try:
+        return Path.home() / ".local" / "share" / "neuro" / "luau" / "luau"
+    except (RuntimeError, KeyError):
+        return None
 
 
 _cpu_sample: dict = {"at": 0.0, "idle": 0, "total": 0, "pct": None}
@@ -2405,7 +2423,15 @@ NODE_OUTPUT_CAP = 256 * 1024
 JOB_LINE_LIMIT = 256 * 1024
 JOB_RESULT_LIMIT = 512 * 1024
 JOB_OUTPUT_LIMIT = 256 * 1024
-GENERATE_MAX_TOKENS = 2048
+GENERATE_MAX_TOKENS = 4096
+# A generate result cut off by max_tokens (finish_reason "length") is not
+# checked: the server queues one replacement with LONG_RETRY_TOKENS instead.
+# A long retry that is still cut off is kept as truncated: never verified,
+# never exported, never a "rejected" answer in pairs.
+LONG_RETRY_TOKENS = 4096
+# Workers that do not say how many tokens they allow ran older code that
+# capped generate at 2048; they only get generate jobs up to that size.
+LEGACY_GEN_MAX = 2048
 GENERATE_TIMEOUT = 600
 LUAU_TIMEOUT = 10
 LUAU_OUTPUT_CAP = 1024 * 1024
@@ -2535,6 +2561,8 @@ def validate_job(kind: str, raw: object) -> dict:
         }
         if raw.get("verify") is not None:
             payload["verify"] = validate_verify_spec(raw.get("verify"))
+        if raw.get("long_retry") is True:
+            payload["long_retry"] = True
         # Rejection sampling: `samples` copies of one prompt share a `group`
         # (JobQueue.add_many makes the copies). `seed` keeps them different.
         samples = int(_clamp(raw.get("samples"), 1, MAX_SAMPLES, 1))
@@ -2724,6 +2752,11 @@ def verify_payload(spec: dict, text: str) -> dict:
     return payload
 
 
+def is_truncated(output: object) -> bool:
+    """A generate result the model stopped because it hit max_tokens."""
+    return isinstance(output, dict) and output.get("finish_reason") == "length"
+
+
 def check_output(kind: str, payload: dict, ok: bool, output: object) -> tuple[bool, bool | None, dict]:
     """Validate a worker's result. Returns (ok, passed, output to store)."""
     if not isinstance(output, dict):
@@ -2789,6 +2822,10 @@ class JobQueue:
         # newest last. Rates and the queue ETA are counted from these.
         self.finished: deque[tuple[int, str, str, bool]] = deque(maxlen=200000)
         self.offset = 0
+        # Generate job ids whose result was cut off (finish_reason "length"),
+        # read from results.jsonl, so older log lines count too.
+        self.truncated: set[str] = set()
+        self.results_offset = 0
 
     # -- file side ---------------------------------------------------------
     def _file_lock(self) -> int | None:
@@ -2857,6 +2894,34 @@ class JobQueue:
                     continue
                 if isinstance(event, dict):
                     self._apply(event)
+
+    def _sync_truncated(self) -> None:
+        """Read new results.jsonl lines and note cut-off generations."""
+        try:
+            size = self.results_path.stat().st_size
+        except FileNotFoundError:
+            return
+        if size < self.results_offset:
+            self.truncated.clear()
+            self.results_offset = 0
+        if size == self.results_offset:
+            return
+        with open(self.results_path, "rb") as handle:
+            handle.seek(self.results_offset)
+            chunk = handle.read(size - self.results_offset)
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return
+        self.results_offset += end + 1
+        for raw in chunk[:end].split(b"\n"):
+            if b'"length"' not in raw:
+                continue
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("kind") == "generate" and row.get("ok") and is_truncated(row.get("output")):
+                self.truncated.add(str(row.get("id")))
 
     def _apply(self, event: dict) -> None:
         op = event.get("op")
@@ -2936,13 +3001,17 @@ class JobQueue:
                 self.sync()
         return ids
 
-    def lease(self, node: str, kinds: object, now: float | None = None) -> dict | None:
+    def lease(self, node: str, kinds: object, now: float | None = None, gen_max: object = None) -> dict | None:
         node = machine_key({"name": node, "os": ""})[0]
         if not node or not isinstance(kinds, list):
             return None
         wanted = {kind for kind in kinds if kind in JOB_KINDS}
         if not wanted:
             return None
+        # The most tokens this worker's generate handler allows. Older
+        # workers do not send it and cap at 2048, so a longer job would only
+        # come back cut off again.
+        allowed = int(_clamp(gen_max, LEGACY_GEN_MAX, GENERATE_MAX_TOKENS, LEGACY_GEN_MAX))
         now = time.time() if now is None else now
         with self.lock:
             self.sync()
@@ -2955,6 +3024,8 @@ class JobQueue:
             for jid in self.order:
                 job = self.jobs[jid]
                 if job["state"] != "queued" or job["kind"] not in wanted:
+                    continue
+                if job["kind"] == "generate" and int(job["payload"].get("max_tokens") or 0) > allowed:
                     continue
                 job["state"] = "leased"
                 job["attempts"] += 1
@@ -2998,7 +3069,23 @@ class JobQueue:
             self.sync()
             note = "saved"
             spec = job["payload"].get("verify")
-            if job["kind"] == "generate" and ok and isinstance(spec, dict):
+            if job["kind"] == "generate" and ok and is_truncated(output):
+                self.truncated.add(jid)
+                payload = job["payload"]
+                if not payload.get("long_retry") and int(payload.get("max_tokens") or 0) < LONG_RETRY_TOKENS:
+                    # Cut off by max_tokens: ask once more with room to finish
+                    # instead of checking half an answer.
+                    retry = {key: value for key, value in payload.items() if key != "samples"}
+                    retry.update({"max_tokens": LONG_RETRY_TOKENS, "long_retry": True})
+                    try:
+                        self.add("generate", retry, parent=jid)
+                        note = f"saved; truncated at {payload.get('max_tokens')} tokens, long retry queued"
+                    except JobError as exc:
+                        note = "saved; truncated, no retry: " + str(exc)[:120]
+                else:
+                    note = "saved; truncated, not verified"
+                job["verified"] = False
+            elif job["kind"] == "generate" and ok and isinstance(spec, dict):
                 try:
                     self.add(spec["kind"], verify_payload(spec, output["text"]), parent=jid)
                     note = "saved; " + spec["kind"] + " queued"
@@ -3015,7 +3102,16 @@ class JobQueue:
                 self._expire(now)
             except (OSError, RuntimeError):
                 pass
+            try:
+                self._sync_truncated()
+            except OSError:
+                pass
             kinds = {kind: {"queued": 0, "leased": 0, "done": 0, "failed": 0, "passed": 0} for kind in JOB_KINDS}
+            kinds["generate"]["truncated"] = 0
+            # Per verify kind: generations cut off, how many got a long
+            # retry, and how many stay cut off for good.
+            cut = {kind: {"truncated": 0, "retried": 0, "truncated_final": 0} for kind in VERIFY_KINDS}
+            retried = {job["parent"] for job in self.jobs.values() if job["kind"] == "generate" and job["payload"].get("long_retry") and job["parent"]}
             exportable = 0
             # Verify jobs that queued generate jobs will add when they finish.
             coming = {kind: 0 for kind in JOB_KINDS}
@@ -3024,8 +3120,15 @@ class JobQueue:
                 row[job["state"]] += 1
                 if job["passed"]:
                     row["passed"] += 1
-                if job["kind"] == "generate" and job["verified"]:
+                if job["kind"] == "generate" and job["verified"] and job["id"] not in self.truncated:
                     exportable += 1
+                if job["kind"] == "generate" and job["id"] in self.truncated:
+                    kinds["generate"]["truncated"] += 1
+                    spec = job["payload"].get("verify")
+                    bucket = cut.get(spec.get("kind")) if isinstance(spec, dict) else None
+                    if bucket is not None:
+                        bucket["truncated"] += 1
+                        bucket["retried" if job["id"] in retried else "truncated_final"] += 1
                 if job["kind"] == "generate" and job["state"] in {"queued", "leased"}:
                     spec = job["payload"].get("verify")
                     if isinstance(spec, dict) and spec.get("kind") in coming:
@@ -3054,6 +3157,7 @@ class JobQueue:
                     "checked": checked,
                     "passed": row["passed"],
                     "pct": round(100 * row["passed"] / checked) if checked else None,
+                    **cut[kind],
                 }
             return {
                 "kinds": kinds,
@@ -3067,7 +3171,10 @@ class JobQueue:
 
     def _results(self) -> tuple[dict[str, str], dict[str, dict]]:
         """Generated texts by job id, and the last verifier verdict by the
-        generate job it checked."""
+        generate job it checked. A generation cut off by max_tokens
+        (finish_reason "length") is left out of the texts, also for older
+        log lines, so it is never exported, neither as chosen nor as
+        rejected."""
         texts: dict[str, str] = {}
         verdicts: dict[str, dict] = {}
         try:
@@ -3082,7 +3189,9 @@ class JobQueue:
                     output = row.get("output") if isinstance(row.get("output"), dict) else {}
                     if row.get("kind") == "generate" and row.get("ok"):
                         text = output.get("text")
-                        if isinstance(text, str):
+                        if is_truncated(output):
+                            texts.pop(str(row.get("id")), None)
+                        elif isinstance(text, str):
                             texts[str(row.get("id"))] = text
                     elif row.get("kind") in VERIFY_KINDS and row.get("parent"):
                         verdicts[str(row["parent"])] = {
@@ -4267,7 +4376,7 @@ def job_loop() -> None:
             kinds = worker_kinds()
             _job_state["paused"] = busy
             if kinds and not busy:
-                code, job = _mesh_post(base, "/jobs/next", {"node": node, "kinds": kinds}, 10)
+                code, job = _mesh_post(base, "/jobs/next", {"node": node, "kinds": kinds, "gen_max": GENERATE_MAX_TOKENS}, 10)
                 _job_state["told"] = ""
                 if code == 200 and isinstance(job, dict) and job.get("kind") in kinds and job.get("id") and job.get("lease"):
                     _job_state["current"] = str(job["kind"])
@@ -4725,7 +4834,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             queue = job_queue()
             if path == "/jobs/next":
-                job = queue.lease(str(body.get("node") or ""), body.get("kinds"))
+                job = queue.lease(str(body.get("node") or ""), body.get("kinds"), gen_max=body.get("gen_max"))
                 if job is None:
                     self.send_empty(204)
                     return

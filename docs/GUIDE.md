@@ -256,7 +256,7 @@ The main PC keeps a queue in `jobs/` (gitignored). Idle workers pull one job at 
 
 | Job kind | Checks | Notes |
 | --- | --- | --- |
-| `generate` | asks the worker's own model | thinking off, up to 2048 tokens, never leaves the worker |
+| `generate` | asks the worker's own model | thinking off, up to 4096 tokens (a cut-off reply is retried once with 4096), never leaves the worker |
 | `verify_python_syntax` | `compile()` | code is never run |
 | `verify_js` | `node --check` | parse only; needs Node on the worker |
 | `verify_ts` | Node's built-in TypeScript stripper + `node --check` | Node 22.13+ / 23.2+; enums are "inconclusive" |

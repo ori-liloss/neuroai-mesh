@@ -808,7 +808,7 @@ function drawJobs(list) {
   }
   checksBox.replaceChildren();
   for (const [kind, row] of Object.entries(jobs.verifiers || {})) {
-    if (!row || !Number(row.checked || 0)) continue;
+    if (!row || !(Number(row.checked || 0) || Number(row.truncated || 0))) continue;
     const line = document.createElement("div");
     line.className = "pass";
     cell(line, kind);
@@ -818,7 +818,8 @@ function drawJobs(list) {
     fill.style.width = Math.max(0, Math.min(100, Number(row.pct || 0))) + "%";
     bar.append(fill);
     line.append(bar);
-    cell(line, Number(row.passed || 0) + " of " + Number(row.checked || 0) + " · " + Number(row.pct || 0) + "%", "b");
+    const cutOff = Number(row.truncated || 0);
+    cell(line, Number(row.passed || 0) + " of " + Number(row.checked || 0) + " · " + Number(row.pct || 0) + "%" + (cutOff ? " · " + cutOff + " truncated" : ""), "b");
     checksBox.append(line);
   }
   if (!checksBox.children.length) {
