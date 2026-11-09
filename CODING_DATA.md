@@ -36,7 +36,7 @@ Code, as a share of the whole mix:
 |---|---|---|
 | JavaScript (Node + browser) | 13% | verify_js (parse) |
 | TypeScript | 9% | verify_ts (parse, erasable syntax only) |
-| Python | 11% | gold tests where they exist, else verify_python_syntax |
+| Python | 11% | gold tests where they exist, else verify_tests (runs the answer's own asserts), else verify_python_syntax |
 | HTML/CSS | 8% | verify_html_css (structure) |
 | SQL (SQLite) | 6% | executed drills plus verify_sql (compile) |
 | Review, debugging, explanation | 3% | answer must contain a block that passes its verifier |
@@ -49,6 +49,9 @@ Code tasks: ~45% write-from-spec, 25% bug fix, 15% refactor/port, 15% explain/re
   prompts are Hebrew with English code, like the first `verified_code.py` row.
 - Cap every template family: no single family above 1500 rows. The SQL
   LEFT JOIN family alone could fill the whole SQL share.
+- `seeds/coding-v2-tested.jsonl` (Python and JavaScript) is checked by running the answer's own
+  asserts (`verify_tests`) plus a cross-check against the other samples' asserts; prefer
+  `jobs export --require-agreement` rows over parse-verified ones.
 - Parse-only verifiers do not prove behaviour. When a gold-tested row and a
   parse-verified mesh row exist for the same task, keep the gold one.
 - Ask for SQLite in SQL prompts. verify_sql fails other dialects.

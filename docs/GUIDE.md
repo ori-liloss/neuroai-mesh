@@ -265,8 +265,53 @@ The main PC keeps a queue in `jobs/` (gitignored). Idle workers pull one job at 
 | `verify_luau` | runs `luau` with limits | needs `luau` on PATH or `NEURO_LUAU` |
 | `verify_math` | final answer vs expected | |
 | `dedup_hash` | normalized hash + MinHash | |
+| `verify_tests` | **runs** the answer's own asserts (Python via `python -I`, JavaScript via `node`) | sandboxed, opt-in; see below |
+| `cross_tests` | **runs** each passing sample of a prompt against the other samples' asserts | queued once per prompt group |
 
-Nothing here runs generated code except `verify_luau` (limited), and no job is ever a shell command.
+The parse checks never run generated code. `verify_luau`, `verify_tests` and `cross_tests` do, with
+limits, and no job is ever a shell command: a job is data for a built-in handler.
+
+### Tests that really run (`verify_tests`, `cross_tests`)
+
+"Verified" from a parse check only means the code parses. `verify_tests` means it works: the answer
+holds the solution and at least 5 assert tests in **one** fenced block, the worker runs it, and it
+passes only when
+
+- the code has at least 3 real asserts that run (`assert True`, `assert 1`, `assert x == x`,
+  `assert.strictEqual(2, 2)` do not count; Python asserts inside a test function count only when the
+  file calls that function),
+- nothing hides a failure (catching `AssertionError`, a `try`/`except Exception` or `catch` around
+  the asserts that does not re-raise, `contextlib.suppress`, `process.on('uncaughtException')`,
+  `console.assert`), and
+- the run exits with code 0 within 10 s **and** reaches the end of the file (exiting early with
+  code 0 is a failure).
+
+The result keeps the runtime and the failure reason (the error line and the first 300 characters
+of stderr). JavaScript tests use `const assert = require('node:assert')`.
+
+When all samples of one prompt group are back and at least two passed their own tests, the main PC
+queues one `cross_tests` job for that group (CodeT-lite): every passing sample runs once more with
+the **other** samples' plain top-level asserts appended, and gets an agreement score, the share of
+those asserts it passes. A sample that only satisfies its own (possibly wrong) tests scores low.
+
+**Safety, and what is not covered.** Running model-written code is a real risk, so a worker only
+takes these jobs when it can sandbox them:
+
+| Where | When | Limits |
+| --- | --- | --- |
+| Windows | always (needs the Job Object API) | Job Object: 1 GB memory, one process (no child processes), 10 s CPU time, killed when closed |
+| Linux / macOS | only with `NEURO_RUN_TESTS=1`, never as root | rlimits in `preexec_fn`: CPU 10 s, address space 1 GB, file size 16 MB, no core files, NPROC 0 (for node, which cannot start its threads under NPROC 0 on Linux, node's permission model blocks child processes instead) |
+
+Always: a fresh temp folder as the working directory (never inside the repository), a scrubbed
+environment (no tokens, proxies, home folder or interpreter options), stdin closed, a 10 s wall
+timeout, output capped (a run that prints more than 4 MB is stopped), the folder deleted afterwards.
+Node also runs with `--permission`, so it can read only its temp folder and cannot write files or
+start processes. **Network access is not blocked**: a test could still open a connection. Do not
+run these jobs on a computer whose network you do not trust with that. A worker's capability text
+on the page (Jobs tab) says whether it runs tests.
+
+Each test job has no verdict retry and at most one lease retry (a worker that vanished);
+`cross_tests` is queued once per group and never queues anything itself.
 
 ### Use the ready coding set
 
@@ -283,6 +328,25 @@ python mesh.py jobs export --pairs coding-v1-pairs.jsonl          # chosen vs re
 `--pairs` refuses paths inside a training-data folder. Answers whose check could not run are never
 used as "rejected".
 
+### The tested coding set
+
+`seeds/coding-v2-tested.jsonl` has 400 original function-level tasks (Python 60%, JavaScript 40%;
+easy, medium and hard; about 10% in Hebrew), each asking for the implementation plus at least 5
+assert tests in one block, checked with `verify_tests`:
+
+```bash
+python mesh.py jobs add generate-verify seeds/coding-v2-tested.jsonl    # 1600 jobs
+python mesh.py jobs export coding-v2-tested.jsonl                       # passed their own tests
+python mesh.py jobs export --require-agreement coding-v2-agreed.jsonl   # and agreement >= 0.5
+python mesh.py jobs export --pairs coding-v2-pairs.jsonl                # chosen vs failed own tests
+```
+
+`export` keeps one answer per prompt: with a cross-check, the highest agreement (ties: the
+shortest). `--require-agreement` keeps only answers whose agreement is at least 0.5 (prompts where
+fewer than two samples passed have no cross-check and are left out). In `--pairs`, chosen is the best
+passing answer (never one below 0.5 agreement) and rejected is one that ran and failed its own
+tests; cut-off replies and checks that could not run are never used.
+
 ### Your own prompts
 
 A row of `prompts.jsonl`:
@@ -293,6 +357,8 @@ A row of `prompts.jsonl`:
 ```
 
 Math: `{"prompt": "What is 6*7?", "verify": {"kind": "verify_math", "expected": "42"}}`.
+Tested code: `{"prompt": "... plus at least 5 assert tests at the bottom of one python block", "verify": {"kind": "verify_tests", "lang": "python"}, "samples": 4}`
+(`lang` is `python` or `javascript`).
 Ask for the answer in **one fenced code block with the language tag**; the extractor looks there first.
 Then `python mesh.py jobs add generate-verify prompts.jsonl`. If `jobs add` says
 "Restart serve first", restart `mesh.py serve` — it is running older code.
@@ -387,6 +453,7 @@ fixed benchmark (pass@1 and tokens per task) → a second round on verified answ
 | `NEURO_JOBS=0` | worker | Take no data jobs. |
 | `NEURO_LOCAL_LLM` | worker | Port of the local model server (default 8080). |
 | `NEURO_LUAU` | worker | Path to the `luau` binary for `verify_luau`. |
+| `NEURO_RUN_TESTS=1` | Linux/macOS worker | Allow `verify_tests` / `cross_tests` (runs model-written code under rlimits; network not blocked). Windows uses a Job Object and needs no switch. |
 | `NEURO_RPC_BIN` | any | Path to `ggml-rpc-server` for memory sharing. |
 | `NEURO_TRAINING_LOG`, `NEURO_TRAINING_RUN_DIR` | main PC | Training log and run folder (or `training.json`). |
 | `NEURO_GPU_LOCK`, `NEURO_AI_DATA` | main PC | GPU lock file and data folder (defaults: `../train_local/gpu.lock`, `../neuro-ai-data`). |
@@ -403,6 +470,9 @@ fixed benchmark (pass@1 and tokens per task) → a second round on verified answ
 - The token and all worker traffic cross your LAN as plain HTTP. Anyone who can watch the LAN
   can see them. Keep the ports off the internet; use a VPN you control to reach it remotely.
 - A worker never shells out for a job; job kinds are a fixed list.
+- `verify_tests` and `cross_tests` run model-written code in a sandbox (Job Object on Windows,
+  rlimits with `NEURO_RUN_TESTS=1` elsewhere, temp folder, scrubbed env, 10 s). The network is not
+  blocked for that code.
 
 ## 10. Troubleshooting
 

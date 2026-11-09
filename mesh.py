@@ -6,6 +6,7 @@ They do not accept shell commands.
 
 from __future__ import annotations
 
+import ast
 import ctypes
 import hashlib
 import hmac
@@ -1945,6 +1946,10 @@ def capabilities(cards: list[dict], ram: dict, chat: bool, rpc_ready: bool) -> d
         # Data-factory job kinds this worker really runs. Empty unless the
         # job thread of `mesh.py work` is on.
         "job_kinds": worker_kinds() if _job_state.get("on") else [],
+        # Whether and how this worker runs model-written tests (verify_tests,
+        # cross_tests). Network access is not blocked for them.
+        "tests": ({"langs": sorted(sandbox_status()["langs"]), "note": sandbox_status()["note"]}
+                  if _job_state.get("on") else None),
         "jobs": {
             "on": bool(_job_state.get("on")),
             "done": int(_job_state.get("done") or 0),
@@ -2935,10 +2940,11 @@ JOBS_DIR = ROOT / "jobs"
 JOB_KINDS = (
     "generate", "verify_luau", "verify_python_syntax", "verify_js", "verify_ts",
     "verify_html_css", "verify_sql", "verify_math", "dedup_hash",
+    "verify_tests", "cross_tests",
 )
 VERIFY_KINDS = (
     "verify_luau", "verify_python_syntax", "verify_js", "verify_ts",
-    "verify_html_css", "verify_sql", "verify_math",
+    "verify_html_css", "verify_sql", "verify_math", "verify_tests",
 )
 # The verifiers added for the coding set never run generated code:
 #   verify_js        node --check (parse only), one temp file per code block
@@ -2971,11 +2977,31 @@ LUAU_TIMEOUT = 10
 LUAU_OUTPUT_CAP = 1024 * 1024
 MINHASH_PERM = 32
 MAX_ATTEMPTS = 3
+# verify_tests / cross_tests RUN model-written code, so they get one lease
+# retry at most (a worker that vanished) and never a second verdict.
+KIND_ATTEMPTS = {"verify_tests": 2, "cross_tests": 2}
 RATE_WINDOW = 3600  # seconds of finished jobs behind the rates and the ETA
 LEASE_SECONDS = {
     "generate": 900, "verify_luau": 180, "verify_python_syntax": 120, "verify_js": 180, "verify_ts": 240,
     "verify_html_css": 120, "verify_sql": 120, "verify_math": 120, "dedup_hash": 300,
+    "verify_tests": 120, "cross_tests": 400,
 }
+# verify_tests: the answer holds the solution plus assert tests in one fenced
+# block; it runs in a sandbox (see run_sandboxed) and passes on exit code 0
+# with every top-level statement finished and at least MIN_ASSERTS real
+# asserts. cross_tests (CodeT-lite) runs each passing sample of a prompt
+# group against the other samples' asserts and scores the agreement.
+TEST_LANGS = {"python": "python", "javascript": "js"}  # verify.lang -> fence language
+TEST_JOB_KINDS = ("verify_tests", "cross_tests")
+TEST_TIMEOUT = 10            # wall seconds per run
+TEST_CPU_SECONDS = 10        # CPU seconds per run (Job Object / RLIMIT_CPU)
+TEST_MEMORY = 1024 ** 3      # Job Object memory / RLIMIT_AS
+TEST_FILE_LIMIT = 16 * 1024 * 1024
+TEST_OUTPUT_CAP = 64 * 1024  # bytes kept per stream
+TEST_OUTPUT_STOP = 4 * 1024 * 1024  # a run that prints more is stopped
+MIN_ASSERTS = 3
+MAX_CROSS_CHECKS = 200       # other samples' asserts run against one solution
+AGREEMENT_MIN = 0.5
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX16 = re.compile(r"^[0-9a-f]{16}$")
 SKILLS = {"general", "code", "math", "luau"}
@@ -3022,6 +3048,10 @@ def validate_verify_spec(spec: object) -> dict:
         out["schema"] = _job_text(spec.get("schema"), 64000, "verify.schema")
     if kind == "verify_html_css" and spec.get("require_tags") is not None:
         out["require_tags"] = _tag_list(spec.get("require_tags"), "verify.require_tags")
+    if kind == "verify_tests":
+        if not isinstance(spec.get("lang"), str) or spec["lang"] not in TEST_LANGS:
+            raise JobError("verify.lang must be python or javascript")
+        out["lang"] = spec["lang"]
     return out
 
 
@@ -3111,6 +3141,29 @@ def validate_job(kind: str, raw: object) -> dict:
             payload["seed"] = seed
     elif kind in ("verify_js", "verify_ts"):
         payload = {"blocks": _code_blocks_field(raw, CODE_KINDS[kind])}
+    elif kind == "verify_tests":
+        if not isinstance(raw.get("lang"), str) or raw["lang"] not in TEST_LANGS:
+            raise JobError("verify_tests needs lang python or javascript")
+        payload = {"lang": raw["lang"], "blocks": _code_blocks_field(raw, TEST_LANGS[raw["lang"]])}
+    elif kind == "cross_tests":
+        if not isinstance(raw.get("lang"), str) or raw["lang"] not in TEST_LANGS:
+            raise JobError("cross_tests needs lang python or javascript")
+        group = raw.get("group")
+        if not isinstance(group, str) or not _HEX16.match(group):
+            raise JobError("cross_tests needs the group id")
+        samples = raw.get("samples")
+        if not isinstance(samples, list) or not 2 <= len(samples) <= MAX_SAMPLES:
+            raise JobError(f"cross_tests needs 2 to {MAX_SAMPLES} samples")
+        clean_samples = []
+        for sample in samples:
+            if not isinstance(sample, dict) or not isinstance(sample.get("id"), str) or not _HEX16.match(sample["id"]):
+                raise JobError("each cross_tests sample needs a job id and code")
+            clean_samples.append({"id": sample["id"], "code": _job_text(sample.get("code"), CODE_LIMIT, "code")})
+        if len({sample["id"] for sample in clean_samples}) != len(clean_samples):
+            raise JobError("cross_tests samples repeat a job id")
+        if sum(len(sample["code"]) for sample in clean_samples) > CODE_LIMIT:
+            raise JobError(f"the code is longer than {CODE_LIMIT} characters")
+        payload = {"lang": raw["lang"], "group": group, "samples": clean_samples}
     elif kind == "verify_html_css":
         if raw.get("html") is None and raw.get("css") is None and raw.get("answer") is not None:
             html, css = split_web(_job_text(raw.get("answer"), CODE_LIMIT, "answer"))
@@ -3269,6 +3322,8 @@ def verify_payload(spec: dict, text: str) -> dict:
         return {"code": extract_code(text, ("python", "py", "python3"))}
     if kind in ("verify_js", "verify_ts"):
         return {"blocks": pick_blocks(text, CODE_KINDS[kind])}
+    if kind == "verify_tests":
+        return {"lang": spec["lang"], "blocks": pick_blocks(text, TEST_LANGS[spec["lang"]])}
     if kind == "verify_html_css":
         html, css = split_web(text)
         payload = {"html": html, "css": css}
@@ -3315,11 +3370,33 @@ def check_output(kind: str, payload: dict, ok: bool, output: object) -> tuple[bo
         if not isinstance(passed, bool):
             return False, None, {"error": "verify result has no passed flag"}
         clean = {"passed": passed}
-        for key in ("error", "detail", "stderr_tail", "stdout_tail", "found", "returncode", "line"):
+        for key in ("error", "detail", "stderr_tail", "stdout_tail", "found", "returncode", "line", "asserts", "stderr"):
             if key in output:
                 value = output[key]
                 clean[key] = value if isinstance(value, int) and not isinstance(value, bool) else clip(value, 4000)
+        seconds = output.get("seconds")
+        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and 0 <= seconds < 1e6:
+            clean["seconds"] = round(float(seconds), 3)
         return True, passed, clean
+    if kind == "cross_tests":
+        scores = output.get("scores")
+        ids = {sample["id"] for sample in payload.get("samples") or []}
+        if not isinstance(scores, dict) or not scores or not set(scores) <= ids:
+            return False, None, {"error": "cross_tests returned no scores for its samples"}
+        clean_scores = {}
+        for jid, row in scores.items():
+            if not isinstance(row, dict):
+                return False, None, {"error": "cross_tests returned a bad score"}
+            agreement = row.get("agreement")
+            good, total = row.get("passed"), row.get("total")
+            if not all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 100000 for v in (good, total)) or good > total:
+                return False, None, {"error": "cross_tests returned bad counts"}
+            if agreement is not None:
+                if not isinstance(agreement, (int, float)) or isinstance(agreement, bool) or not 0 <= agreement <= 1:
+                    return False, None, {"error": "cross_tests returned a bad agreement"}
+                agreement = round(float(agreement), 4)
+            clean_scores[jid] = {"agreement": agreement, "passed": good, "total": total}
+        return True, None, {"scores": clean_scores, "detail": clip(output.get("detail") or "", 300)}
     hashes = output.get("hashes")
     texts = payload.get("texts") or []
     if not isinstance(hashes, list) or len(hashes) != len(texts):
@@ -3360,6 +3437,14 @@ class JobQueue:
         # read from results.jsonl, so older log lines count too.
         self.truncated: set[str] = set()
         self.results_offset = 0
+        # verify_tests prompt groups: group id -> its generate job ids, every
+        # job's children, the groups that already have a cross_tests job (so
+        # one is queued once per group, also after a restart), and the
+        # cross-check agreement per generate job (from cross_tests finishes).
+        self.groups: dict[str, list[str]] = {}
+        self.children: dict[str, list[str]] = {}
+        self.crossed: set[str] = set()
+        self.agreement: dict[str, float | None] = {}
 
     # -- file side ---------------------------------------------------------
     def _file_lock(self) -> int | None:
@@ -3411,6 +3496,10 @@ class JobQueue:
                 self.by_node.clear()
                 self.node_done.clear()
                 self.finished.clear()
+                self.groups.clear()
+                self.children.clear()
+                self.crossed.clear()
+                self.agreement.clear()
                 self.offset = 0
             if size == self.offset:
                 return
@@ -3476,6 +3565,15 @@ class JobQueue:
                 "verified": None,
             }
             self.order.append(jid)
+            payload = event["payload"]
+            parent = self.jobs[jid]["parent"]
+            if parent:
+                self.children.setdefault(parent, []).append(jid)
+            spec = payload.get("verify")
+            if kind == "generate" and isinstance(payload.get("group"), str) and isinstance(spec, dict) and spec.get("kind") == "verify_tests":
+                self.groups.setdefault(payload["group"], []).append(jid)
+            if kind == "cross_tests" and isinstance(payload.get("group"), str):
+                self.crossed.add(payload["group"])
         elif op == "finish":
             job = self.jobs.get(jid)
             if job is None or job["state"] in {"done", "failed"}:
@@ -3495,6 +3593,16 @@ class JobQueue:
             parent = self.jobs.get(job["parent"]) if job["parent"] else None
             if parent is not None and job["kind"] in VERIFY_KINDS:
                 parent["verified"] = bool(job["state"] == "done" and job["passed"])
+            scores = event.get("scores")
+            if job["kind"] == "cross_tests" and job["state"] == "done" and isinstance(scores, dict):
+                members = {sample.get("id") for sample in job["payload"].get("samples") or [] if isinstance(sample, dict)}
+                for gid, value in scores.items():
+                    if gid not in members or gid not in self.jobs:
+                        continue
+                    if value is None:
+                        self.agreement[gid] = None
+                    elif isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1:
+                        self.agreement[gid] = float(value)
 
     def _expire(self, now: float) -> None:
         for jid, held in list(self.leases.items()):
@@ -3506,9 +3614,10 @@ class JobQueue:
             job = self.jobs.get(jid)
             if job is None or job["state"] != "leased":
                 continue
-            if job["attempts"] >= MAX_ATTEMPTS:
+            if job["attempts"] >= KIND_ATTEMPTS.get(job["kind"], MAX_ATTEMPTS):
                 self._append(self.queue_path, [{"op": "finish", "id": jid, "ok": False, "node": "", "note": "lease expired", "at": int(now)}])
                 self.sync()
+                self._maybe_cross(job)
             else:
                 job["state"] = "queued"
 
@@ -3535,7 +3644,8 @@ class JobQueue:
                 self.sync()
         return ids
 
-    def lease(self, node: str, kinds: object, now: float | None = None, gen_max: object = None) -> dict | None:
+    def lease(self, node: str, kinds: object, now: float | None = None, gen_max: object = None,
+              test_langs: object = None) -> dict | None:
         node = machine_key({"name": node, "os": ""})[0]
         if not node or not isinstance(kinds, list):
             return None
@@ -3546,6 +3656,9 @@ class JobQueue:
         # workers do not send it and cap at 2048, so a longer job would only
         # come back cut off again.
         allowed = int(_clamp(gen_max, LEGACY_GEN_MAX, GENERATE_MAX_TOKENS, LEGACY_GEN_MAX))
+        # Languages this worker's sandbox runs. A worker may run Python
+        # tests but have no node that works under its limits.
+        langs = {str(lang) for lang in test_langs} if isinstance(test_langs, list) else None
         now = time.time() if now is None else now
         with self.lock:
             self.sync()
@@ -3560,6 +3673,8 @@ class JobQueue:
                 if job["state"] != "queued" or job["kind"] not in wanted:
                     continue
                 if job["kind"] == "generate" and int(job["payload"].get("max_tokens") or 0) > allowed:
+                    continue
+                if job["kind"] in TEST_JOB_KINDS and langs is not None and job["payload"].get("lang") not in langs:
                     continue
                 job["state"] = "leased"
                 job["attempts"] += 1
@@ -3599,7 +3714,10 @@ class JobQueue:
                 self.results_path,
                 [{"id": jid, "kind": job["kind"], "parent": job["parent"], "node": node, "ok": ok, "passed": passed, "output": output, "at": int(now)}],
             )
-            self._append(self.queue_path, [{"op": "finish", "id": jid, "ok": ok, "passed": passed, "node": node, "at": int(now)}])
+            event = {"op": "finish", "id": jid, "ok": ok, "passed": passed, "node": node, "at": int(now)}
+            if job["kind"] == "cross_tests" and ok:
+                event["scores"] = {gid: row["agreement"] for gid, row in output["scores"].items()}
+            self._append(self.queue_path, [event])
             self.sync()
             note = "saved"
             spec = job["payload"].get("verify")
@@ -3626,7 +3744,48 @@ class JobQueue:
                 except (JobError, KeyError) as exc:
                     job["verified"] = False
                     note = "saved; not verified: " + str(exc)[:120]
+            crossed = self._maybe_cross(job)
+            if crossed:
+                note += "; " + crossed
             return True, note
+
+    def _maybe_cross(self, job: dict) -> str:
+        """Queue one cross_tests job for a verify_tests prompt group once
+        every sample of it is settled (generated, retried, checked or
+        failed) and at least two passed their own tests. Never twice for a
+        group: `crossed` is rebuilt from the queue file, so a restart does
+        not queue it again either. cross_tests itself never queues anything."""
+        gen = job if job["kind"] == "generate" else self.jobs.get(job["parent"]) if job["parent"] else None
+        if gen is None or gen["kind"] != "generate":
+            return ""
+        payload = gen["payload"]
+        group, spec = payload.get("group"), payload.get("verify")
+        if not isinstance(group, str) or not isinstance(spec, dict) or spec.get("kind") != "verify_tests" or group in self.crossed:
+            return ""
+        members = [self.jobs[gid] for gid in self.groups.get(group, []) if gid in self.jobs]
+        originals = [member for member in members if not member["payload"].get("long_retry")]
+        if not originals or len(originals) < int(originals[0]["payload"].get("samples") or 1):
+            return ""
+        candidates = []
+        for member in members:
+            if member["state"] in {"queued", "leased"}:
+                return ""
+            kids = [self.jobs[cid] for cid in self.children.get(member["id"], []) if cid in self.jobs]
+            if any(kid["state"] in {"queued", "leased"} for kid in kids):
+                return ""
+            if member["state"] != "done" or not member["verified"] or member["id"] in self.truncated:
+                continue
+            checks = [kid for kid in kids if kid["kind"] == "verify_tests" and kid["state"] == "done" and kid["passed"]]
+            blocks = [block for block in checks[-1]["payload"].get("blocks") or [] if block.strip()] if checks else []
+            if len(blocks) == 1:
+                candidates.append({"id": member["id"], "code": blocks[0]})
+        if len(candidates) < 2:
+            return ""
+        try:
+            self.add("cross_tests", {"lang": spec["lang"], "group": group, "samples": candidates[:MAX_SAMPLES]})
+        except JobError as exc:
+            return "no cross-check: " + str(exc)[:120]
+        return f"cross_tests queued for {len(candidates)} samples"
 
     def summary(self, now: float | None = None) -> dict:
         now = time.time() if now is None else now
@@ -3693,6 +3852,14 @@ class JobQueue:
                     "pct": round(100 * row["passed"] / checked) if checked else None,
                     **cut[kind],
                 }
+            scored = [value for value in self.agreement.values() if value is not None]
+            verifiers["verify_tests"]["agreement"] = {
+                "groups": len(self.crossed),
+                "scored": len(scored),
+                "avg": round(sum(scored) / len(scored), 3) if scored else None,
+                "agree": sum(1 for value in scored if value >= AGREEMENT_MIN),
+                "min": AGREEMENT_MIN,
+            }
             return {
                 "kinds": kinds,
                 "nodes": nodes,
@@ -3737,11 +3904,24 @@ class JobQueue:
             pass
         return texts, verdicts
 
-    def export(self, name: str, per_prompt: int = 1) -> tuple[Path, int]:
+    def _ranked(self, jids: list[str], texts: dict[str, str]) -> list[str]:
+        """Candidates of one prompt, best first: with a cross-check, the
+        highest agreement, then the shortest answer; otherwise queue order."""
+        if not any(jid in self.agreement for jid in jids):
+            return list(jids)
+        def key(jid: str) -> tuple[float, int]:
+            value = self.agreement.get(jid)
+            return (-(value if value is not None else -1.0), len(strip_thinking(texts.get(jid, ""))))
+        return sorted(jids, key=key)
+
+    def export(self, name: str, per_prompt: int = 1, require_agreement: bool = False) -> tuple[Path, int]:
         """Write only verified generate rows, as chat training rows, into
         the jobs folder. With rejection sampling, at most `per_prompt`
         verified candidates of one prompt group are kept (0 keeps all);
-        identical answers are written once."""
+        identical answers are written once. verify_tests groups with a
+        cross-check give the highest agreement first (ties: shortest).
+        require_agreement keeps only candidates whose cross-check agreement
+        is at least AGREEMENT_MIN (rows without a cross-check are left out)."""
         base = Path(str(name)).name
         if not base.endswith(".jsonl") or base in {"queue.jsonl", "results.jsonl"}:
             raise JobError("Name the export file like verified.jsonl")
@@ -3750,27 +3930,35 @@ class JobQueue:
             texts, _ = self._results()
             rows = []
             kept: dict[str, list[str]] = {}
+            by_group: dict[str, list[str]] = {}
             for jid in self.order:
                 job = self.jobs[jid]
                 if job["kind"] != "generate" or not job["verified"] or jid not in texts:
                     continue
-                payload = job["payload"]
-                answer = strip_thinking(texts[jid])
-                group = kept.setdefault(str(payload.get("group") or jid), [])
-                if answer in group or (per_prompt > 0 and len(group) >= per_prompt):
+                if require_agreement and (self.agreement.get(jid) is None or self.agreement[jid] < AGREEMENT_MIN):
                     continue
-                group.append(answer)
-                rows.append(
-                    {
-                        "messages": payload["messages"] + [{"role": "assistant", "content": answer}],
-                        "skill": job_skill(payload),
-                        "verified_by": (payload.get("verify") or {}).get("kind", ""),
-                        "node": job["node"],
-                        "job": jid,
-                        **({"group": payload["group"]} if "group" in payload else {}),
-                        **({"meta": payload["meta"]} if "meta" in payload else {}),
-                    }
-                )
+                by_group.setdefault(str(job["payload"].get("group") or jid), []).append(jid)
+            for key, members in by_group.items():
+                for jid in self._ranked(members, texts):
+                    job = self.jobs[jid]
+                    payload = job["payload"]
+                    answer = strip_thinking(texts[jid])
+                    group = kept.setdefault(key, [])
+                    if answer in group or (per_prompt > 0 and len(group) >= per_prompt):
+                        continue
+                    group.append(answer)
+                    rows.append(
+                        {
+                            "messages": payload["messages"] + [{"role": "assistant", "content": answer}],
+                            "skill": job_skill(payload),
+                            "verified_by": (payload.get("verify") or {}).get("kind", ""),
+                            "node": job["node"],
+                            "job": jid,
+                            **({"group": payload["group"]} if "group" in payload else {}),
+                            **({"agreement": self.agreement[jid]} if self.agreement.get(jid) is not None else {}),
+                            **({"meta": payload["meta"]} if "meta" in payload else {}),
+                        }
+                    )
         self.folder.mkdir(parents=True, exist_ok=True)
         out = self.folder / base
         _write_jsonl_atomic(out, rows)
@@ -3779,8 +3967,11 @@ class JobQueue:
     def export_pairs(self, target: str) -> tuple[Path, int]:
         """Preference rows for DPO/KTO: for one prompt, a candidate the
         verifier passed (chosen) against one it ran and failed (rejected).
-        A candidate whose verifier could not run (unavailable, timed out)
-        or never ran is neither. Candidates pair up once each. The file goes
+        A candidate whose verifier could not run (unavailable, sandbox
+        error) or never ran is neither, and a cut-off reply is never used.
+        With a cross-check, chosen goes best agreement first, and a sample
+        that passed its own tests but agrees below AGREEMENT_MIN with the
+        others is not chosen. Candidates pair up once each. The file goes
         where the user names it, but never into the live training folder."""
         out = pairs_target(target, self.folder)
         with self.lock:
@@ -3798,11 +3989,15 @@ class JobQueue:
                 ).hexdigest()[:16])
                 bucket = groups.setdefault(key, {"chosen": [], "rejected": []})
                 answer = strip_thinking(texts[jid])
+                if verdict["passed"] and self.agreement.get(jid) is not None and self.agreement[jid] < AGREEMENT_MIN:
+                    continue
                 side = bucket["chosen" if verdict["passed"] else "rejected"]
                 if answer and all(answer != seen for _, seen in bucket["chosen"] + bucket["rejected"]):
                     side.append((jid, answer))
             rows = []
             for key, bucket in groups.items():
+                order = self._ranked([jid for jid, _ in bucket["chosen"]], texts)
+                bucket["chosen"].sort(key=lambda item: order.index(item[0]))
                 for (good, good_text), (bad, bad_text) in zip(bucket["chosen"], bucket["rejected"]):
                     payload = self.jobs[good]["payload"]
                     rows.append(
@@ -3816,6 +4011,7 @@ class JobQueue:
                             "group": key,
                             "chosen_job": good,
                             "rejected_job": bad,
+                            **({"chosen_agreement": self.agreement[good]} if self.agreement.get(good) is not None else {}),
                             **({"meta": payload["meta"]} if "meta" in payload else {}),
                         }
                     )
@@ -3893,7 +4089,7 @@ def job_skill(payload: dict) -> str:
         return "luau"
     if kind == "verify_math":
         return "math"
-    return "code" if kind in CODE_KINDS else "general"
+    return "code" if kind in CODE_KINDS or kind == "verify_tests" else "general"
 
 
 def expand_samples(kind: str, raw: object) -> list[object]:
@@ -4042,6 +4238,10 @@ def worker_kinds() -> list[str]:
         kinds.insert(0, "verify_luau")
     if local_model_ready():
         kinds.insert(0, "generate")
+    # Only a computer that can sandbox model-written code runs its tests
+    # (Windows Job Object, or NEURO_RUN_TESTS=1 with rlimits elsewhere).
+    if sandbox_status()["langs"]:
+        kinds.extend(TEST_JOB_KINDS)
     _kinds_cache.update({"at": now, "kinds": kinds})
     return list(kinds)
 
@@ -4679,6 +4879,849 @@ def job_dedup_hash(payload: dict) -> tuple[bool, dict]:
     return True, {"hashes": rows, "num_perm": MINHASH_PERM}
 
 
+# -- verify_tests / cross_tests: running model-written tests in a sandbox -----
+# The only job kinds that RUN generated code. Each run: a fresh temp folder
+# (never inside this repository) as cwd, an argument list (never a shell),
+# `python -I` or node with its permission model, stdin closed, a scrubbed
+# environment (no tokens, proxies, PATH extras or interpreter options), a
+# 10 s wall timeout, capped output, the folder removed afterwards.
+#   Windows: a Job Object with 1 GB memory, ONE active process (no child
+#            processes), 10 s CPU time and kill-on-close.
+#   Linux/macOS: only with NEURO_RUN_TESTS=1, never as root; rlimits set in
+#            preexec_fn: CPU 10 s, address space 1 GB, file size 16 MB,
+#            no core files, NPROC 0 (node only without NPROC when it cannot
+#            start its threads under it; then node's permission model
+#            refuses child processes and worker threads).
+# Network access is NOT blocked. A worker that cannot sandbox never
+# advertises these kinds. The code was adapted from
+# ml/evaluation/coding_eval.py (copied, not imported).
+
+
+class SandboxError(OSError):
+    pass
+
+
+class _WinJob:
+    """A Windows Job Object: memory cap, one active process, CPU time limit,
+    kill on close, no UI access."""
+
+    JOB_OBJECT_LIMIT_JOB_TIME = 0x0004
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x0008
+    JOB_OBJECT_LIMIT_JOB_MEMORY = 0x0200
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x0400
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    PROCESS_ACCESS = 0x0001 | 0x0100 | 0x0800 | 0x1000  # terminate, set quota, suspend/resume, query limited
+
+    _api = None
+
+    @classmethod
+    def api(cls):
+        if cls._api is None:
+            from ctypes import wintypes
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+            class BASIC(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                            ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class EXTENDED(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IO_COUNTERS),
+                            ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            class UI(ctypes.Structure):
+                _fields_ = [("UIRestrictionsClass", wintypes.DWORD)]
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            ntdll = ctypes.WinDLL("ntdll")
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+            k32.SetInformationJobObject.restype = wintypes.BOOL
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            k32.AssignProcessToJobObject.restype = wintypes.BOOL
+            k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            k32.TerminateJobObject.restype = wintypes.BOOL
+            k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            k32.TerminateProcess.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
+            ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+            ntdll.NtResumeProcess.restype = ctypes.c_long
+            cls._api = (k32, ntdll, EXTENDED, UI)
+        return cls._api
+
+    def __init__(self, memory_bytes: int, cpu_seconds: float):
+        k32, _, EXTENDED, UI = self.api()
+        self.handle = k32.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        info = EXTENDED()
+        info.BasicLimitInformation.LimitFlags = (
+            self.JOB_OBJECT_LIMIT_JOB_TIME | self.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | self.JOB_OBJECT_LIMIT_JOB_MEMORY
+            | self.JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION | self.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        info.BasicLimitInformation.PerJobUserTimeLimit = int(cpu_seconds * 10_000_000)  # 100 ns units
+        info.BasicLimitInformation.ActiveProcessLimit = 1
+        info.JobMemoryLimit = memory_bytes
+        if not k32.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            error = ctypes.get_last_error()
+            self.close()
+            raise OSError(error, "SetInformationJobObject failed")
+        ui = UI(0xFF)  # no clipboard, desktop switching, global atoms, system parameters or exit-windows
+        k32.SetInformationJobObject(self.handle, 4, ctypes.byref(ui), ctypes.sizeof(ui))
+
+    def adopt(self, pid: int) -> None:
+        """Put a process created with CREATE_SUSPENDED into the job, then let it run."""
+        k32, ntdll, _, _ = self.api()
+        process = k32.OpenProcess(self.PROCESS_ACCESS, False, pid)
+        if not process:
+            raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+        try:
+            if not k32.AssignProcessToJobObject(self.handle, process):
+                error = ctypes.get_last_error()
+                k32.TerminateProcess(process, 1)
+                raise OSError(error, "AssignProcessToJobObject failed")
+            if ntdll.NtResumeProcess(process) != 0:
+                k32.TerminateProcess(process, 1)
+                raise OSError(0, "NtResumeProcess failed")
+        finally:
+            k32.CloseHandle(process)
+
+    def terminate(self) -> None:
+        if self.handle:
+            self.api()[0].TerminateJobObject(self.handle, 1)
+
+    def close(self) -> None:
+        if self.handle:
+            self.api()[0].CloseHandle(self.handle)
+            self.handle = None
+
+
+def sandbox_env(workdir: str) -> dict:
+    """A minimal environment: no tokens, proxies, PATH extras, home secrets
+    or interpreter options."""
+    if os.name == "nt":
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        return {"SystemRoot": root, "WINDIR": root, "SystemDrive": os.environ.get("SystemDrive", "C:"),
+                "PATH": rf"{root}\System32;{root}", "TEMP": workdir, "TMP": workdir,
+                "USERPROFILE": workdir, "HOME": workdir}
+    return {"PATH": "/usr/bin:/bin", "HOME": workdir, "TMPDIR": workdir, "LANG": "C.UTF-8"}
+
+
+def _posix_limits(nproc: bool, address_space: bool):
+    """preexec_fn for a test child. The values are worked out here, in the
+    parent; the child only calls setrlimit."""
+    import resource
+
+    def capped(which: int, value: int) -> tuple[int, int]:
+        _, hard = resource.getrlimit(which)
+        value = value if hard == resource.RLIM_INFINITY else min(value, hard)
+        return value, value
+
+    cpu_soft, _ = capped(resource.RLIMIT_CPU, TEST_CPU_SECONDS)
+    rules = [
+        (resource.RLIMIT_CPU, (cpu_soft, cpu_soft), True),
+        (resource.RLIMIT_FSIZE, capped(resource.RLIMIT_FSIZE, TEST_FILE_LIMIT), True),
+        (resource.RLIMIT_CORE, (0, 0), True),
+    ]
+    if nproc:
+        rules.append((resource.RLIMIT_NPROC, (0, 0), True))
+    if address_space:
+        # macOS does not enforce RLIMIT_AS and may refuse it; elsewhere it must hold.
+        rules.append((resource.RLIMIT_AS, capped(resource.RLIMIT_AS, TEST_MEMORY), sys.platform != "darwin"))
+    setrlimit = resource.setrlimit
+
+    def apply() -> None:
+        for which, value, required in rules:
+            try:
+                setrlimit(which, value)
+            except (ValueError, OSError):
+                if required:
+                    raise
+    return apply
+
+
+def _drain(stream, cap: int, sink: dict, flood: threading.Event | None = None) -> None:
+    kept = bytearray()
+    total = 0
+    try:
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if len(kept) < cap:
+                kept += chunk[:cap - len(kept)]
+            if flood is not None and total > TEST_OUTPUT_STOP:
+                flood.set()
+    except (OSError, ValueError):
+        pass
+    sink["data"], sink["total"] = bytes(kept), total
+
+
+def run_sandboxed(argv: list[str], workdir: str, limits: dict, timeout: float = TEST_TIMEOUT) -> dict:
+    """Run argv in workdir under `limits` ({"job": True} on Windows, or
+    {"nproc": bool, "address_space": bool} on POSIX). Returns a result dict."""
+    kwargs: dict = {"cwd": workdir, "env": sandbox_env(workdir), "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "shell": False, "close_fds": True}
+    job = None
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        if not limits.get("job"):
+            raise SandboxError("no Job Object: refusing to run tests")
+        job = _WinJob(TEST_MEMORY, TEST_CPU_SECONDS)
+        kwargs["creationflags"] |= 0x00000004  # CREATE_SUSPENDED until it is inside the job
+    else:
+        kwargs["start_new_session"] = True
+        kwargs["preexec_fn"] = _posix_limits(bool(limits.get("nproc")), bool(limits.get("address_space")))
+    start = time.perf_counter()
+    try:
+        proc = subprocess.Popen(argv, **kwargs)
+    except (OSError, subprocess.SubprocessError) as error:
+        if job:
+            job.close()
+        raise SandboxError(f"could not start {Path(argv[0]).name}: {error}") from error
+    sinks: tuple[dict, dict] = ({}, {})
+    timed_out = flooded = False
+    flood = threading.Event()
+    try:
+        if job:
+            try:
+                job.adopt(proc.pid)
+            except OSError as error:
+                proc.kill()
+                proc.wait()
+                raise SandboxError(f"could not apply the Job Object limit: {error}") from error
+        readers = [threading.Thread(target=_drain, args=(pipe, TEST_OUTPUT_CAP, sink, flood), daemon=True)
+                   for pipe, sink in zip((proc.stdout, proc.stderr), sinks)]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None and not flood.is_set() and time.monotonic() < deadline:
+            flood.wait(0.02)
+        if proc.poll() is None:
+            flooded = flood.is_set()
+            timed_out = not flooded
+            if job:
+                job.terminate()
+            elif os.name != "nt":
+                try:
+                    os.killpg(proc.pid, 9)
+                except OSError:
+                    proc.kill()
+            else:
+                proc.kill()
+            proc.wait(timeout=10)
+        for reader in readers:
+            reader.join(timeout=5)
+    finally:
+        if job:
+            job.terminate()
+            job.close()
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+    out, err = sinks
+    return {
+        "returncode": proc.returncode, "timed_out": timed_out, "flooded": flooded,
+        "seconds": round(time.perf_counter() - start, 3),
+        "stdout": out.get("data", b"").decode("utf-8", "replace"),
+        "stderr": err.get("data", b"").decode("utf-8", "replace"),
+        "stdout_bytes": out.get("total", 0), "stderr_bytes": err.get("total", 0),
+    }
+
+
+def _remove_tree(path: str) -> bool:
+    for attempt in range(10):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            return True
+        time.sleep(0.1 * (attempt + 1))
+    return False
+
+
+def sandbox_workdir() -> str:
+    """A fresh temp folder for one run, never inside this repository."""
+    folder = tempfile.mkdtemp(prefix="neuro-tests-")
+    resolved = os.path.normcase(os.path.realpath(folder))
+    repo = os.path.normcase(os.path.realpath(str(ROOT)))
+    if resolved == repo or resolved.startswith(repo.rstrip("\\/") + os.sep):
+        _remove_tree(folder)
+        raise SandboxError("the temp folder is inside the repository; set TEMP/TMPDIR elsewhere")
+    return folder
+
+
+# Python: runs main.py as __main__, then (cross_tests) each extra assert on
+# its own, then prints the run token, so exiting early with code 0 is no pass.
+PY_TEST_HARNESS = '''\
+import json, sys
+token = sys.argv.pop(1)
+checks = None
+try:
+    with open("checks.json", encoding="utf-8") as handle:
+        checks = json.load(handle)
+except FileNotFoundError:
+    pass
+with open("main.py", encoding="utf-8") as handle:
+    source = handle.read()
+namespace = {"__name__": "__main__", "__file__": "main.py", "__builtins__": __builtins__}
+exec(compile(source, "main.py", "exec"), namespace)
+sys.stdout.flush()
+print()
+if checks is not None:
+    for index, check in enumerate(checks):
+        try:
+            exec(compile(check, "check%d" % index, "exec"), namespace)
+            print(token, "P", index, flush=True)
+        except BaseException:
+            print(token, "F", index, flush=True)
+    print(token, "END", flush=True)
+else:
+    print(token, flush=True)
+'''
+
+JS_TEST_TAIL = '''
+;process.stdout.write("\\n@@TOKEN@@\\n");
+'''
+
+# Direct eval inside the module, so the checks see the solution's functions.
+JS_CROSS_TAIL = '''
+;(async () => {
+  const __neuroAssert = (typeof require === "function" ? require : process.getBuiltinModule)("node:assert");
+  const __neuroChecks = @@CHECKS@@;
+  process.stdout.write("\\n");
+  for (let __neuroIndex = 0; __neuroIndex < __neuroChecks.length; __neuroIndex++) {
+    let __neuroOk = true;
+    try {
+      const __neuroResult = eval("{ const assert = __neuroAssert;\\n" + __neuroChecks[__neuroIndex] + "\\n}");
+      if (__neuroResult && typeof __neuroResult.then === "function") await __neuroResult;
+    } catch (__neuroError) {
+      __neuroOk = false;
+    }
+    process.stdout.write("@@TOKEN@@ " + (__neuroOk ? "P " : "F ") + __neuroIndex + "\\n");
+  }
+  process.stdout.write("@@TOKEN@@ END\\n");
+})();
+'''
+
+_sandbox_cache: dict = {}
+_sandbox_lock = threading.Lock()
+_PY_PROBE = "import json\nassert json.loads('[1, 2]') == [1, 2]\nprint('probe-ok')\n"
+_JS_PROBE = "require('node:assert').strictEqual(1 + 1, 2); console.log('probe-ok');"
+
+
+def _probe(argv_for, limits: dict, source_name: str, source: str) -> bool:
+    """Run a fixed probe program (never job code) under the given limits."""
+    folder = sandbox_workdir()
+    try:
+        script = Path(folder) / source_name
+        script.write_text(source, encoding="utf-8")
+        (Path(folder) / "package.json").write_text("{}\n", encoding="utf-8")
+        ran = run_sandboxed(argv_for(folder) + [str(script)], folder, limits, timeout=20)
+        return not ran["timed_out"] and ran["returncode"] == 0 and ran["stdout"].strip() == "probe-ok"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    finally:
+        _remove_tree(folder)
+
+
+def _node_flag_sets(node: str) -> list[list[str]]:
+    """Node flags to try, permission model first (no child processes, no
+    worker threads, file reads only inside the run folder)."""
+    base = ["--max-old-space-size=512"]
+    return [["--permission", "--allow-fs-read={dir}", *base],
+            ["--experimental-permission", "--allow-fs-read={dir}", *base],
+            base]
+
+
+def sandbox_status(refresh: bool = False) -> dict:
+    """Whether this computer may run model-written tests, and how.
+    {"ok", "note", "langs": {"python"|"javascript": {"argv", "limits", "how"}}}.
+    Probed once per process with fixed programs."""
+    with _sandbox_lock:
+        if _sandbox_cache and not refresh:
+            return _sandbox_cache["status"]
+        status = _sandbox_probe()
+        _sandbox_cache["status"] = status
+        return status
+
+
+def _sandbox_probe() -> dict:
+    def off(why: str) -> dict:
+        return {"ok": False, "note": "tests off: " + why, "langs": {}}
+
+    if os.name == "nt":
+        try:
+            _WinJob(TEST_MEMORY, TEST_CPU_SECONDS).close()
+        except (OSError, AttributeError, ValueError) as exc:
+            return off(f"no Windows Job Object ({exc})")
+        py_variants = [({"job": True}, "Job Object")]
+        js_variants = [({"job": True}, "Job Object")]
+        how = (f"Windows Job Object: {TEST_MEMORY >> 20} MB, 1 process (no child processes), "
+               f"{TEST_CPU_SECONDS} s CPU, kill on close")
+    else:
+        if os.environ.get("NEURO_RUN_TESTS", "").strip() != "1":
+            return off("set NEURO_RUN_TESTS=1 to run model-written tests on this computer")
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            return off("refused as root (process limits do not bind root)")
+        try:
+            import resource  # noqa: F401
+        except ImportError:
+            return off("no resource module")
+        py_variants = [({"nproc": True, "address_space": True}, "NPROC 0")]
+        js_variants = [({"nproc": True, "address_space": True}, "NPROC 0"),
+                       ({"nproc": False, "address_space": True}, "node permission model instead of NPROC"),
+                       ({"nproc": False, "address_space": False}, "node permission model, heap cap instead of RLIMIT_AS")]
+        how = (f"rlimits: CPU {TEST_CPU_SECONDS} s, address space {TEST_MEMORY >> 20} MB, "
+               f"file size {TEST_FILE_LIMIT >> 20} MB, no core files")
+    langs: dict = {}
+    python = getattr(sys, "_base_executable", "") or sys.executable
+    if python and Path(python).is_file():
+        prefix = [str(Path(python).resolve()), "-I", "-B", "-X", "utf8"]
+        for limits, label in py_variants:
+            if _probe(lambda folder: list(prefix), limits, "probe.py", _PY_PROBE):
+                langs["python"] = {"argv": prefix, "limits": limits, "how": label}
+                break
+    node = node_path()
+    if node:
+        node = str(Path(node).resolve())
+        for limits, label in js_variants:
+            for flags in _node_flag_sets(node):
+                permission = any("permission" in flag for flag in flags)
+                if label.startswith("node permission") and not permission:
+                    continue
+                argv = [node, *flags]
+                if _probe(lambda folder: [arg.replace("{dir}", folder) for arg in argv], limits, "probe.js", _JS_PROBE):
+                    langs["javascript"] = {"argv": argv, "limits": limits,
+                                           "how": label + (", node permission model" if permission and "permission" not in label else "")}
+                    break
+            if "javascript" in langs:
+                break
+    if not langs:
+        return off(how + "; but no Python or node ran under these limits")
+    detail = "; ".join(f"{lang}: {spec['how']}" for lang, spec in sorted(langs.items()))
+    note = (f"runs model-written tests ({', '.join(sorted(langs))}): {how}; {detail}; fresh temp folder, "
+            f"scrubbed env, {TEST_TIMEOUT} s wall timeout. Network access is NOT blocked.")
+    return {"ok": True, "note": note, "langs": langs}
+
+
+def run_test_program(lang: str, code: str, box: dict, checks: list[str] | None = None,
+                     timeout: float = TEST_TIMEOUT) -> dict:
+    """Run one answer (and, for cross_tests, extra asserts after it) in the
+    sandbox. Adds "finished" (the run reached its end) and "results"
+    (index -> passed, cross_tests only)."""
+    spec = box["langs"][lang]
+    token = "NEURO-TESTS-" + secrets.token_hex(16)
+    folder = sandbox_workdir()
+    try:
+        work = Path(folder)
+        if lang == "python":
+            (work / "main.py").write_text(code, encoding="utf-8")
+            (work / "harness.py").write_text(PY_TEST_HARNESS, encoding="utf-8")
+            if checks is not None:
+                (work / "checks.json").write_text(json.dumps(checks, ensure_ascii=False), encoding="utf-8")
+            argv = list(spec["argv"]) + [str(work / "harness.py"), token]
+        else:
+            # An empty package.json stops node from reading one in a parent folder.
+            (work / "package.json").write_text("{}\n", encoding="utf-8")
+            tail = (JS_CROSS_TAIL if checks is not None else JS_TEST_TAIL).replace("@@TOKEN@@", token)
+            tail = tail.replace("@@CHECKS@@", json.dumps(checks or [], ensure_ascii=True))
+            (work / "main.js").write_text(code + "\n" + tail, encoding="utf-8")
+            argv = [arg.replace("{dir}", folder) for arg in spec["argv"]] + [str(work / "main.js")]
+        result = run_sandboxed(argv, folder, spec["limits"], timeout)
+    finally:
+        result_cleaned = _remove_tree(folder)
+    result["cleaned"] = result_cleaned
+    for spelled in {folder, folder.replace("\\", "/")}:
+        result["stderr"] = result["stderr"].replace(spelled, "<job>")
+    lines = [line.strip() for line in result["stdout"].splitlines() if line.strip()]
+    end = f"{token} END" if checks is not None else token
+    result["finished"] = bool(result["returncode"] == 0 and not result["timed_out"] and not result["flooded"]
+                              and lines and lines[-1] == end)
+    results: dict[int, bool] = {}
+    if checks is not None:
+        for line in lines:
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == token and parts[1] in ("P", "F") and parts[2].isdigit():
+                results.setdefault(int(parts[2]), parts[1] == "P")
+    result["results"] = results
+    return result
+
+
+def _stderr_head(text: str, limit: int = 300) -> str:
+    """The start of stderr without the harness's own traceback frames."""
+    kept, skipping = [], False
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if 'harness.py"' in line:
+            skipping = True
+            continue
+        if skipping and line.startswith("    "):
+            continue
+        skipping = False
+        kept.append(line)
+    return "\n".join(kept).strip()[:limit]
+
+
+def _error_line(text: str) -> str:
+    """The most telling stderr line: the last 'SomethingError: ...' line, else the last line."""
+    fatal = [line.strip() for line in text.splitlines() if "FATAL ERROR" in line or "out of memory" in line]
+    if fatal:
+        return fatal[0][:300]
+    errors = [line.strip() for line in text.splitlines() if re.match(r"\s*\w*(Error|Exception)\b", line)]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    line = errors[-1] if errors else (lines[-1] if lines else "")
+    return line[:300]
+
+
+# -- static checks on the tests: enough real asserts, nothing swallowed -------
+
+_PY_BROAD = {"Exception", "BaseException"}
+
+
+def _handler_names(node: ast.AST | None) -> set[str]:
+    if node is None:
+        return set()
+    if isinstance(node, ast.Tuple):
+        return set().union(*(_handler_names(item) for item in node.elts)) if node.elts else set()
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    return set()
+
+
+def _trivial_py_assert(node: ast.Assert) -> bool:
+    """assert True / assert 1 / assert "x" / assert 2 == 2 / assert x == x:
+    no name in the test at all, or both sides of one comparison the same."""
+    test = node.test
+    if not any(isinstance(item, ast.Name) for item in ast.walk(test)):
+        return True
+    if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], (ast.Eq, ast.Is, ast.GtE, ast.LtE)):
+        return ast.dump(test.left) == ast.dump(test.comparators[0])
+    return False
+
+
+def _py_test_problems(code: str) -> tuple[int, str]:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return 0, clip(f"SyntaxError: {exc.msg} (line {exc.lineno})", 300)
+    except (ValueError, RecursionError, MemoryError, OverflowError) as exc:
+        return 0, clip(f"{type(exc).__name__}: {exc}", 300)
+    try_types = tuple(t for t in (ast.Try, getattr(ast, "TryStar", None)) if t is not None)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "AssertionError" and not isinstance(node.ctx, ast.Load):
+            return 0, "the code rebinds AssertionError"
+        if isinstance(node, ast.Call) and _handler_names(node.func) & {"suppress"}:
+            if any(_handler_names(arg) & (_PY_BROAD | {"AssertionError"}) for arg in node.args):
+                return 0, "contextlib.suppress hides assert failures"
+        if isinstance(node, try_types):
+            guarded = any(isinstance(item, ast.Assert) for stmt in node.body for item in ast.walk(stmt))
+            for handler in node.handlers:
+                names = _handler_names(handler.type)
+                if "AssertionError" in names:
+                    return 0, "the code catches AssertionError"
+                reraises = any(isinstance(item, ast.Raise) for stmt in handler.body for item in ast.walk(stmt))
+                if guarded and (handler.type is None or names & _PY_BROAD) and not reraises:
+                    return 0, "a try/except around the asserts swallows failures"
+    # Asserts that run: top level (also inside top-level if/for/with blocks)
+    # or inside a top-level function that the top level calls.
+    top = [stmt for stmt in tree.body if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    called = {item.func.id for stmt in top for item in ast.walk(stmt)
+              if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)}
+    running: list[ast.Assert] = []
+    for stmt in tree.body:
+        if isinstance(stmt, ast.ClassDef):
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name not in called:
+            continue
+        running.extend(item for item in ast.walk(stmt) if isinstance(item, ast.Assert))
+    real = [item for item in running if not _trivial_py_assert(item)]
+    if len(real) < MIN_ASSERTS:
+        extra = f" ({len(running) - len(real)} trivial ones like `assert True` do not count)" if len(running) > len(real) else ""
+        return len(real), f"only {len(real)} assert statement(s) that run; at least {MIN_ASSERTS} are needed{extra}"
+    return len(real), ""
+
+
+def js_mask(code: str) -> str:
+    """The code with comments and string/template/regex contents blanked
+    (same length, newlines kept), so structure can be scanned with regexes."""
+    out = list(code)
+    index, size = 0, len(code)
+    last = ""  # last significant character, to tell a regex from a division
+
+    def blank(start: int, stop: int) -> None:
+        for at in range(start, min(stop, size)):
+            if out[at] != "\n":
+                out[at] = " "
+
+    while index < size:
+        char = code[index]
+        if code.startswith("//", index):
+            end = code.find("\n", index)
+            end = size if end < 0 else end
+            blank(index, end)
+            index = end
+            continue
+        if code.startswith("/*", index):
+            end = code.find("*/", index + 2)
+            end = size if end < 0 else end + 2
+            blank(index, end)
+            index = end
+            continue
+        if char in "'\"`" or (char == "/" and (not last or last in "(,=:[!&|?{};+-*%<>~^" )):
+            close = char
+            at = index + 1
+            in_class = False
+            while at < size:
+                current = code[at]
+                if current == "\\":
+                    at += 2
+                    continue
+                if current == "\n" and close != "`":
+                    break
+                if close == "/":
+                    if current == "[":
+                        in_class = True
+                    elif current == "]":
+                        in_class = False
+                    elif current == "/" and not in_class:
+                        break
+                elif current == close:
+                    break
+                at += 1
+            blank(index + 1, at)
+            index = at + 1
+            last = "a"
+            continue
+        if not char.isspace():
+            last = char
+        index += 1
+    return "".join(out)
+
+
+_JS_ASSERT_METHODS = frozenset(
+    "strictEqual deepStrictEqual equal deepEqual notStrictEqual notDeepStrictEqual notEqual notDeepEqual "
+    "ok throws doesNotThrow rejects doesNotReject match doesNotMatch".split()
+)
+_JS_ASSERT_CALL = re.compile(r"(?<![\w$.])assert\s*(?:\.\s*(?:strict\s*\.\s*)?([A-Za-z]+)\s*)?\(")
+_JS_EQUALS = frozenset("strictEqual deepStrictEqual equal deepEqual".split())
+_JS_TRUTHY = re.compile(r"""^(?:true|!0|!false|!!1|[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*|"[^"]+"|'[^']+'|`[^`]+`|\[\s*\]|\{\s*\})$""")
+
+
+def _close_paren(masked: str, start: int) -> int:
+    """Index of the bracket that closes the one at `start`, or -1."""
+    depth = 0
+    for at in range(start, len(masked)):
+        char = masked[at]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                return at
+    return -1
+
+
+def _split_args(masked: str, code: str, start: int, stop: int) -> list[str]:
+    parts, depth, last = [], 0, start
+    for at in range(start, stop):
+        char = masked[at]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(code[last:at].strip())
+            last = at + 1
+    tail = code[last:stop].strip()
+    if tail or parts:
+        parts.append(tail)
+    return [part for part in parts if part]
+
+
+def js_assert_calls(code: str, masked: str | None = None) -> list[dict]:
+    """node:assert calls: [{"start", "end" (after the close paren), "method", "args", "real"}]."""
+    masked = js_mask(code) if masked is None else masked
+    calls = []
+    for match in _JS_ASSERT_CALL.finditer(masked):
+        method = match.group(1) or ""
+        if method and method not in _JS_ASSERT_METHODS:
+            continue
+        open_at = match.end() - 1
+        close_at = _close_paren(masked, open_at)
+        if close_at < 0:
+            continue
+        args = _split_args(masked, code, open_at + 1, close_at)
+        real = bool(args)
+        if method in ("", "ok") and args and _JS_TRUTHY.match(args[0]):
+            real = False
+        if method in _JS_EQUALS and len(args) >= 2 and args[0] == args[1]:
+            real = False
+        calls.append({"start": match.start(), "end": close_at + 1, "method": method or "assert", "args": args, "real": real})
+    return calls
+
+
+_JS_ASSERT_IMPORT = re.compile(r"""\brequire\s*\(\s*['"](?:node:)?assert(?:/strict)?['"]\s*\)|\bfrom\s+['"](?:node:)?assert(?:/strict)?['"]|\bgetBuiltinModule\s*\(\s*['"](?:node:)?assert(?:/strict)?['"]""")
+
+
+def _js_test_problems(code: str) -> tuple[int, str]:
+    masked = js_mask(code)
+    if not _JS_ASSERT_IMPORT.search(code):
+        return 0, "no node:assert import (use const assert = require('node:assert'))"
+    if re.search(r"\bconsole\s*\.\s*assert\b", masked):
+        return 0, "console.assert never fails a run; use node:assert"
+    if re.search(r"\b(?:uncaughtException|unhandledRejection)\b", code):
+        return 0, "a global error handler could hide failing asserts"
+    calls = js_assert_calls(code, masked)
+    for match in re.finditer(r"\btry\s*\{", masked):
+        body_end = _close_paren(masked, match.end() - 1)
+        if body_end < 0:
+            continue
+        caught = re.match(r"\s*catch\s*(?:\([^)]*\))?\s*\{", masked[body_end + 1:])
+        if not caught:
+            continue
+        catch_open = body_end + 1 + caught.end() - 1
+        catch_end = _close_paren(masked, catch_open)
+        if catch_end < 0:
+            continue
+        guarded = any(match.end() <= call["start"] < body_end for call in calls)
+        if guarded and not re.search(r"\bthrow\b", masked[catch_open:catch_end]):
+            return 0, "a try/catch around the asserts swallows failures"
+    real = sum(1 for call in calls if call["real"])
+    if real < MIN_ASSERTS:
+        trivial = len(calls) - real
+        extra = f" ({trivial} trivial ones like assert(true) do not count)" if trivial else ""
+        return real, f"only {real} node:assert call(s); at least {MIN_ASSERTS} are needed{extra}"
+    return real, ""
+
+
+def tests_problems(code: str, lang: str) -> tuple[int, str]:
+    """(real asserts counted, "" or why the tests do not qualify)."""
+    return _py_test_problems(code) if lang == "python" else _js_test_problems(code)
+
+
+def extract_asserts(code: str, lang: str) -> list[str]:
+    """The plain top-level asserts of one answer, one statement each, for
+    cross_tests. Python: module-level `assert` statements (also inside
+    `if __name__ == "__main__":`). JavaScript: node:assert calls that start
+    a line at the top level of the file."""
+    if lang == "python":
+        try:
+            tree = ast.parse(code)
+        except (SyntaxError, ValueError, RecursionError, MemoryError, OverflowError):
+            return []
+        found: list[ast.Assert] = []
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assert):
+                found.append(stmt)
+            elif (isinstance(stmt, ast.If) and isinstance(stmt.test, ast.Compare)
+                  and isinstance(stmt.test.left, ast.Name) and stmt.test.left.id == "__name__"):
+                found.extend(item for item in stmt.body if isinstance(item, ast.Assert))
+        out = []
+        for item in found:
+            if _trivial_py_assert(item):
+                continue
+            try:
+                out.append(ast.unparse(item))
+            except (ValueError, RecursionError):
+                continue
+        return out
+    masked = js_mask(code)
+    depth_at = []
+    depth = 0
+    for char in masked:
+        depth_at.append(depth)
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+    out = []
+    for call in js_assert_calls(code, masked):
+        line_start = masked.rfind("\n", 0, call["start"]) + 1
+        if not call["real"] or depth_at[call["start"]] != 0 or masked[line_start:call["start"]].strip():
+            continue
+        # A whole statement only: assert.x(...).catch(...) is not a plain assert.
+        if not re.match(r"[ \t]*(?:;|\r?\n|$)", masked[call["end"]:]):
+            continue
+        out.append(code[call["start"]:call["end"]] + ";")
+    return out
+
+
+def job_verify_tests(payload: dict) -> tuple[bool, dict]:
+    """Run the answer's own asserts in the sandbox. Passed: exactly one code
+    block, at least MIN_ASSERTS real asserts that run, nothing that hides a
+    failure, exit code 0 within the time limit, and the run reached its end."""
+    lang = payload["lang"]
+    blocks = [block for block in payload.get("blocks") or [] if block.strip()]
+    if not blocks:
+        return True, {"passed": False, "error": f"no {lang} code block found"}
+    if len(blocks) > 1:
+        return True, {"passed": False, "error": f"expected one {lang} code block, found {len(blocks)}"}
+    code = blocks[0]
+    count, problem = tests_problems(code, lang)
+    if problem:
+        return True, {"passed": False, "error": problem, "asserts": count}
+    box = sandbox_status()
+    if lang not in box["langs"]:
+        return False, {"error": "unavailable: " + box["note"]}
+    try:
+        ran = run_test_program(lang, code, box)
+    except SandboxError as exc:
+        return False, {"error": clip(f"unavailable: {exc}", 300)}
+    result = {"passed": ran["finished"], "asserts": count, "seconds": ran["seconds"], "returncode": int(ran["returncode"] if ran["returncode"] is not None else -1)}
+    if not ran["finished"]:
+        if ran["timed_out"]:
+            result["error"] = f"timed out after {TEST_TIMEOUT} s"
+        elif ran["flooded"]:
+            result["error"] = f"printed more than {TEST_OUTPUT_STOP >> 20} MB"
+        elif ran["returncode"] == 0:
+            result["error"] = "the program stopped before the end of its tests"
+        else:
+            result["error"] = _error_line(ran["stderr"]) or f"exit code {ran['returncode']}"
+        result["stderr"] = _stderr_head(ran["stderr"])
+    return True, result
+
+
+def job_cross_tests(payload: dict) -> tuple[bool, dict]:
+    """CodeT-lite: each sample's code runs with the other samples' plain
+    asserts appended, one sandbox run per sample. Agreement = the share of
+    the others' asserts it passes (None when the others have none)."""
+    lang = payload["lang"]
+    box = sandbox_status()
+    if lang not in box["langs"]:
+        return False, {"error": "unavailable: " + box["note"]}
+    samples = payload["samples"]
+    extracted = [extract_asserts(sample["code"], lang) for sample in samples]
+    scores: dict[str, dict] = {}
+    timeouts = 0
+    for index, sample in enumerate(samples):
+        checks = [check for other, found in enumerate(extracted) if other != index for check in found][:MAX_CROSS_CHECKS]
+        if not checks:
+            scores[sample["id"]] = {"agreement": None, "passed": 0, "total": 0}
+            continue
+        try:
+            ran = run_test_program(lang, sample["code"], box, checks=checks)
+        except SandboxError as exc:
+            return False, {"error": clip(f"unavailable: {exc}", 300)}
+        timeouts += bool(ran["timed_out"] or ran["flooded"])
+        good = sum(1 for at in range(len(checks)) if ran["results"].get(at))
+        scores[sample["id"]] = {"agreement": round(good / len(checks), 4), "passed": good, "total": len(checks)}
+    detail = f"{len(samples)} samples, {sum(len(found) for found in extracted)} asserts" + (f", {timeouts} run(s) timed out" if timeouts else "")
+    return True, {"scores": scores, "detail": detail}
+
+
 JOB_HANDLERS = {
     "generate": job_generate,
     "verify_luau": job_verify_luau,
@@ -4689,6 +5732,8 @@ JOB_HANDLERS = {
     "verify_sql": job_verify_sql,
     "verify_math": job_verify_math,
     "dedup_hash": job_dedup_hash,
+    "verify_tests": job_verify_tests,
+    "cross_tests": job_cross_tests,
 }
 
 
@@ -4906,6 +5951,7 @@ def job_loop() -> None:
         print("Jobs are off: no main PC address. Set NEURO_MESH_URL to the main PC's LAN address.", flush=True)
         return
     node = socket.gethostname()
+    print("Tests: " + sandbox_status()["note"], flush=True)
     time.sleep(20)
     while True:
         wait = 15.0
@@ -4914,7 +5960,9 @@ def job_loop() -> None:
             kinds = worker_kinds()
             _job_state["paused"] = busy
             if kinds and not busy:
-                code, job = _mesh_post(base, "/jobs/next", {"node": node, "kinds": kinds, "gen_max": GENERATE_MAX_TOKENS}, 10)
+                body = {"node": node, "kinds": kinds, "gen_max": GENERATE_MAX_TOKENS,
+                        "test_langs": sorted(sandbox_status()["langs"])}
+                code, job = _mesh_post(base, "/jobs/next", body, 10)
                 _job_state["told"] = ""
                 if code == 200 and isinstance(job, dict) and job.get("kind") in kinds and job.get("id") and job.get("lease"):
                     _job_state["current"] = str(job["kind"])
@@ -4995,7 +6043,7 @@ def read_job_file(kind_arg: str, path: str) -> tuple[list[tuple[str, dict]], lis
 def jobs_main(args: list[str]) -> None:
     usage = (
         "use: mesh.py jobs add <kind|generate-verify> <file.jsonl> | mesh.py jobs status"
-        " | mesh.py jobs export [--per-prompt N] <name.jsonl> | mesh.py jobs export --pairs <path.jsonl>"
+        " | mesh.py jobs export [--per-prompt N] [--require-agreement] <name.jsonl> | mesh.py jobs export --pairs <path.jsonl>"
     )
     if not args:
         raise SystemExit(usage)
@@ -5044,17 +6092,26 @@ def jobs_main(args: list[str]) -> None:
             raise SystemExit(str(exc))
         print(f"Wrote {count} chosen/rejected pairs to {out}", flush=True)
         return
-    if command == "export" and len(args) in (2, 4):
+    if command == "export" and len(args) >= 2:
         per_prompt = 1
-        if len(args) == 4:
-            if args[1] != "--per-prompt" or not args[2].isdigit():
+        require_agreement = False
+        rest = args[1:-1]
+        while rest:
+            flag = rest.pop(0)
+            if flag == "--per-prompt" and rest and rest[0].isdigit():
+                per_prompt = int(rest.pop(0))
+            elif flag == "--require-agreement":
+                require_agreement = True
+            else:
                 raise SystemExit(usage)
-            per_prompt = int(args[2])
+        if args[-1].startswith("--"):
+            raise SystemExit(usage)
         try:
-            out, count = queue.export(args[-1], per_prompt)
+            out, count = queue.export(args[-1], per_prompt, require_agreement)
         except JobError as exc:
             raise SystemExit(str(exc))
-        print(f"Wrote {count} verified rows to {out}", flush=True)
+        extra = f" (cross-check agreement >= {AGREEMENT_MIN})" if require_agreement else ""
+        print(f"Wrote {count} verified rows{extra} to {out}", flush=True)
         return
     raise SystemExit(usage)
 
@@ -5372,7 +6429,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             queue = job_queue()
             if path == "/jobs/next":
-                job = queue.lease(str(body.get("node") or ""), body.get("kinds"), gen_max=body.get("gen_max"))
+                job = queue.lease(str(body.get("node") or ""), body.get("kinds"), gen_max=body.get("gen_max"),
+                                  test_langs=body.get("test_langs"))
                 if job is None:
                     self.send_empty(204)
                     return

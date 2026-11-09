@@ -427,7 +427,7 @@
         </article>
         <article class="card">
           <h3>Checks</h3>
-          <p class="note" style="margin-bottom:8px">Share of finished checks that passed, per verifier. A reply cut off by the token limit is "truncated": retried once, never exported.</p>
+          <p class="note" style="margin-bottom:8px">Share of finished checks that passed, per verifier. "tests" runs each answer's own asserts in a sandbox on computers that allow it. A reply cut off by the token limit is "truncated": retried once, never exported.</p>
           <div class="table t-checks" id="jobs-verifiers"></div>
         </article>
         <article class="card">
@@ -1407,8 +1407,10 @@ function factoryRow(box, name, item, done, index) {
   const model = item && item.status ? modelLine(item) : null;
   const caps = (item && item.status && item.status.caps) || {};
   const kinds = (caps.job_kinds || []).map(String);
-  const meta = [act ? act.why : "", model ? model.text : "", kinds.length ? kinds.length + " job kinds" : ""].filter(Boolean).join(" · ");
-  if (meta) cell(row, meta, "span", "sub");
+  const tests = caps.tests && Array.isArray(caps.tests.langs) && caps.tests.langs.length ? "runs tests: " + caps.tests.langs.map(String).join(", ") + " (sandboxed, network not blocked)" : "";
+  const meta = [act ? act.why : "", model ? model.text : "", kinds.length ? kinds.length + " job kinds" : "", tests].filter(Boolean).join(" · ");
+  const sub = meta ? cell(row, meta, "span", "sub") : null;
+  if (sub && caps.tests && caps.tests.note) sub.title = String(caps.tests.note);
   box.append(row);
 }
 function headRow(box, labels, numFrom) {
@@ -1421,6 +1423,18 @@ function headRow(box, labels, numFrom) {
     row.append(node);
   });
   box.append(row);
+}
+function testsAgreement(kind, row) {
+  // verify_tests runs the answer's own asserts; cross_tests then runs each
+  // passing sample against the other samples' asserts (CodeT-lite).
+  if (kind !== "verify_tests") return "";
+  const agree = (row && row.agreement) || {};
+  const scored = Number(agree.scored || 0);
+  const groups = Number(agree.groups || 0);
+  if (!scored) return groups ? "Cross-check: " + num(groups) + " prompt groups queued, no score yet." : "Ran each answer's own tests in a sandbox. Cross-check starts when 2+ samples of a prompt pass.";
+  const avg = Number(agree.avg);
+  const min = Number(agree.min || 0.5);
+  return "Cross-check agreement: average " + (Number.isFinite(avg) ? Math.round(avg * 100) + "%" : "–") + " over " + num(scored) + " samples in " + num(groups) + " prompt groups · " + num(agree.agree || 0) + " at or above " + Math.round(min * 100) + "%";
 }
 function drawJobs(list) {
   const jobs = mesh.jobs || {};
@@ -1483,6 +1497,8 @@ function drawJobs(list) {
     const cutOff = Number(row.truncated || 0);
     const retried = Number(row.retried || 0);
     cell(line, Number(row.passed || 0) + " of " + Number(row.checked || 0) + (cutOff ? " · " + cutOff + " truncated" : "") + (retried ? " (" + retried + " retried)" : ""), "span", "num");
+    const agree = testsAgreement(kind, row);
+    if (agree) cell(line, agree, "span", "sub");
     checksBox.append(line);
   }
   if (checksBox.children.length < 2) {

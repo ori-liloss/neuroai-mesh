@@ -50,7 +50,9 @@ python mesh.py jobs status
 python mesh.py jobs export coding-v1-verified.jsonl            # only answers that passed a check
 ```
 
-A job is data for a built-in handler (generate, verify_js/ts/python/sql/html_css/luau/math, dedup_hash), never a shell command.
+A job is data for a built-in handler (generate, verify_js/ts/python/sql/html_css/luau/math, verify_tests, cross_tests, dedup_hash), never a shell command.
+
+`seeds/coding-v2-tested.jsonl` (400 tasks) goes further: each answer carries its own assert tests and `verify_tests` really runs them, then `cross_tests` checks each sample against the other samples' tests (`jobs export --require-agreement`). That runs model-written code, so a worker only does it inside a sandbox: a Job Object on Windows (1 GB, no child processes, 10 s), rlimits on Linux/macOS only with `NEURO_RUN_TESTS=1`. Network access is not blocked for that code. Details in the guide, section 6.
 
 ## Security, in short
 
@@ -66,5 +68,6 @@ Both ports answer only loopback and private LAN addresses; Origin and Host are c
 | `side_train.py` | Small LoRA experiments on a side GPU |
 | `platforms/` | One-command workers for Mac, Linux, Steam Deck and Windows laptops |
 | `seeds/coding-v1.jsonl` | A ready set of coding prompts with verifiers |
+| `seeds/coding-v2-tested.jsonl` | Coding tasks whose answers include assert tests that are run (`verify_tests`) |
 
 MIT license.
