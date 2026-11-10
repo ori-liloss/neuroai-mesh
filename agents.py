@@ -6,6 +6,7 @@ Only a few of them may generate at once, because the GPU has four slots.
 
 from __future__ import annotations
 
+import contextvars
 import ctypes
 import difflib
 import http.client
@@ -192,17 +193,59 @@ class _Db(sqlite3.Connection):
             self.close()
 
 
-_schema_ready = False
+_schema_ready: set[str] = set()
+# Drills point one thread at a temporary queue and log folder. Nothing else ever sets these, so a
+# drill running inside mesh.py never touches the live agents.db or the live logs.
+_OVERRIDE = threading.local()
+
+
+def db_path() -> Path:
+    return getattr(_OVERRIDE, "db", None) or DB_PATH
+
+
+def logs_home() -> Path:
+    return getattr(_OVERRIDE, "logs", None) or LOG_DIR
+
+
+# Team mode columns. ALTER TABLE ADD COLUMN with a constant default keeps every old row valid, and
+# workers still running older code keep working: they never name these columns.
+TEAM_COLUMNS = (
+    ("parent_id", "INTEGER DEFAULT NULL"),
+    ("role", "TEXT DEFAULT NULL"),
+    ("depth", "INTEGER NOT NULL DEFAULT 0"),
+    ("prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("cached_tokens", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def migrate_jobs(db: sqlite3.Connection) -> list[str]:
+    """Add the team columns that are missing. Safe to run again and from several processes."""
+    added: list[str] = []
+    db.execute("BEGIN IMMEDIATE")
+    have = {str(row[1]) for row in db.execute("PRAGMA table_info(jobs)")}
+    for name, declaration in TEAM_COLUMNS:
+        if name in have:
+            continue
+        try:
+            db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
+            added.append(name)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    db.execute("CREATE INDEX IF NOT EXISTS jobs_parent ON jobs(parent_id)")
+    db.commit()
+    return added
 
 
 def connect() -> sqlite3.Connection:
-    global _schema_ready
     # timeout is SQLite's busy_timeout: ten processes wait for the write lock instead of failing.
-    db = sqlite3.connect(DB_PATH, timeout=30, factory=_Db)
+    path = db_path()
+    db = sqlite3.connect(path, timeout=30, factory=_Db)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=30000")
     db.execute("PRAGMA synchronous=NORMAL")
-    if not _schema_ready:
+    if path_key(Path(path)) not in _schema_ready:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute(
             """
@@ -231,7 +274,8 @@ def connect() -> sqlite3.Connection:
             """
         )
         db.commit()
-        _schema_ready = True
+        migrate_jobs(db)
+        _schema_ready.add(path_key(Path(path)))
     return db
 
 
@@ -297,14 +341,15 @@ def worker_cap(requested: int) -> int:
     return max(0, min(int(requested), int(room), 24))
 
 
-def enqueue(title: str, prompt: str) -> int:
+def enqueue(title: str, prompt: str, *, role: str | None = None) -> int:
+    """A top-level job. role='lead' marks a team task (agents.py team). Sub-tasks come from SPAWN."""
     now = time.time()
-    # The task kind rides on the first line of the prompt. No schema change; run_agent strips it.
+    # The task kind rides on the first line of the prompt. run_agent strips it.
     stamped = stamp_kind(prompt)
     with connect() as db:
         cursor = db.execute(
-            "INSERT INTO jobs (title, prompt, status, created, updated) VALUES (?, ?, 'queued', ?, ?)",
-            (title.strip()[:80] or "task", stamped, now, now),
+            "INSERT INTO jobs (title, prompt, status, created, updated, role) VALUES (?, ?, 'queued', ?, ?, ?)",
+            (title.strip()[:80] or "task", stamped, now, now, role),
         )
         return int(cursor.lastrowid)
 
@@ -364,13 +409,28 @@ def claim(pid: int) -> dict | None:
             "ON CONFLICT(pid) DO UPDATE SET heartbeat=excluded.heartbeat",
             (pid, now, now),
         )
-        running = db.execute("SELECT COUNT(*) AS n FROM jobs WHERE status='running'").fetchone()["n"]
+        # A lead sitting in WAIT generates nothing, so it does not hold one of the model's slots.
+        running = db.execute(
+            "SELECT COUNT(*) AS n FROM jobs j WHERE j.status='running' AND NOT EXISTS "
+            "(SELECT 1 FROM workers w WHERE w.pid=j.worker_pid AND w.state='team_wait')"
+        ).fetchone()["n"]
         if running >= SLOTS:
             db.execute("UPDATE workers SET state='waiting', job_id=NULL, heartbeat=? WHERE pid=?", (now, pid))
             db.commit()
             return None
+        # No deadlock: sub-tasks go before new top-level jobs, and at most max(1, workers - 1)
+        # top-level jobs that may SPAWN run at once, so one worker stays free for sub-tasks.
+        workers = db.execute("SELECT COUNT(*) AS n FROM workers").fetchone()["n"]
+        leads = db.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status='running' AND parent_id IS NULL "
+            "AND prompt NOT LIKE '[kind:quick]%'"
+        ).fetchone()["n"]
+        lead_room = 1 if leads < max(1, int(workers) - 1) else 0
         job = db.execute(
-            "SELECT id, title, prompt FROM jobs WHERE status='queued' ORDER BY id LIMIT 1"
+            "SELECT id, title, prompt, parent_id, role, depth FROM jobs WHERE status='queued' "
+            "AND (parent_id IS NOT NULL OR prompt LIKE '[kind:quick]%' OR ?) "
+            "ORDER BY CASE WHEN parent_id IS NULL THEN 1 ELSE 0 END, id LIMIT 1",
+            (lead_room,),
         ).fetchone()
         if job is None:
             db.execute("UPDATE workers SET state='idle', job_id=NULL, heartbeat=? WHERE pid=?", (now, pid))
@@ -385,13 +445,24 @@ def claim(pid: int) -> dict | None:
             (job["id"], now, pid),
         )
         db.commit()
-        return {"id": int(job["id"]), "title": str(job["title"]), "prompt": str(job["prompt"])}
+        return {
+            "id": int(job["id"]),
+            "title": str(job["title"]),
+            "prompt": str(job["prompt"]),
+            "parent_id": int(job["parent_id"]) if job["parent_id"] is not None else None,
+            "role": str(job["role"] or ""),
+            "depth": int(job["depth"] or 0),
+        }
+
+
+CANCELLED = "cancelled: the lead finished before this sub-task started"
 
 
 def finish(job_id: int, pid: int, result: str = "", error: str = "") -> None:
     now = time.time()
     status = "error" if error else "done"
     title = ""
+    team_row = None
     with connect() as db:
         # Skip the write if another worker took this job over after a missed heartbeat.
         db.execute(
@@ -403,12 +474,44 @@ def finish(job_id: int, pid: int, result: str = "", error: str = "") -> None:
             "UPDATE workers SET state='idle', job_id=NULL, heartbeat=? WHERE pid=?",
             (now, pid),
         )
-        row = db.execute("SELECT title FROM jobs WHERE id=?", (job_id,)).fetchone()
+        row = db.execute("SELECT title, parent_id FROM jobs WHERE id=?", (job_id,)).fetchone()
         title = str(row["title"]) if row else ""
+        root = job_id
+        if row is not None and row["parent_id"] is None:
+            # Nobody will WAIT for sub-tasks that never started, so they do not run.
+            db.execute(
+                "UPDATE jobs SET status='error', error=?, updated=? WHERE parent_id=? AND status='queued'",
+                (CANCELLED, now, job_id),
+            )
+        elif row is not None:
+            root = int(row["parent_id"])
+        # The write above holds the lock, so only the last job of a tree to finish sees it closed.
+        tree = db.execute(
+            "SELECT COUNT(*) AS jobs, SUM(status IN ('queued','running')) AS open, "
+            "SUM(prompt_tokens) AS p, SUM(completion_tokens) AS c, SUM(cached_tokens) AS k, "
+            "MIN(created) AS first, MAX(updated) AS last FROM jobs WHERE id=? OR parent_id=?",
+            (root, root),
+        ).fetchone()
+        if tree is not None and int(tree["jobs"] or 0) > 1 and not int(tree["open"] or 0):
+            team_row = {
+                "t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                "kind": "team",
+                "tree": root,
+                "jobs": int(tree["jobs"]),
+                "prompt_tokens": int(tree["p"] or 0),
+                "completion_tokens": int(tree["c"] or 0),
+                "cached_tokens": int(tree["k"] or 0),
+                "seconds": round(float(tree["last"] or now) - float(tree["first"] or now), 1),
+            }
     try:
         remember(job_id, status, title, error or result)
     except OSError:
         pass
+    if team_row is not None:
+        try:
+            append_capped(logs_home() / "usage.jsonl", json.dumps(team_row), limit=2_000_000, keep=5000)
+        except OSError:
+            pass
 
 
 def requeue(job_id: int, pid: int) -> None:
@@ -713,12 +816,31 @@ def workspace_note() -> str:
     return "Repo files: " + ", ".join(names[:24])
 
 
+# A code sub-agent writes only in its own folder, workspace/team-<lead id>/<own id>/, so parallel
+# sub-agents never overwrite each other or the repo. Set by AgentRun for that job only; it adds a
+# block on top of inside() and never loosens anything.
+_JAIL: contextvars.ContextVar[tuple[str, Path] | None] = contextvars.ContextVar("neuro_write_jail", default=None)
+
+
+def jail_block(raw: str, path: Path, *, folder_ok: bool = False) -> str:
+    jail = _JAIL.get()
+    if jail is None:
+        return ""
+    shown, root = jail
+    if root in path.parents or (folder_ok and path == root):
+        return ""
+    return f"blocked {raw}: a sub-agent writes only under {shown}/"
+
+
 def safe_write(relative: str, content: str) -> str:
     shown = (relative or "").strip().replace("\\", "/").lstrip("/")
     found = inside(relative)
     if found is None:
         return "blocked " + shown
     raw, path = found
+    jailed = jail_block(raw, path)
+    if jailed:
+        return jailed
     text = content.lstrip("\r\n").rstrip() + "\n"
     if len(text.encode("utf-8")) > 150000:
         return "too large"
@@ -829,6 +951,9 @@ def tool_edit(relative: str, old: str, new: str, state: TaskState | None) -> tup
     if found is None:
         return "blocked " + shown, []
     raw, path = found
+    jailed = jail_block(raw, path)
+    if jailed:
+        return jailed, []
     if path.is_dir():
         return "blocked " + raw + " is a folder", []
     try:
@@ -1040,6 +1165,10 @@ def apply_actions(answer: str, require_end: bool = False) -> list[str]:
             if found is None:
                 logs.append("blocked path")
                 return logs
+            jailed = jail_block(found[0], found[1], folder_ok=True)
+            if jailed:
+                logs.append(jailed)
+                return logs
             try:
                 found[1].mkdir(parents=True, exist_ok=True)
                 logs.append("mkdir " + raw)
@@ -1149,13 +1278,48 @@ def kind_tools(kind: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def tool_help(kind: str) -> str:
-    """The whole system prompt for one kind. Stable text only: it is the cached prefix of every turn."""
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.environ.get(name) or default)
+    except ValueError:
+        return default
+    return max(low, min(value, high))
+
+
+# Team mode: a lead (a top-level code, research or review job) splits a large task into sub-tasks
+# and runs them on other workers in parallel. Sub-agents cannot SPAWN (depth limit 1).
+TEAM_ROLES = {"research": "research", "code": "code", "review": "review", "test": "code"}
+TEAM_KINDS = frozenset({"research", "review", "code"})
+TEAM_HEADS = frozenset({"SPAWN", "WAIT", "CHILDREN"})
+TEAM_MAX = _env_int("NEURO_TEAM_MAX", 6, 1, 12)  # sub-agents per lead, ever
+TEAM_WAIT = _env_int("NEURO_TEAM_WAIT", 480, 5, 1800)  # seconds one WAIT may block
+TEAM_WAITS = _env_int("NEURO_TEAM_WAITS", 4, 1, 12)  # WAIT calls per lead run
+TEAM_WALL = _env_int("NEURO_TEAM_WALL", 3600, 60, 14400)  # seconds from the first SPAWN
+TEAM_REPORT = _env_int("NEURO_TEAM_REPORT", 1500, 200, 4000)  # characters of each report in WAIT
+TEAM_POLL = 2.0
+TEAM_BONUS_TURNS = 4  # a lead that spawned needs turns to WAIT, verify and integrate
+TEAM_RESULT_CHARS = min(12000, (TEAM_REPORT + 200) * TEAM_MAX)
+
+
+def team_roles_for(kind: str) -> list[str]:
+    """A lead may only start sub-agents with no more power than itself: a task that cannot change
+    files cannot get files changed through a code or test sub-agent either."""
+    write = (KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]).write
+    return [role for role, child in TEAM_ROLES.items() if write or not KIND_BUDGET[child].write]
+
+
+def tool_help(kind: str, mode: str = "solo") -> str:
+    """The whole system prompt for one kind. Stable text only: it is the cached prefix of every turn.
+    mode: solo (no queue job), lead (a top-level job that may SPAWN), child (a sub-agent)."""
     allowed = kind_tools(kind)
     budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
+    lead = mode == "lead" and kind in TEAM_KINDS
+    child = mode == "child"
     batch = " ".join(name for name in ("LIST", "GLOB", "GREP", "READ", "SESSIONS", "TODO") if name in allowed)
     alone = [name for name in ("EDIT", "WRITE", "MKDIR", "RUN") if name in allowed]
     lines = ["You are Neuro, a careful agent working in a local repo.", "- Understand the task first."]
+    if child:
+        lines[0] = "You are Neuro, a sub-agent in a local repo. Do only your sub-task; you cannot SPAWN."
     if "TODO" in allowed:
         lines.append("- For work with 3 or more steps, keep a short TODO and update it as you go.")
     lines.append("- Never guess what a file says. GLOB, GREP or READ it first.")
@@ -1171,11 +1335,31 @@ def tool_help(kind: str) -> str:
         + (f"; {', '.join(alone)} {'goes' if len(alone) == 1 else 'go'} alone." if alone else "."),
     ]
     lines += [syntax for name, syntax in TOOL_SYNTAX if name in allowed]
-    if budget.write:
+    if budget.write and child:
+        lines.append("WRITE, EDIT and MKDIR only under your folder named in the task. READ shows numbered lines; leave the numbers out of EDIT.")
+    elif budget.write:
         lines.append("WRITE under workspace/ is allowed. READ shows numbered lines; leave the numbers out of EDIT.")
+    if lead:
+        roles = "|".join(team_roles_for(kind))
+        lines += [
+            "Team: a small task you do yourself. A large task with independent parts: plan, keep a TODO,"
+            f" SPAWN up to {TEAM_MAX} sub-agents in parallel, each with one clear deliverable, then WAIT,"
+            " review and verify their results" + (" (RUN the tests), integrate them yourself," if budget.write else ",")
+            + " and answer.",
+            f"SPAWN {roles.split('|')[0]} short title\nthe sub-task: what to do and the deliverable\nENDSPAWN",
+            "WAIT\nWAIT 12 13\nCHILDREN",
+            f"SPAWN roles: {roles}. Several SPAWNs may go in one turn; each returns an id at once."
+            + (" Code and test sub-agents write only under workspace/team-<your id>/<their id>/." if budget.write else ""),
+            "WAIT returns each report (all sub-agents if no ids); still running means WAIT later or keep working.",
+        ]
     lines.append("Results come back inside <tool_response>.")
     lines.append(KIND_NOTES.get(kind, ""))
-    if budget.write:
+    if child:
+        lines.append(
+            "Final report, plain text, at most 8 lines: what was done, the files (paths), how it was verified"
+            " and the result, and anything not done. No tool syntax. Stop when done."
+        )
+    elif budget.write:
         lines.append(
             "Final answer, plain text, at most 8 lines: what changed (files), how it was checked and the"
             " result, and anything not done. No tool syntax. Stop when done."
@@ -1187,10 +1371,16 @@ def tool_help(kind: str) -> str:
 
 # Built once: the system message is the same for every job of a kind, so the server cache reuses it.
 KIND_TOOLS = {kind: tool_help(kind) for kind in KIND_BUDGET}
+LEAD_TOOLS = {kind: tool_help(kind, "lead") for kind in TEAM_KINDS}
+CHILD_TOOLS = {kind: tool_help(kind, "child") for kind in KIND_BUDGET}
 TOOL_HELP = KIND_TOOLS["code"]
 
 
-def agent_system(kind: str) -> str:
+def agent_system(kind: str, mode: str = "solo") -> str:
+    if mode == "child":
+        return CHILD_TOOLS.get(kind, CHILD_TOOLS["quick"])
+    if mode == "lead" and kind in LEAD_TOOLS:
+        return LEAD_TOOLS[kind]
     return KIND_TOOLS.get(kind, KIND_TOOLS["quick"])
 
 
@@ -1337,7 +1527,7 @@ def remember(job_id: int, status: str, title: str, text: str) -> None:
         "text": (text or "")[:800],
     }
     # Ten workers append here. The lock keeps lines whole and the cap keeps the file small.
-    append_capped(LOG_DIR / "session.jsonl", json.dumps(row, ensure_ascii=False), limit=400000, keep=400)
+    append_capped(logs_home() / "session.jsonl", json.dumps(row, ensure_ascii=False), limit=400000, keep=400)
 
 
 def recent_sessions(limit: int = 6) -> list[str]:
@@ -1552,7 +1742,11 @@ TOOL_NAMES = {
     "glob": "GLOB", "glob_files": "GLOB", "find_files": "GLOB", "file_search": "GLOB",
     "todo": "TODO", "todos": "TODO", "todo_write": "TODO", "todowrite": "TODO", "update_todo": "TODO",
     "update_todos": "TODO", "set_todo": "TODO", "update_plan": "TODO",
+    "spawn": "SPAWN", "spawn_agent": "SPAWN", "spawn_subagent": "SPAWN", "subagent": "SPAWN",
+    "wait": "WAIT", "wait_children": "WAIT", "wait_agents": "WAIT",
+    "children": "CHILDREN", "list_children": "CHILDREN", "list_agents": "CHILDREN",
 }
+SPAWN_BODY_KEYS = ("task", "prompt", "description", "body", "content", "text", "subtask", "sub_task")
 PATH_KEYS = ("path", "file", "file_path", "filepath", "filename", "dir", "directory", "dir_path", "folder", "target")
 QUERY_KEYS = ("query", "pattern", "text", "search", "needle", "regex", "q", "keyword")
 COMMAND_KEYS = ("command", "cmd", "script", "shell", "code")
@@ -1622,14 +1816,25 @@ def command_from(name: object, args: object) -> str:
     command = TOOL_NAMES.get(str(name or "").strip().strip("\"'").lower().replace("-", "_"), "")
     if not command:
         return ""
-    if command == "SESSIONS":
-        return "SESSIONS"
+    if command in {"SESSIONS", "CHILDREN"}:
+        return command
     if isinstance(args, str):
         args = {"value": args}
     if not isinstance(args, dict):
         args = {}
     args = {str(key).strip().lower(): value for key, value in args.items()}
     only = next(iter(args.values())) if len(args) == 1 else None
+    if command == "WAIT":
+        ids = _pick(args, ("ids", "id", "children", "agents", "value"))
+        found = re.findall(r"\d+", json.dumps(ids) if isinstance(ids, (list, dict)) else str(ids or ""))
+        return ("WAIT " + " ".join(found[:TEAM_MAX])) if found else "WAIT"
+    if command == "SPAWN":
+        role = _first_line(_pick(args, ("role", "type", "kind", "agent")))
+        title = _first_line(_pick(args, ("title", "name", "summary")))
+        body = _pick(args, SPAWN_BODY_KEYS)
+        if not role or not isinstance(body, str) or not body.strip():
+            return ""
+        return f"SPAWN {role.split()[0]} {title}".rstrip() + "\n" + body.strip("\n") + "\nENDSPAWN"
     if command == "EDIT":
         safe = tool_path(_first_line(_pick(args, PATH_KEYS)))
         old = next((args[key] for key in OLD_KEYS if key in args and args[key] is not None), None)
@@ -1807,13 +2012,57 @@ def native_tools(answer: str) -> list[tuple[str, str]]:
 SINGLE_HEADS = ("LIST ", "GREP ", "GLOB ", "READ ", "MKDIR ", "RUN ", "SESSIONS ")
 
 
+def team_line(stripped: str) -> bool:
+    """A line that starts a team call. It also ends the body of the SPAWN before it."""
+    return stripped.startswith(("SPAWN ", "WAIT ")) or stripped in {"WAIT", "CHILDREN"}
+
+
+def parse_spawn(command: str) -> tuple[str, str, str, bool] | None:
+    """SPAWN role title / sub-task lines / ENDSPAWN -> (role, title, body, closed)."""
+    lines = command.splitlines()
+    if not lines:
+        return None
+    match = re.match(r"SPAWN\s+(\S+)[ \t]*(.*)$", clean_tool_line(lines[0]))
+    if not match:
+        return None
+    role = match.group(1).strip("`'\"<>[](),:;").lower()
+    title = one_line(match.group(2).strip("`'\" -:"), 80)
+    body = lines[1:]
+    closed = bool(body) and clean_tool_line(body[-1]) == "ENDSPAWN"
+    if closed:
+        body = body[:-1]
+    return role, title, "\n".join(body).strip(), closed
+
+
 def text_tools(answer: str) -> list[tuple[str, str]]:
-    """Every call in the plain line syntax. WRITE, EDIT and TODO carry their body lines."""
+    """Every call in the plain line syntax. WRITE, EDIT, TODO and SPAWN carry their body lines."""
     lines = answer.splitlines()
     calls: list[tuple[str, str]] = []
     index = 0
     while index < len(lines):
         stripped = clean_tool_line(lines[index])
+        if stripped.startswith("SPAWN "):
+            block = [stripped]
+            index += 1
+            closed = False
+            while index < len(lines):
+                following = clean_tool_line(lines[index])
+                if following == "ENDSPAWN":
+                    closed = True
+                    index += 1
+                    break
+                if team_line(following):
+                    closed = True  # the next team call starts, so this one was whole
+                    break
+                block.append(lines[index])
+                index += 1
+            text = "\n".join(block + (["ENDSPAWN"] if closed else []))
+            calls.append((text, text))
+            continue
+        if team_line(stripped):
+            calls.append((stripped, stripped))
+            index += 1
+            continue
         if stripped.startswith(("WRITE ", "EDIT ")):
             is_write = stripped.startswith("WRITE ")
             block = [stripped]
@@ -1855,7 +2104,15 @@ def tool_head(command: str) -> str:
 
 
 def batch_calls(calls: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Up to MAX_BATCH read-only calls run together. WRITE, EDIT, MKDIR and RUN run alone."""
+    """Up to MAX_BATCH read-only calls run together. WRITE, EDIT, MKDIR and RUN run alone.
+    A lead's SPAWN calls run together too, so its sub-agents start in parallel."""
+    if calls and tool_head(calls[0][0]) == "SPAWN":
+        spawns = []
+        for call in calls:
+            if tool_head(call[0]) != "SPAWN" or len(spawns) >= TEAM_MAX:
+                break
+            spawns.append(call)
+        return spawns
     if not calls or tool_head(calls[0][0]) not in READ_ONLY:
         return calls[:1]
     picked = []
@@ -1872,8 +2129,8 @@ def pick_tool(answer: str, tool_calls: object = None) -> tuple[str, str]:
     return calls[0] if calls else ("", "")
 
 
-def tool_response(text: str) -> str:
-    body = clip((text or "").strip(), TOOL_CHARS).replace("</tool_response>", "<\\/tool_response>")
+def tool_response(text: str, limit: int = TOOL_CHARS) -> str:
+    body = clip((text or "").strip(), limit).replace("</tool_response>", "<\\/tool_response>")
     return "<tool_response>\n" + body + "\n</tool_response>"
 
 
@@ -2001,8 +2258,249 @@ def plain_answer(answer: str) -> str:
     return text.strip()
 
 
+TEAM_STATUS = {"done": "done", "error": "failed", "running": "still running", "queued": "still running (waiting for a worker)"}
+TEAM_LEAD_NOTE = (
+    "Team mode is on: if this task has independent parts, plan them, SPAWN sub-agents for them in"
+    " parallel, WAIT for their reports, verify and integrate. Do a small task yourself."
+)
+
+
+def team_jail(parent_id: int, job_id: int) -> str:
+    return f"workspace/team-{int(parent_id)}/{int(job_id)}"
+
+
+def team_children(parent_id: int, ids: list[int] | None = None) -> list[dict]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT id, title, status, role, result, error, created, prompt_tokens, completion_tokens "
+            "FROM jobs WHERE parent_id=? ORDER BY id",
+            (parent_id,),
+        ).fetchall()
+    found = [dict(row) for row in rows]
+    if ids is not None:
+        wanted = set(ids)
+        found = [row for row in found if row["id"] in wanted]
+    return found
+
+
+def live_workers(db: sqlite3.Connection) -> int:
+    cutoff = time.time() - REAP_AFTER
+    return int(db.execute("SELECT COUNT(*) AS n FROM workers WHERE heartbeat >= ?", (cutoff,)).fetchone()["n"])
+
+
+def child_prompt(kind: str, role: str, title: str, body: str, parent_id: int, parent_title: str, job_id: int) -> str:
+    """The compact task a sub-agent gets: role, sub-task, workspace rule, report contract."""
+    lines = [
+        f"Role: {role} sub-agent #{job_id} of lead task #{parent_id} ({one_line(parent_title, 60)}).",
+        f"Sub-task: {title}",
+        clip(body, 2600),
+    ]
+    if KIND_BUDGET[kind].write:
+        lines.append(
+            f"Workspace rule: write files only under {team_jail(parent_id, job_id)}/ (yours alone; other"
+            " sub-agents work in parallel). READ anything in the repo. The lead integrates your work."
+        )
+    else:
+        lines.append("This sub-task does not change files.")
+    lines.append("Final report, at most 8 lines: what was done, the files, how it was verified.")
+    head = f"[kind:{kind}]\n"
+    return head + "\n".join(lines)[: 4000 - len(head)]
+
+
+class Team:
+    """Team mode for one job. A lead (depth 0, a code/research/review job in the queue) may SPAWN,
+    WAIT and list CHILDREN; a sub-agent (depth 1) may not, and writes only in its own folder."""
+
+    def __init__(
+        self, job: dict | None, kind: str, *, sleep=None, clock=None, wait_seconds: float | None = None,
+        wall_seconds: float | None = None,
+    ) -> None:
+        job = job or {}
+        self.job_id = int(job["id"]) if job.get("id") is not None else None
+        self.parent_id = int(job["parent_id"]) if job.get("parent_id") is not None else None
+        self.role = str(job.get("role") or "")
+        self.depth = int(job.get("depth") or 0)
+        self.pid = int(job.get("pid") or os.getpid())
+        self.kind = kind
+        self.sleep = sleep or time.sleep
+        self.clock = clock or time.time
+        self.wait_seconds = float(TEAM_WAIT if wait_seconds is None else wait_seconds)
+        self.wall_seconds = float(TEAM_WALL if wall_seconds is None else wall_seconds)
+        self.waits = 0
+        self.spawned = 0
+
+    @property
+    def child(self) -> bool:
+        return self.depth >= 1 or self.parent_id is not None
+
+    @property
+    def lead(self) -> bool:
+        return self.job_id is not None and not self.child and self.kind in TEAM_KINDS
+
+    @property
+    def mode(self) -> str:
+        return "child" if self.child else "lead" if self.lead else "solo"
+
+    def jail(self) -> str | None:
+        if self.child and self.job_id is not None and self.parent_id is not None:
+            return team_jail(self.parent_id, self.job_id)
+        return None
+
+    def children(self, ids: list[int] | None = None) -> list[dict]:
+        return team_children(self.job_id, ids) if self.job_id is not None else []
+
+    def time_left(self, kids: list[dict] | None = None) -> float:
+        kids = self.children() if kids is None else kids
+        if not kids:
+            return self.wall_seconds
+        first = min(float(row["created"]) for row in kids)
+        return self.wall_seconds - (self.clock() - first)
+
+    def save_tokens(self, usage: dict) -> None:
+        if self.job_id is None:
+            return
+        try:
+            with connect() as db:
+                db.execute(
+                    "UPDATE jobs SET prompt_tokens=?, completion_tokens=?, cached_tokens=? WHERE id=?",
+                    (usage["prompt"], usage["completion"], usage["cached"], self.job_id),
+                )
+        except sqlite3.Error:
+            pass
+
+    def set_state(self, state: str) -> None:
+        try:
+            with connect() as db:
+                db.execute("UPDATE workers SET state=?, heartbeat=? WHERE pid=?", (state, time.time(), self.pid))
+        except sqlite3.Error:
+            pass
+
+    def note(self) -> str:
+        """For the lead's task message: team mode, and sub-agents left from an earlier attempt."""
+        parts = [TEAM_LEAD_NOTE] if self.role == "lead" else []
+        kids = self.children() if self.lead else []
+        if kids:
+            listed = "; ".join(f"#{row['id']} {row['role']} {row['status']}: {one_line(row['title'], 40)}" for row in kids)
+            parts.append(f"Sub-agents already started for this task: {listed}. WAIT or CHILDREN shows them.")
+        return "\n".join(parts)
+
+    def tool(self, command: str, head: str, cut: bool) -> str:
+        if self.job_id is None:
+            return "blocked: SPAWN, WAIT and CHILDREN work only for a task in the queue. Do the work yourself."
+        if self.child:
+            return f"blocked: a sub-agent cannot use {head} (depth limit 1). Do your sub-task yourself."
+        if self.kind not in TEAM_KINDS:
+            return "blocked: this task cannot start sub-agents. Answer it directly."
+        if head == "SPAWN":
+            return self.spawn(command, cut)
+        if head == "WAIT":
+            return self.wait(command[4:])
+        return self.children_text()
+
+    def spawn(self, command: str, cut: bool) -> str:
+        parsed = parse_spawn(command)
+        if parsed is None:
+            return "SPAWN needs: SPAWN role short title, the sub-task on the next lines, then ENDSPAWN"
+        role, title, body, closed = parsed
+        if cut and not closed:
+            return "not spawned: the call was cut off before ENDSPAWN. Send a shorter sub-task."
+        if role not in TEAM_ROLES:
+            return "refused: the role must be research, code, review or test."
+        kind = TEAM_ROLES[role]
+        if role not in team_roles_for(self.kind):
+            return f"refused: a {self.kind} task cannot change files, so it cannot SPAWN a {role} sub-agent. Use research or review."
+        if not body:
+            return "refused: put the sub-task text on the lines after SPAWN, then ENDSPAWN."
+        title = title or one_line(body, 60)
+        now = self.clock()
+        with connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            parent = db.execute("SELECT title, parent_id FROM jobs WHERE id=?", (self.job_id,)).fetchone()
+            if parent is None:
+                return "refused: this task is not in the queue."
+            if parent["parent_id"] is not None:  # the queue itself also holds the depth limit
+                return "blocked: a sub-agent cannot use SPAWN (depth limit 1). Do your sub-task yourself."
+            kids = db.execute(
+                "SELECT COUNT(*) AS n, MIN(created) AS first FROM jobs WHERE parent_id=?", (self.job_id,)
+            ).fetchone()
+            if int(kids["n"]) >= TEAM_MAX:
+                return f"refused: this task already has {TEAM_MAX} sub-agents (the limit). WAIT for them or do the rest yourself."
+            if kids["first"] is not None and now - float(kids["first"]) >= self.wall_seconds:
+                return f"refused: the team time limit ({int(self.wall_seconds)}s) is used up. Integrate what you have."
+            if live_workers(db) < 2:
+                return "refused: fewer than 2 agent workers are running, so a sub-agent could not run in parallel. Do the work yourself."
+            cursor = db.execute(
+                "INSERT INTO jobs (title, prompt, status, created, updated, parent_id, role, depth) "
+                "VALUES (?, '', 'queued', ?, ?, ?, ?, ?)",
+                (title[:80], now, now, self.job_id, role, self.depth + 1),
+            )
+            job_id = int(cursor.lastrowid)
+            prompt = child_prompt(kind, role, title, body, self.job_id, str(parent["title"]), job_id)
+            db.execute("UPDATE jobs SET prompt=? WHERE id=?", (prompt, job_id))
+        self.spawned += 1
+        where = f", writes under {team_jail(self.job_id, job_id)}/" if KIND_BUDGET[kind].write else ""
+        return f"spawned #{job_id} {role}: {title}{where}. WAIT {job_id} returns its report."
+
+    def wait(self, argument: str) -> str:
+        kids = self.children()
+        if not kids:
+            return "refused: there are no sub-agents yet. SPAWN first, or do the work yourself."
+        if self.waits >= TEAM_WAITS:
+            return f"refused: WAIT was used {self.waits} times (the limit). Integrate what you have; CHILDREN shows the status."
+        asked = [int(item) for item in re.findall(r"\d+", argument or "")]
+        known = {row["id"] for row in kids}
+        wanted = [item for item in dict.fromkeys(asked) if item in known] if asked else sorted(known)
+        if not wanted:
+            return "refused: those ids are not sub-agents of this task. CHILDREN lists them."
+        self.waits += 1
+        left = self.time_left(kids)
+        limit = max(0.0, min(self.wait_seconds, left))
+        deadline = self.clock() + limit
+        self.set_state("team_wait")
+        try:
+            while True:
+                rows = self.children(wanted)
+                if all(row["status"] in {"done", "error"} for row in rows) or self.clock() >= deadline:
+                    break
+                self.sleep(TEAM_POLL)
+        finally:
+            self.set_state("generating")
+        finished = sum(1 for row in rows if row["status"] in {"done", "error"})
+        head = f"{finished} of {len(rows)} sub-agents finished."
+        if finished < len(rows):
+            head += (
+                " The team time limit is used up; integrate what you have." if left <= 0
+                else f" The rest are still running after {int(limit)}s: WAIT again later or keep working."
+            )
+        unknown = [item for item in asked if item not in known]
+        if unknown:
+            head += " Not sub-agents of this task: " + ", ".join(f"#{item}" for item in unknown) + "."
+        out = [head]
+        for row in rows:
+            tokens = int(row["prompt_tokens"] or 0) + int(row["completion_tokens"] or 0)
+            out.append(f"#{row['id']} {row['role']} {TEAM_STATUS.get(row['status'], row['status'])} ({tokens} tokens): {one_line(row['title'], 60)}")
+            report = str(row["result"] or row["error"] or "").strip()
+            if row["status"] in {"done", "error"} and report:
+                if len(report) > TEAM_REPORT:
+                    report = "[...] " + report[-(TEAM_REPORT - 6) :]
+                out.append(report)
+        return "\n".join(out)
+
+    def children_text(self) -> str:
+        kids = self.children()
+        if not kids:
+            return f"no sub-agents yet (limit {TEAM_MAX})"
+        lines = [
+            f"#{row['id']} {row['role']} {TEAM_STATUS.get(row['status'], row['status'])}: {one_line(row['title'], 60)}"
+            for row in kids
+        ]
+        lines.append(f"{len(kids)} of {TEAM_MAX} sub-agents used, WAIT used {self.waits} of {TEAM_WAITS}")
+        return "\n".join(lines)
+
+
 def run_tool(
-    command: str, source: str, cut: bool, *, kind: str = "code", state: TaskState | None = None
+    command: str, source: str, cut: bool, *, kind: str = "code", state: TaskState | None = None,
+    team: Team | None = None,
 ) -> tuple[str, list[str]]:
     # Gates by task kind come first. They only add blocks; every check below still runs.
     budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
@@ -2011,6 +2509,12 @@ def run_tool(
         return "blocked: this task cannot change files. Use LIST, GREP or READ, or answer in plain text.", []
     if head == "RUN" and not budget.run:
         return "blocked: this task cannot RUN commands. Use LIST, GREP or READ, or answer in plain text.", []
+    if head in TEAM_HEADS:
+        if kind not in TEAM_KINDS:
+            return "blocked: this task cannot start sub-agents. Answer it directly.", []
+        if team is None:
+            return "blocked: SPAWN, WAIT and CHILDREN work only for a task in the queue. Do the work yourself.", []
+        return team.tool(command, head, cut), []
     if command.startswith("WRITE "):
         wrote = apply_actions(source, require_end=cut)
         if state is not None:
@@ -2069,7 +2573,7 @@ def ask_fitted(messages: list[dict], think: bool = False, max_tokens: int = 1200
 
 
 # On the last turn these still run once. Their result goes into the answer instead of being lost.
-FINAL_TOOLS = frozenset({"RUN", "READ", "GREP", "GLOB", "LIST", "SESSIONS"})
+FINAL_TOOLS = frozenset({"RUN", "READ", "GREP", "GLOB", "LIST", "SESSIONS", "WAIT", "CHILDREN"})
 # A RUN that checks written work: a compiler, a test runner, or running the program.
 VERIFY_RUN = re.compile(
     r"\b(?:py_compile|compileall|pytest|unittest|tests?|tsc|mypy|ruff|flake8|pylint|lint|build|check|cargo|go"
@@ -2163,7 +2667,10 @@ def _say_line(line: str) -> None:
 class AgentRun:
     """One job, run the way a long coding session runs: plan, look, change, check, report."""
 
-    def __init__(self, prompt: str, ask, say, log_dir: Path | None, context_chars: int | None) -> None:
+    def __init__(
+        self, prompt: str, ask, say, log_dir: Path | None, context_chars: int | None,
+        job: dict | None = None, team_options: dict | None = None,
+    ) -> None:
         self.ask = ask or ask_fitted
         self.say = say or _say_line
         self.log_dir = log_dir or LOG_DIR
@@ -2173,12 +2680,15 @@ class AgentRun:
         self.deep, prompt = deep_request(prompt)
         self.kind = kind
         self.budget = KIND_BUDGET[kind]
+        self.max_turns = self.budget.max_turns
+        self.team = Team(job, kind, **(team_options or {}))
         self.state = TaskState(prompt)
         self.secrets = secret_values() if kind == "code" else []
         # Stable first (cached by the server for every job of this kind), the task and live files after.
-        first = "Task:\n" + prompt + "\n\n" + workspace_note()
+        note = self.team.note() if self.team.lead else ""
+        first = "Task:\n" + prompt + ("\n\n" + note if note else "") + "\n\n" + workspace_note()
         self.history: list[dict] = [
-            {"role": "system", "content": agent_system(kind)},
+            {"role": "system", "content": agent_system(kind, self.team.mode)},
             {"role": "user", "content": first},
         ]
         # The full conversation, never compacted. Saved only for verified code tasks.
@@ -2213,6 +2723,7 @@ class AgentRun:
         used = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
         for key in self.usage:
             self.usage[key] += _count(used.get(key))
+        self.team.save_tokens(self.usage)  # the live tree shows tokens per agent
         return reply
 
     def track(self, command: str, result: str) -> None:
@@ -2234,6 +2745,13 @@ class AgentRun:
             "changed": len(self.state.changed),
             "verified": bool(self.verified and self.passed),
         }
+        if self.team.job_id is not None:
+            # "tree" is the lead's id for the lead and every sub-agent, so tokens add up per team.
+            row["job_id"] = self.team.job_id
+            row["tree"] = self.team.parent_id if self.team.parent_id is not None else self.team.job_id
+            row["role"] = self.team.role or ("lead" if self.team.spawned else "")
+            row["depth"] = self.team.depth
+            row["spawned"] = self.team.spawned
         try:
             append_capped(self.log_dir / "usage.jsonl", json.dumps(row), limit=2_000_000, keep=5000)
         except OSError:
@@ -2269,6 +2787,21 @@ class AgentRun:
         return True
 
     def run(self) -> str:
+        jail = self.team.jail()
+        if jail is None:
+            return self._run()
+        found = inside(jail)
+        if found is None:
+            raise RuntimeError("the sub-agent folder is not allowed")
+        if self.budget.write:
+            found[1].mkdir(parents=True, exist_ok=True)
+        token = _JAIL.set((found[0], found[1].resolve()))
+        try:
+            return self._run()
+        finally:
+            _JAIL.reset(token)
+
+    def _run(self) -> str:
         budget, state, logs = self.budget, self.state, self.logs
         fixes = 0
         nudged = False
@@ -2278,8 +2811,14 @@ class AgentRun:
         retry_tokens = 0
         last_sig = ""
         repeats = 0
-        for turn in range(budget.max_turns):
-            final_turn = turn == budget.max_turns - 1
+        turn = -1
+        while True:
+            turn += 1
+            if self.team.spawned and self.max_turns == budget.max_turns:
+                self.max_turns += TEAM_BONUS_TURNS  # once: room to WAIT, verify and integrate
+            if turn >= self.max_turns:
+                break
+            final_turn = turn == self.max_turns - 1
             think, tokens = turn_budget(
                 self.kind, turn=turn, deep=self.deep, after_failure=after_failure, writing=writing,
                 final_turn=final_turn,
@@ -2329,8 +2868,12 @@ class AgentRun:
             if final_turn and any(head not in FINAL_TOOLS for head in heads):
                 break
             signature = "\n".join(command for command, _ in batch)
-            repeats = repeats + 1 if signature == last_sig else 1
-            last_sig = signature
+            if heads == ["WAIT"]:
+                # WAIT again is how a lead polls; TEAM_WAITS bounds it instead of the loop breaker.
+                repeats, last_sig = 0, ""
+            else:
+                repeats = repeats + 1 if signature == last_sig else 1
+                last_sig = signature
             call_text = "\n".join(text for _, text in batch)
             first_line = batch[0][0].splitlines()[0][:120]
             if repeats >= 3:
@@ -2344,13 +2887,14 @@ class AgentRun:
                 after_failure = True
                 continue
             results: list[str] = []
+            limits: list[int] = []
             notes: list[str] = []
             for command, _ in batch:
                 head = tool_head(command)
                 self.say("tool " + command.splitlines()[0][:120])
                 source = command if "\n" in command else answer
                 try:
-                    result, made = run_tool(command, source, cut, kind=self.kind, state=state)
+                    result, made = run_tool(command, source, cut, kind=self.kind, state=state, team=self.team)
                 except Exception as exc:  # a tool failure is a result for the model, not a dead job
                     result, made = f"error: {exc}", []
                 self.track(command, result)
@@ -2371,18 +2915,24 @@ class AgentRun:
                 if head in {"READ", "EDIT"} or (head == "RUN" and tool_failed(result)) or result.startswith(("not written", "not edited")):
                     writing = True  # the next turn may well be an EDIT or a WRITE
                 results.append(result)
+                # Sub-agent reports are each capped already; one WAIT may carry all of them.
+                limits.append(TEAM_RESULT_CHARS if head == "WAIT" else TOOL_CHARS)
             if final_turn:
                 return self.finish(compose(logs, "last tool result:\n" + clip("\n".join(results), 1500)), "last_turn")
-            response = "\n".join(tool_response(result) for result in results)
+            response = "\n".join(tool_response(result, limit) for result, limit in zip(results, limits))
             if len(calls) > len(batch):
                 response += "\n" + tool_response(BATCH_NOTE.format(n=len(batch)))
             self.add_turn(call_text, response, "; ".join(notes))
         return self.finish(compose(logs, "[stopped: out of turns before a final answer]"), "out_of_turns")
 
 
-def run_agent(prompt: str, *, ask=None, say=None, log_dir: Path | None = None, context_chars: int | None = None) -> str:
-    """One job. ask(messages, think, max_tokens) is the model call; drills pass a fake one."""
-    job = AgentRun(prompt, ask, say, log_dir, context_chars)
+def run_agent(
+    prompt: str, *, ask=None, say=None, log_dir: Path | None = None, context_chars: int | None = None,
+    job: dict | None = None, team_options: dict | None = None,
+) -> str:
+    """One job. ask(messages, think, max_tokens) is the model call; drills pass a fake one.
+    job is the queue row (id, parent_id, role, depth, pid); without it there is no team mode."""
+    job = AgentRun(prompt, ask, say, log_dir, context_chars, job, team_options)
     try:
         return job.run()
     except ModelWait:
@@ -2439,7 +2989,7 @@ def worker_main() -> None:
         pulse.start()
         try:
             try:
-                result = run_agent(str(job["prompt"]))
+                result = run_agent(str(job["prompt"]), job={**job, "pid": pid})
             except Exception as exc:
                 text = str(exc) or type(exc).__name__
                 if isinstance(exc, ModelWait) or "training" in text.lower():
@@ -2634,6 +3184,100 @@ def wait_job(job_id: int, timeout: int = 180) -> str:
     if gpu_busy():
         return TRAINING_WAIT
     return "The model did not answer in time."
+
+
+def tree_rows(job_id: int) -> list[dict]:
+    """The lead and its sub-agents. A sub-agent's id shows its whole tree."""
+    with connect() as db:
+        row = db.execute("SELECT parent_id FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return []
+        root = int(row["parent_id"]) if row["parent_id"] is not None else int(job_id)
+        rows = db.execute(
+            "SELECT id, parent_id, title, status, role, prompt_tokens, completion_tokens, cached_tokens, "
+            "created, updated, result, error FROM jobs WHERE id=? OR parent_id=? "
+            "ORDER BY CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END, id",
+            (root, root),
+        ).fetchall()
+    return [dict(item) for item in rows]
+
+
+def tree_finished(rows: list[dict]) -> bool:
+    return bool(rows) and all(row["status"] in {"done", "error"} for row in rows)
+
+
+def tree_text(job_id: int, full: bool = False) -> str:
+    rows = tree_rows(job_id)
+    if not rows:
+        return f"no task #{job_id}"
+    lines = []
+    total = cached = 0
+    for row in rows:
+        tokens = int(row["prompt_tokens"] or 0) + int(row["completion_tokens"] or 0)
+        total += tokens
+        cached += int(row["cached_tokens"] or 0)
+        child = row["parent_id"] is not None
+        role = str(row["role"] or ("" if child else "lead"))
+        status = "failed" if row["status"] == "error" else str(row["status"])
+        seconds = max(0.0, float(row["updated"]) - float(row["created"]))
+        lines.append(
+            f"{'  +- ' if child else ''}#{row['id']} {role:<8} {status:<8} {tokens:>7} tok {seconds:>6.0f}s  "
+            + one_line(row["title"], 60)
+        )
+        if full:
+            text = str(row["result"] or row["error"] or "").strip()
+            for part in clip(text, 600).splitlines()[-8:]:
+                lines.append(("      " if child else "    ") + part[:160])
+    lead = rows[0]
+    lines.append(
+        f"team #{lead['id']}: {len(rows) - 1} sub-agents, {total} tokens ({cached} cached), "
+        + ("finished" if tree_finished(rows) else "working")
+    )
+    return "\n".join(lines)
+
+
+def team_main(task: str) -> None:
+    """agents.py team "<task>": queue a lead task and show its tree until the whole team is done."""
+    task = (task or "").strip()
+    if not task:
+        raise SystemExit('use: agents.py team "<task>"')
+    job_id = enqueue(task[:70], task, role="lead")
+    with connect() as db:
+        row = db.execute("SELECT prompt FROM jobs WHERE id=?", (job_id,)).fetchone()
+        workers = live_workers(db)
+    kind = job_kind(str(row["prompt"]))[0] if row else "?"
+    print(f"team task #{job_id} queued ({kind})", flush=True)
+    if kind not in TEAM_KINDS:
+        print("this is a quick task, so it runs alone without sub-agents", flush=True)
+    if workers < 2:
+        print(
+            f"note: {workers} agent worker(s) running. Sub-agents need 2 or more; start them with"
+            " 'agents.py agents' or from the mesh page. This window only watches.",
+            flush=True,
+        )
+    shown = ""
+    live = sys.stdout.isatty()
+    try:
+        while True:
+            rows = tree_rows(job_id)
+            text = tree_text(job_id)
+            if text != shown:
+                sys.stdout.write(("\x1b[H\x1b[J" if live else "") + text + "\n" + ("" if live else "\n"))
+                sys.stdout.flush()
+                shown = text
+            if tree_finished(rows):
+                break
+            time.sleep(1.5)
+    except KeyboardInterrupt:
+        print(f"\nstopped watching. The team keeps running; 'agents.py tree {job_id}' shows it later.", flush=True)
+        return
+    print("\n" + tree_text(job_id, full=True), flush=True)
+
+
+def tree_main(raw: str) -> None:
+    if not raw.strip().lstrip("#").isdigit():
+        raise SystemExit("use: agents.py tree <id>")
+    print(tree_text(int(raw.strip().lstrip("#")), full=True), flush=True)
 
 
 BRAIN = (
@@ -3290,6 +3934,279 @@ def session_drill(round_file: str) -> dict:
     return checks
 
 
+OLD_JOBS_SCHEMA = (
+    "CREATE TABLE jobs (id INTEGER PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,"
+    " worker_pid INTEGER, result TEXT, error TEXT, created REAL NOT NULL, updated REAL NOT NULL)"
+)
+OLD_WORKERS_SCHEMA = (
+    "CREATE TABLE workers (pid INTEGER PRIMARY KEY, started REAL NOT NULL, heartbeat REAL NOT NULL,"
+    " state TEXT NOT NULL, job_id INTEGER)"
+)
+
+
+def team_drill() -> dict:
+    """Team mode on a temporary queue: SPAWN, WAIT, limits, the write jail, scheduling, migration.
+    Mocked model only. It never opens the live agents.db and never writes the live logs."""
+    pid = os.getpid()
+    quiet = lambda _line: None  # noqa: E731
+    checks: dict[str, bool] = {}
+    home = LOG_DIR / "drill" / f"team-{pid}"
+    old_db, team_db = home / "old-schema.db", home / "team.db"
+    before = (getattr(_OVERRIDE, "db", None), getattr(_OVERRIDE, "logs", None))
+    # High ids keep the drill's workspace/team-<id> folders apart from real team folders.
+    base = 900_000_000 + (pid % 1_000_000) * 100
+    w1, w2 = 990_000_001, 990_000_002  # fake worker pids: rows in the temporary queue only
+    escape = f"workspace/agent-check/team-escape-{pid}.txt"
+    folders: list[str] = []
+    for item in (old_db, team_db):
+        _schema_ready.discard(path_key(item))
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True, exist_ok=True)
+    try:
+        # Migration: an old-schema queue gains the team columns and keeps its rows.
+        raw = sqlite3.connect(old_db)
+        raw.execute(OLD_JOBS_SCHEMA)
+        raw.execute(OLD_WORKERS_SCHEMA)
+        raw.execute("INSERT INTO jobs (title, prompt, status, created, updated) VALUES ('old', '[kind:quick]\nhi', 'done', 1, 1)")
+        raw.commit()
+        raw.close()
+        _OVERRIDE.db, _OVERRIDE.logs = old_db, home
+        with connect() as db:
+            columns = {str(row[1]) for row in db.execute("PRAGMA table_info(jobs)")}
+            kept = [tuple(row) for row in db.execute("SELECT title, status, parent_id, role, depth, prompt_tokens FROM jobs")]
+            again = migrate_jobs(db)
+        checks["team_migrate"] = (
+            all(name in columns for name, _ in TEAM_COLUMNS) and kept == [("old", "done", None, None, 0, 0)] and again == []
+        )
+        # A fresh temporary queue with two workers.
+        _OVERRIDE.db = team_db
+        now = time.time()
+        with connect() as db:
+            db.execute(
+                "INSERT INTO jobs (id, title, prompt, status, created, updated) VALUES (?, 'drill base', '[kind:quick]\nbase', 'done', ?, ?)",
+                (base, now, now),
+            )
+            for worker in (w1, w2):
+                db.execute("INSERT INTO workers (pid, started, heartbeat, state, job_id) VALUES (?, ?, ?, 'idle', NULL)", (worker, now, now))
+        lead1 = enqueue("drill lead one", "[kind:code]\nbuild three drill parts", role="lead")
+        lead2 = enqueue("drill lead two", "[kind:research]\nlook at the drill parts", role="lead")
+        folders += [f"workspace/team-{lead1}", f"workspace/team-{lead2}"]
+        first = claim(w1)
+        capped = claim(w2)  # 2 workers: one lead at a time, the other worker stays free for sub-agents
+        # Lead one SPAWNs 3 sub-agents in one turn; while it WAITs, worker two runs them.
+        runs: dict[str, tuple[dict, str, list]] = {}
+        lead_states: list[str] = []
+
+        def child_replies(job: dict) -> list:
+            jail = team_jail(lead1, job["id"])
+            if job["role"] == "code":
+                return [
+                    "SPAWN code nested\nmore work\nENDSPAWN",
+                    f"WRITE {escape}\nno\nENDWRITE",
+                    f"WRITE {jail}/part.py\nprint('part')\nENDWRITE",
+                    "RUN echo check part-ok",
+                    {"content": "Wrote part.py in my folder. Check passed.", "usage": {"prompt": 50, "completion": 9}},
+                ]
+            if job["role"] == "test":
+                return [f"WRITE {jail}/test_part.py\nassert True\nENDWRITE", "RUN echo check test-ok", "Wrote test_part.py. Check passed."]
+            return [{"content": "Research: the drill parts are independent.", "usage": {"prompt": 40, "completion": 6}}]
+
+        def run_children(_seconds: float) -> None:
+            with connect() as db:
+                lead_states.append(str(db.execute("SELECT state FROM workers WHERE pid=?", (w1,)).fetchone()["state"]))
+            while True:
+                job = claim(w2)
+                if job is None:
+                    break
+                ask, seen = _scripted(child_replies(job))
+                out = run_agent(job["prompt"], ask=ask, say=quiet, log_dir=home, job={**job, "pid": w2})
+                finish(job["id"], w2, out)
+                runs[job["role"]] = (job, out, seen)
+
+        spawns = (
+            "SPAWN code part one\nWrite part.py that prints a word.\nENDSPAWN\n"
+            "SPAWN research survey\nSay whether the parts are independent.\nENDSPAWN\n"
+            "SPAWN test part tests\nWrite test_part.py."
+        )
+        ask, seen = _scripted(
+            [{"content": spawns, "usage": {"prompt": 100, "completion": 20}}, "WAIT", "CHILDREN", "Integrated the three parts."]
+        )
+        lead_out = run_agent(
+            str(first["prompt"]) if first else "", ask=ask, say=quiet, log_dir=home,
+            job={**(first or {}), "pid": w1}, team_options={"sleep": run_children},
+        )
+        finish(lead1, w1, lead_out)
+        kids = team_children(lead1)
+        ids = {row["role"]: row["id"] for row in kids}
+        checks["team_parent_cap"] = bool(first) and first["id"] == lead1 and capped is None
+        checks["team_spawn3"] = (
+            len(seen) == 4 and seen[1]["last"].count("spawned #") == 3 and [row["role"] for row in kids] == ["code", "research", "test"]
+            and seen[0]["system"] == agent_system("code", "lead") and TEAM_LEAD_NOTE in seen[0]["task"]
+            and "SPAWN" in seen[0]["system"] and "WAIT" in seen[0]["system"] and "SPAWN" not in agent_system("code")
+        )
+        report = seen[2]["last"] if len(seen) > 2 else ""
+        checks["team_wait_reports"] = (
+            "3 of 3 sub-agents finished." in report and f"#{ids.get('code')} code done" in report
+            and "Wrote part.py in my folder" in report and "Research: the drill parts are independent." in report
+            and "Wrote test_part.py" in report and lead_states == ["team_wait"] and lead_out.endswith("Integrated the three parts.")
+            and all(row["status"] == "done" for row in kids)
+        )
+        code_job, _code_out, code_seen = runs.get("code", ({}, "", []))
+        code_jail = team_jail(lead1, ids.get("code", 0))
+        with connect() as db:
+            grandchildren = db.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE parent_id IN (SELECT id FROM jobs WHERE parent_id=?)", (lead1,)
+            ).fetchone()["n"]
+        checks["team_child_no_spawn"] = (
+            len(code_seen) == 5 and "cannot use SPAWN" in code_seen[1]["last"] and grandchildren == 0
+            and code_seen[0]["system"] == agent_system("code", "child") and "SPAWN <" not in code_seen[0]["system"]
+            and "SPAWN research" not in code_seen[0]["system"]
+            and f"Role: code sub-agent #{ids.get('code')} of lead task #{lead1}" in code_seen[0]["task"]
+            and f"{code_jail}/" in code_seen[0]["task"] and "at most 8 lines" in code_seen[0]["task"]
+            and "at most 8 lines" in code_seen[0]["system"]
+        )
+        part = inside(f"{code_jail}/part.py")
+        test_part = inside(f"{team_jail(lead1, ids.get('test', 0))}/test_part.py")
+        child_team = Team({"id": ids.get("code"), "parent_id": lead1, "depth": 1, "pid": w2}, "code")
+        token = _JAIL.set((code_jail, inside(code_jail)[1].resolve()))
+        try:
+            jail_write = safe_write(f"workspace/team-{lead1}/{ids.get('test')}/x.py", "no")
+            jail_mkdir = apply_actions(f"MKDIR workspace/team-{lead1}/other-{pid}")
+            jail_state = TaskState("jail")
+            jail_state.saw("x", test_part[1])
+            jail_edit = tool_edit(f"{team_jail(lead1, ids.get('test', 0))}/test_part.py", "assert True", "assert 1", jail_state)[0]
+            jail_ok = safe_write(f"{code_jail}/more.py", "x = 1")
+        finally:
+            _JAIL.reset(token)
+        checks["team_jail"] = (
+            safe_read(escape) == "missing" and "a sub-agent writes only under" in code_seen[2]["last"]
+            and part is not None and part[1].is_file() and test_part is not None and test_part[1].is_file()
+            and jail_write.startswith("blocked") and jail_mkdir[0].startswith("blocked") and jail_edit.startswith("blocked")
+            and jail_ok.startswith("wrote ") and "assert True" in safe_read(f"{team_jail(lead1, ids.get('test', 0))}/test_part.py")
+            and child_team.tool("SPAWN code x\ny", "SPAWN", False).startswith("blocked")
+            and safe_write(f"workspace/agent-check/team-free-{pid}.txt", "ok").startswith("wrote ")  # the jail ended
+        )
+        folders.append(f"workspace/agent-check/team-free-{pid}.txt")
+        tree = tree_text(lead1)
+        rows = [json.loads(line) for line in (home / "usage.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        team_rows = [row for row in rows if row.get("kind") == "team"]
+        checks["team_tree_usage"] = (
+            f"#{lead1} lead" in tree and all(f"#{item}" in tree for item in ids.values()) and "finished" in tree
+            and "120 tok" in tree and "3 sub-agents" in tree
+            and len(team_rows) == 1 and team_rows[0]["tree"] == lead1 and team_rows[0]["jobs"] == 4
+            and team_rows[0]["prompt_tokens"] == 190 and team_rows[0]["completion_tokens"] == 35
+            and sum(1 for row in rows if row.get("tree") == lead1 and row.get("kind") != "team") == 4
+        )
+        # Lead two: limits, refusals, the WAIT timeout path and cancel on finish.
+        second = claim(w1)
+        clock = [time.time()]
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        team2 = Team({**(second or {}), "pid": w1}, "research", sleep=fake_sleep, clock=lambda: clock[0], wait_seconds=30)
+
+        def call(text: str, kind: str = "research", team: Team | None = team2, cut: bool = False) -> str:
+            return run_tool(text, text, cut, kind=kind, team=team)[0]
+
+        no_code = call("SPAWN code build\nwrite it\nENDSPAWN")
+        made = [call(f"SPAWN research part {n}\nlook at part {n}\nENDSPAWN") for n in range(TEAM_MAX)]
+        seventh = call("SPAWN research one more\nlook again\nENDSPAWN")
+        cut_spawn = call("SPAWN research cut\npartial", cut=True)
+        checks["team_limit"] = (
+            (TEAM_MAX == 6 or bool(os.environ.get("NEURO_TEAM_MAX")))
+            and (TEAM_WAIT == 480 or bool(os.environ.get("NEURO_TEAM_WAIT")))
+            and bool(second) and second["id"] == lead2 and no_code.startswith("refused")
+            and all(item.startswith("spawned #") for item in made) and seventh.startswith("refused")
+            and f"already has {TEAM_MAX} sub-agents" in seventh and cut_spawn.startswith("not spawned")
+            and len(team_children(lead2)) == TEAM_MAX
+            and call("SPAWN research x\ny", kind="quick").startswith("blocked")
+            and call("SPAWN research x\ny", team=None).startswith("blocked")
+            and call("SPAWN bogus x\ny").startswith("refused")
+        )
+        waited = call("WAIT")
+        with connect() as db:
+            restored = str(db.execute("SELECT state FROM workers WHERE pid=?", (w1,)).fetchone()["state"])
+        unknown = call("WAIT 12345")
+        for _ in range(TEAM_WAITS - 1):
+            call("WAIT " + str(team_children(lead2)[0]["id"]))
+        over = call("WAIT")
+        checks["team_wait_timeout"] = (
+            f"0 of {TEAM_MAX} sub-agents finished." in waited and "still running after 30s" in waited
+            and waited.count("waiting for a worker") == TEAM_MAX and len(sleeps) >= 15 and sleeps[:15] == [TEAM_POLL] * 15
+            and restored == "generating" and unknown.startswith("refused") and over.startswith("refused")
+            and "limit" in over and team2.waits == TEAM_WAITS
+        )
+        finish(lead2, w1, "done")
+        cancelled = team_children(lead2)
+        # Wall time and worker count: a third lead with its own clock.
+        lead3 = enqueue("drill lead three", "[kind:review]\nreview the drill parts", role="lead")
+        folders.append(f"workspace/team-{lead3}")
+        team3 = Team({"id": lead3, "pid": w1}, "review", sleep=fake_sleep, clock=lambda: clock[0], wall_seconds=60)
+        one = call("SPAWN review look\nreview part one\nENDSPAWN", kind="review", team=team3)
+        with connect() as db:
+            db.execute("DELETE FROM workers WHERE pid=?", (w2,))
+        alone = call("SPAWN review look\nreview part two\nENDSPAWN", kind="review", team=team3)
+        with connect() as db:
+            db.execute("INSERT INTO workers (pid, started, heartbeat, state, job_id) VALUES (?, ?, ?, 'idle', NULL)", (w2, now, time.time()))
+        clock[0] += 120
+        late = call("SPAWN review late\nreview part three\nENDSPAWN", kind="review", team=team3)
+        count = len(sleeps)
+        late_wait = call("WAIT", kind="review", team=team3)
+        checks["team_wall_cancel"] = (
+            all(row["status"] == "error" and row["error"] == CANCELLED for row in cancelled) and len(cancelled) == TEAM_MAX
+            and one.startswith("spawned #") and alone.startswith("refused") and "fewer than 2" in alone
+            and late.startswith("refused") and "team time limit" in late and "time limit is used up" in late_wait
+            and len(sleeps) == count
+        )
+        # Slots: a lead in WAIT does not hold one of the model's slots; four generating jobs do.
+        stamp = time.time()
+        with connect() as db:
+            db.execute("UPDATE jobs SET status='done' WHERE status IN ('queued', 'running')")
+            db.execute("UPDATE workers SET state='team_wait' WHERE pid=?", (w1,))
+            for worker in (w1, 990_000_003, 990_000_004, 990_000_005):
+                db.execute(
+                    "INSERT INTO jobs (title, prompt, status, worker_pid, created, updated) VALUES ('busy', '[kind:quick]\nx', 'running', ?, ?, ?)",
+                    (worker, stamp, stamp),
+                )
+        quick1 = enqueue("drill quick", "[kind:quick]\nsay hi")
+        took = claim(w2)
+        with connect() as db:
+            db.execute("UPDATE workers SET state='generating' WHERE pid=?", (w1,))
+        enqueue("drill quick two", "[kind:quick]\nsay hi")
+        full = claim(w2)
+        checks["team_slots"] = bool(took) and took["id"] == quick1 and full is None
+        # Parsing: plain SPAWN blocks, native spawn and wait calls, SPAWN batches.
+        parsed = text_tools("SPAWN code a\ndo a\n\nmore a\nSPAWN research b\ndo b\nENDSPAWN\nWAIT 3 4\nCHILDREN")
+        checks["team_parse"] = (
+            [item[0].split("\n")[0] for item in parsed] == ["SPAWN code a", "SPAWN research b", "WAIT 3 4", "CHILDREN"]
+            and parse_spawn(parsed[0][0]) == ("code", "a", "do a\n\nmore a", True)
+            and len(batch_calls(parsed)) == 2
+            and native_tool('<tool_call>{"name": "spawn_agent", "arguments": {"role": "test", "title": "t", "task": "write tests"}}</tool_call>')
+            == "SPAWN test t\nwrite tests\nENDSPAWN"
+            and native_tool('<tool_call>{"name": "wait", "arguments": {"ids": [5, 6]}}</tool_call>') == "WAIT 5 6"
+        )
+    finally:
+        _OVERRIDE.db, _OVERRIDE.logs = before
+        for item in (old_db, team_db):
+            _schema_ready.discard(path_key(item))
+        for leftover in [*folders, escape]:
+            found = inside(leftover)
+            if found is None:
+                continue
+            if found[1].is_dir():
+                shutil.rmtree(found[1], ignore_errors=True)
+            else:
+                try:
+                    found[1].unlink(missing_ok=True)
+                except OSError:
+                    pass
+        shutil.rmtree(home, ignore_errors=True)
+    return checks
+
+
 def drill_round(index: int) -> dict:
     """Check the tool layer with no model and no server. Safe to run while training."""
     folder = LOG_DIR / "drill"
@@ -3362,6 +4279,10 @@ def drill_round(index: int) -> dict:
         checks.update(session_drill(relative))
     except Exception as exc:
         checks["session_drill_" + type(exc).__name__] = False
+    try:
+        checks.update(team_drill())
+    except Exception as exc:
+        checks["team_drill_" + type(exc).__name__] = False
     try:
         (folder / name).unlink(missing_ok=True)
     except OSError:
@@ -3663,7 +4584,16 @@ def main() -> None:
     if command == "agents":
         terminal(int(sys.argv[2]) if len(sys.argv) > 2 else 4)
         return
-    raise SystemExit("use: agents.py agent | agents.py drill [ROUNDS] | agents.py watch start | agents.py fleet | agents.py code [TASK]")
+    if command == "team":
+        team_main(" ".join(sys.argv[2:]))
+        return
+    if command == "tree":
+        tree_main(sys.argv[2] if len(sys.argv) > 2 else "")
+        return
+    raise SystemExit(
+        "use: agents.py agent | agents.py drill [ROUNDS] | agents.py watch start | agents.py fleet"
+        ' | agents.py code [TASK] | agents.py team "TASK" | agents.py tree ID'
+    )
 
 
 if __name__ == "__main__":
