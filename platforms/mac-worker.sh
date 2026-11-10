@@ -2,7 +2,8 @@
 # Neuro worker for a Mac with Apple Silicon - one command starts the local model and the worker.
 #   cd ~/neuroai-mesh && git pull && sh platforms/mac-worker.sh
 # Needs llama.cpp once:  brew install llama.cpp
-# The model (Qwen3.5-4B, about 2.9 GB) is downloaded by llama-server the first time.
+# The model is downloaded by llama-server the first time: Qwen3.5-4B (~2.9 GB), or Qwen3.5-9B
+# (~6 GB, slower but passes the tests more often) with NEURO_MODEL=9b.
 # If a model already answers on 127.0.0.1:8080 it is used as is. Ctrl+C stops the worker and
 # the model this script started. The Mac stays awake while it runs.
 set -eu
@@ -30,7 +31,8 @@ if model_up; then
 else
   command -v llama-server >/dev/null 2>&1 || { echo "llama-server was not found. Run: brew install llama.cpp"; exit 1; }
   echo "[1/2] Starting the model on 127.0.0.1:8080 (first time downloads ~2.9 GB; log: $LOG)..."
-  llama-server -hf unsloth/Qwen3.5-4B-GGUF:UD-Q4_K_XL --host 127.0.0.1 --port 8080 -np "$MODEL_SLOTS" --kv-unified -c "$MODEL_CTX" --jinja >"$LOG" 2>&1 &
+  case "${NEURO_MODEL:-4b}" in 9b|9B) HF_MODEL="unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL" ;; *) HF_MODEL="unsloth/Qwen3.5-4B-GGUF:UD-Q4_K_XL" ;; esac
+  llama-server -hf "$HF_MODEL" --host 127.0.0.1 --port 8080 -np "$MODEL_SLOTS" --kv-unified -c "$MODEL_CTX" --jinja >"$LOG" 2>&1 &
   LLAMA_PID=$!
   waited=0
   until model_up; do

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Neuro worker for the Steam Deck (SteamOS) - one command does everything:
 #   1. downloads llama.cpp for the Deck's GPU (Vulkan), once
-#   2. downloads a small model (Qwen3.5-4B, about 2.9 GB), once
+#   2. downloads a model once: Qwen3.5-4B (~2.9 GB), or Qwen3.5-9B (~6 GB) with NEURO_MODEL=9b
 #   3. starts the model on 127.0.0.1:8080 (this computer only), unless one is already running
 #   4. starts the Neuro worker and shows the pairing code
 # Run it in Desktop mode, from Konsole:
@@ -25,8 +25,13 @@ done
 # No NEURO_MESH_URL: mesh.py finds the main PC on this network and remembers it in mesh_url.txt.
 LLAMA_DIR="$HOME/llama"
 MODEL_DIR="$HOME/models"
-MODEL="$MODEL_DIR/Qwen3.5-4B-UD-Q4_K_XL.gguf"
-MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+# NEURO_MODEL=9b uses Qwen3.5-9B (about 6 GB): slower, but its answers pass the tests more often.
+case "${NEURO_MODEL:-4b}" in
+  9b|9B) MODEL_NAME="Qwen3.5-9B-UD-Q4_K_XL.gguf"; MODEL_REPO="unsloth/Qwen3.5-9B-GGUF" ;;
+  *) MODEL_NAME="Qwen3.5-4B-UD-Q4_K_XL.gguf"; MODEL_REPO="unsloth/Qwen3.5-4B-GGUF" ;;
+esac
+MODEL="$MODEL_DIR/$MODEL_NAME"
+MODEL_URL="https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_NAME"
 LOG="$HOME/llama-server.log"
 # Parallel slots: llama-server answers NEURO_MODEL_SLOTS requests at once (1-8, default 2),
 # 8k context each, and the worker runs one generate job per slot.
@@ -69,7 +74,7 @@ else
   chmod +x "$(dirname "$SERVER")"/* 2>/dev/null || true
 
   if [ ! -s "$MODEL" ]; then
-    echo "[2/4] Downloading the model (about 2.9 GB). It resumes if interrupted."
+    echo "[2/4] Downloading $MODEL_NAME (3-6 GB). It resumes if interrupted."
     mkdir -p "$MODEL_DIR"
     curl -L -f -C - -o "$MODEL.part" "$MODEL_URL"
     mv "$MODEL.part" "$MODEL"
