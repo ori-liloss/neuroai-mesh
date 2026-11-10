@@ -6024,7 +6024,11 @@ def machine_busy(gpu: bool = True) -> str:
     pct = cpu_busy_pct()
     if pct is not None and pct >= 75:
         return "CPU busy"
-    if int(ram_mib().get("free_mib") or 0) < 1024:
+    # A generate slot only sends a request to the local model server, whose memory (weights and KV
+    # cache) was allocated when it started: it needs little free RAM. A check slot starts a sandboxed
+    # process that may use up to ~1 GB. Workers running a model sat paused at ~800 MB free otherwise.
+    floor = 384 if gpu else 1024
+    if int(ram_mib().get("free_mib") or 0) < floor:
         return "low memory"
     # NEURO_MODEL_ON_CPU=1: the local model server runs on the CPU only (llama-server -ngl 0), so a
     # training run on this computer's GPU does not stop it. This lets the training PC's idle CPU and
