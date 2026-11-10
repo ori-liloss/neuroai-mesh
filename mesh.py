@@ -6025,7 +6025,11 @@ def machine_busy(gpu: bool = True) -> str:
         return "CPU busy"
     if int(ram_mib().get("free_mib") or 0) < 1024:
         return "low memory"
-    if gpu and os.name == "nt" and lock_held(GPU_LOCK):
+    # NEURO_MODEL_ON_CPU=1: the local model server runs on the CPU only (llama-server -ngl 0), so a
+    # training run on this computer's GPU does not stop it. This lets the training PC's idle CPU and
+    # RAM generate data too.
+    on_cpu = os.environ.get("NEURO_MODEL_ON_CPU", "").strip() == "1"
+    if gpu and not on_cpu and os.name == "nt" and lock_held(GPU_LOCK):
         return "training holds the GPU"
     return ""
 
