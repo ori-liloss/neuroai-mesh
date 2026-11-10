@@ -1259,7 +1259,8 @@ _BAR = re.compile(
 )
 _NUM = r"(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)"
 _LOSS = re.compile(r"[\"']loss[\"']\s*:\s*[\"']?" + _NUM)
-_EVAL_LOSS = re.compile(r"[\"']eval_loss[\"']\s*:\s*[\"']?" + _NUM)
+# "eval_loss", or "eval_all_loss" when the trainer also reports per-domain eval sets.
+_EVAL_LOSS = re.compile(r"[\"']eval_(?:all_)?loss[\"']\s*:\s*[\"']?" + _NUM)
 _EPOCH = re.compile(r"[\"']epoch[\"']\s*:\s*[\"']?" + _NUM)
 _LR = re.compile(r"[\"']learning_rate[\"']\s*:\s*[\"']?" + _NUM)
 _EXC = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit))\b:?(.*)$")
