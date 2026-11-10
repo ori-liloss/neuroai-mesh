@@ -71,5 +71,6 @@ Both ports answer only loopback and private LAN addresses; Origin and Host are c
 | `platforms/` | One-command workers for Mac, Linux, Steam Deck and Windows laptops |
 | `seeds/coding-v1.jsonl` | A ready set of coding prompts with verifiers |
 | `seeds/coding-v2-tested.jsonl` | Coding tasks whose answers include assert tests that are run (`verify_tests`) |
+| `seeds/luau-v2-tested.jsonl` | 398 plain-Luau tasks (OOP, coroutines, algorithms, parsing, typed Luau, game logic) whose answers end in `assert` tests run by `verify_luau` |
 
 MIT license.

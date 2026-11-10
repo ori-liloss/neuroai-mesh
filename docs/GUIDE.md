@@ -349,6 +349,9 @@ python mesh.py jobs export --require-agreement coding-v2-agreed.jsonl   # and ag
 python mesh.py jobs export --pairs coding-v2-pairs.jsonl                # chosen vs failed own tests
 ```
 
+`seeds/luau-v2-tested.jsonl` has 398 plain-Luau tasks for the Luau stage (easy 20% / medium 50% / hard 30%, about 12% Hebrew, no Roblox APIs), each asking for one ```lua block ending in at least 5 `assert` tests; `verify_luau` runs it with the `luau` CLI and a failing assert fails the answer.
+Queue it like the others: `python mesh.py jobs add generate-verify seeds/luau-v2-tested.jsonl` (1592 jobs; workers need the `luau` binary).
+
 `export` keeps one answer per prompt: with a cross-check, the highest agreement (ties: the
 shortest). `--require-agreement` keeps only answers whose agreement is at least 0.5 (prompts where
 fewer than two samples passed have no cross-check and are left out). In `--pairs`, chosen is the best
