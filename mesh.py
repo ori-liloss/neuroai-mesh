@@ -69,6 +69,13 @@ NODES_PATH = ROOT / "nodes.json"
 SPECS_PATH = ROOT / "specs.json"
 PID_PATH = ROOT / "rpc.pid"
 DASHBOARD = ROOT / "dashboard.html"
+# Third-party files the page loads from this PC (no CDN at runtime). Only the
+# names listed here are ever served from vendor/, each with a fixed type.
+VENDOR_DIR = ROOT / "vendor"
+VENDOR_FILES = {
+    "three.module.min.js": "text/javascript; charset=utf-8",
+    "LICENSE": "text/plain; charset=utf-8",
+}
 RPC_PORT = 50052
 DASHBOARD_PORT = 8780
 WORKER_PORT = 8781
@@ -931,6 +938,205 @@ def parse_nvidia(out: str) -> list[dict]:
     return cards
 
 
+# GPU telemetry history for this PC (serve only): one fixed nvidia-smi query
+# every 15 s into a 24 h ring buffer, plus, on Windows, the shared (system)
+# memory the GPU spills into, read once a minute from a performance counter.
+TELEMETRY_INTERVAL_S = 15
+TELEMETRY_WINDOW_S = 24 * 3600
+TELEMETRY_SHARED_EVERY_S = 60
+TELEMETRY_POINTS = 400
+TELEMETRY_ARGS = [
+    "nvidia-smi",
+    "--query-gpu=index,name,utilization.gpu,power.draw,power.limit,temperature.gpu,memory.used,memory.total",
+    "--format=csv,noheader,nounits",
+]
+SHARED_COUNTER_ARGS = [
+    "typeperf",
+    r"\GPU Adapter Memory(*)\Dedicated Usage",
+    r"\GPU Adapter Memory(*)\Shared Usage",
+    "-sc",
+    "1",
+]
+
+
+def _float_or_none(text: str) -> float | None:
+    try:
+        value = float(str(text).strip())
+    except (TypeError, ValueError):
+        return None  # "[N/A]", "[Not Supported]", ""
+    return value if value == value and abs(value) != float("inf") else None
+
+
+def parse_nvidia_telemetry(out: str) -> list[dict]:
+    """One dict per GPU line of TELEMETRY_ARGS. A field a GPU cannot report
+    ("[N/A]") becomes None instead of dropping the line."""
+    gpus = []
+    for line in str(out or "").splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 8:
+            continue
+        index = _float_or_none(parts[0])
+        if index is None:
+            continue
+        gpus.append({
+            "index": int(index),
+            "name": clip(parts[1], 80),
+            "util": _float_or_none(parts[2]),
+            "power_w": _float_or_none(parts[3]),
+            "power_limit_w": _float_or_none(parts[4]),
+            "temp_c": _float_or_none(parts[5]),
+            "mem_used_mib": _float_or_none(parts[6]),
+            "mem_total_mib": _float_or_none(parts[7]),
+        })
+    return gpus[:8]
+
+
+def parse_shared_counters(out: str) -> float | None:
+    """typeperf CSV with Dedicated Usage and Shared Usage columns per GPU
+    adapter (bytes). Returns the shared MiB of the adapter that holds the
+    most dedicated memory (the discrete GPU), or None."""
+    rows = [line for line in str(out or "").splitlines() if line.startswith('"')]
+    if len(rows) < 2:
+        return None
+    header = [cell.strip('"') for cell in rows[0].split('","')]
+    values = [cell.strip('"') for cell in rows[-1].split('","')]
+    dedicated: dict[str, float] = {}
+    shared: dict[str, float] = {}
+    for name, raw in zip(header[1:], values[1:]):
+        match = re.search(r"GPU Adapter Memory\((.*?)\)\\(Dedicated|Shared) Usage", name)
+        number = _float_or_none(raw)
+        if not match or number is None:
+            continue
+        (dedicated if match.group(2) == "Dedicated" else shared)[match.group(1)] = number
+    if not dedicated or not shared:
+        return None
+    adapter = max(dedicated, key=lambda key: dedicated[key])
+    if adapter not in shared:
+        return None
+    return round(shared[adapter] / (1024 * 1024), 1)
+
+
+def _run_quiet(run, argv: list[str], timeout: float) -> str:
+    result = run(argv, capture_output=True, text=True, timeout=timeout, errors="replace",
+                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return str(getattr(result, "stdout", "") or "")
+
+
+def sample_telemetry(run=subprocess.run) -> tuple[list[dict], str]:
+    """(gpus, error). The command is fixed; nothing from a request reaches it."""
+    try:
+        gpus = parse_nvidia_telemetry(_run_quiet(run, TELEMETRY_ARGS, 5))
+    except FileNotFoundError:
+        return [], "nvidia-smi was not found on this PC."
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return [], f"nvidia-smi failed: {type(exc).__name__}"
+    return gpus, "" if gpus else "nvidia-smi reported no GPU."
+
+
+def sample_shared(run=subprocess.run) -> float | None:
+    if os.name != "nt":
+        return None
+    try:
+        return parse_shared_counters(_run_quiet(run, SHARED_COUNTER_ARGS, 8))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def downsample_rows(rows: list, limit: int) -> list:
+    """At most `limit` rows [x, a, b, ...]: each bucket becomes its column
+    means (None ignored; x rounded), the newest row stays exact."""
+    if len(rows) <= limit:
+        return [list(row) for row in rows]
+    size = len(rows) / (limit - 1)
+    out = []
+    for index in range(limit - 1):
+        bucket = rows[int(index * size): max(int((index + 1) * size), int(index * size) + 1)] or [rows[-2]]
+        merged = [round(sum(row[0] for row in bucket) / len(bucket))]
+        for column in range(1, len(bucket[0])):
+            seen = [row[column] for row in bucket if row[column] is not None]
+            merged.append(round(sum(seen) / len(seen), 4) if seen else None)
+        out.append(merged)
+    out.append(list(rows[-1]))
+    return out
+
+
+class Telemetry:
+    """24 h ring buffer of GPU samples. Thread-safe."""
+
+    def __init__(self, interval_s: int = TELEMETRY_INTERVAL_S, window_s: int = TELEMETRY_WINDOW_S):
+        self.interval_s = interval_s
+        self.window_s = window_s
+        self.samples: deque = deque(maxlen=window_s // interval_s + 8)
+        self.error = ""
+        self.lock = threading.Lock()
+
+    def add(self, at: float, gpus: list[dict], shared_mib: float | None = None, error: str = "") -> None:
+        with self.lock:
+            self.error = error
+            if gpus:
+                self.samples.append((float(at), [dict(gpu) for gpu in gpus], shared_mib))
+            while self.samples and self.samples[0][0] < at - self.window_s:
+                self.samples.popleft()
+
+    def view(self, window_s: int = TELEMETRY_WINDOW_S, limit: int = TELEMETRY_POINTS, now: float | None = None) -> dict:
+        window_s = max(300, min(int(window_s or self.window_s), self.window_s))
+        with self.lock:
+            samples = list(self.samples)
+            error = self.error
+        end = now if now is not None else (samples[-1][0] if samples else time.time())
+        samples = [item for item in samples if item[0] >= end - window_s]
+        gpus: dict[int, dict] = {}
+        for at, cards, shared in samples:
+            for card in cards:
+                entry = gpus.setdefault(card["index"], {"index": card["index"], "name": card.get("name") or "",
+                                                        "mem_total_mib": None, "power_limit_w": None, "rows": []})
+                entry["name"] = card.get("name") or entry["name"]
+                entry["mem_total_mib"] = card.get("mem_total_mib") or entry["mem_total_mib"]
+                entry["power_limit_w"] = card.get("power_limit_w") or entry["power_limit_w"]
+                entry["rows"].append([int(at), card.get("util"), card.get("power_w"), card.get("temp_c"),
+                                      card.get("mem_used_mib"), shared if card["index"] == 0 else None])
+        out = []
+        for index in sorted(gpus):
+            entry = gpus[index]
+            rows = entry.pop("rows")
+            entry["points"] = downsample_rows(rows, limit)
+            out.append(entry)
+        return {
+            "interval_s": self.interval_s,
+            "window_s": window_s,
+            "available": bool(out),
+            "error": error,
+            "count": len(samples),
+            "columns": ["t", "util_pct", "power_w", "temp_c", "mem_used_mib", "shared_mib"],
+            "gpus": out,
+        }
+
+
+TELEMETRY = Telemetry()
+
+
+def telemetry_tick(store: Telemetry, run=subprocess.run, now: float | None = None,
+                   state: dict | None = None) -> None:
+    """One sample. The shared-memory counter is read at most once a minute."""
+    now = time.time() if now is None else now
+    state = state if state is not None else {}
+    gpus, error = sample_telemetry(run)
+    if gpus and now - float(state.get("shared_at") or 0) >= TELEMETRY_SHARED_EVERY_S:
+        state["shared_at"] = now
+        state["shared"] = sample_shared(run)
+    store.add(now, gpus, state.get("shared") if gpus else None, error)
+
+
+def telemetry_loop(store: Telemetry, run=subprocess.run) -> None:
+    state: dict = {}
+    while True:
+        try:
+            telemetry_tick(store, run, state=state)
+        except Exception as exc:  # the page keeps the samples it has
+            print(f"telemetry failed: {type(exc).__name__}: {exc}", flush=True)
+        time.sleep(TELEMETRY_INTERVAL_S)
+
+
 # Stopping these turns the computer off or closes the login session.
 PROTECTED = {
     "system",
@@ -1425,13 +1631,29 @@ LOSS_SERIES_POINTS = 400
 LOSS_READ_CHUNK = 4_000_000
 LOSS_READ_BUDGET = 32_000_000
 _STEPS_PER_EPOCH = re.compile(r"[\"']optimizer_steps_per_epoch[\"']\s*:\s*" + _NUM)
+_GRAD_NORM = re.compile(r"[\"']grad_norm[\"']\s*:\s*[\"']?" + _NUM)
+# Per-domain eval losses: 'eval_cpp_loss', 'eval_extra/luau_loss', 'eval_all_loss' (the overall one).
+_EVAL_DOMAIN = re.compile(r"[\"']eval_([A-Za-z0-9_./-]{1,60}?)_loss[\"']\s*:\s*[\"']?" + _NUM)
+EVAL_DOMAINS_CAP = 24
 _loss_cache: dict = {}
 _loss_lock = threading.Lock()
 
 
 def _loss_state(path: str, fingerprint: bytes = b"") -> dict:
     return {"path": path, "offset": 0, "encoding": None, "fingerprint": fingerprint, "loss": [], "eval": [],
+            "grad": [], "lr": [], "domains": {}, "speed": [], "speed_step": None,
             "bar_step": None, "bar_total": 0, "steps_per_epoch": None}
+
+
+def _new_run(state: dict) -> None:
+    state.update(loss=[], eval=[], grad=[], lr=[], domains={}, speed=[], speed_step=None,
+                 bar_step=None, bar_total=0, steps_per_epoch=None)
+
+
+def _keep(points: list, row: list, cap: int) -> None:
+    points.append(row)
+    if len(points) > cap:
+        _thin(points, cap)
 
 
 def _last_break(raw: bytes, encoding: str) -> int:
@@ -1463,7 +1685,7 @@ def _parse_loss_text(state: dict, text: str, max_steps_hint: int = 0, cap: int =
         if runner:
             if runner.group(2).strip().lower().startswith("start"):
                 # A new run in the same log: its curve starts over.
-                state.update(loss=[], eval=[], bar_step=None, bar_total=0, steps_per_epoch=None)
+                _new_run(state)
             continue
         spe = _num(_STEPS_PER_EPOCH, line)
         if spe and spe > 0:
@@ -1475,17 +1697,48 @@ def _parse_loss_text(state: dict, text: str, max_steps_hint: int = 0, cap: int =
                 total = int(match.group("total"))
                 if total > 0 and (total == max_steps_hint or total >= state["bar_total"]):
                     state["bar_total"] = max(state["bar_total"], total)
-                    state["bar_step"] = int(match.group("n"))
+                    step = int(match.group("n"))
+                    state["bar_step"] = step
+                    # One speed sample per new train step: [step, s/it, elapsed s].
+                    rate = match.group("rate")
+                    if rate and step != state["speed_step"]:
+                        try:
+                            value = float(rate)
+                            seconds = value if match.group("unit") == "s/it" else (1 / value if value else 0)
+                        except ValueError:
+                            seconds = 0
+                        if seconds > 0:
+                            state["speed_step"] = step
+                            _keep(state["speed"], [step, round(seconds, 3), clock_seconds(match.group("elapsed"))], cap)
+        epoch = None
         loss = _num(_LOSS, line)
         if loss is not None:
-            state["loss"].append([_num(_EPOCH, line), state["bar_step"], round(loss, 4)])
-            if len(state["loss"]) > cap:
-                _thin(state["loss"], cap)
+            epoch = _num(_EPOCH, line)
+            _keep(state["loss"], [epoch, state["bar_step"], round(loss, 4)], cap)
+        grad = _num(_GRAD_NORM, line)
+        if grad is not None:
+            epoch = _num(_EPOCH, line) if epoch is None else epoch
+            _keep(state["grad"], [epoch, state["bar_step"], round(grad, 4)], cap)
+        rate_value = _num(_LR, line)
+        if rate_value is not None:
+            epoch = _num(_EPOCH, line) if epoch is None else epoch
+            _keep(state["lr"], [epoch, state["bar_step"], float(f"{rate_value:.4g}")], cap)
         eval_loss = _num(_EVAL_LOSS, line)
         if eval_loss is not None:
-            state["eval"].append([_num(_EPOCH, line), state["bar_step"], round(eval_loss, 4)])
-            if len(state["eval"]) > cap:
-                _thin(state["eval"], cap)
+            _keep(state["eval"], [_num(_EPOCH, line), state["bar_step"], round(eval_loss, 4)], cap)
+        if "eval_" in line:
+            for found in _EVAL_DOMAIN.finditer(line):
+                name = found.group(1)
+                if name == "all":
+                    continue  # eval_all_loss is the overall curve above
+                try:
+                    value = float(found.group(2))
+                except ValueError:
+                    continue
+                domains = state["domains"]
+                if name not in domains and len(domains) >= EVAL_DOMAINS_CAP:
+                    continue
+                _keep(domains.setdefault(name, []), [_num(_EPOCH, line), state["bar_step"], round(value, 4)], cap)
 
 
 def update_loss_cache(path: Path, max_steps_hint: int = 0, cache: dict | None = None,
@@ -1527,8 +1780,9 @@ def update_loss_cache(path: Path, max_steps_hint: int = 0, cache: dict | None = 
         return cache.get("state") or _loss_state(key)
 
 
-def downsample(points: list, limit: int = LOSS_SERIES_POINTS) -> list:
-    """At most `limit` [x, y] points: each bucket becomes its mean, the newest point stays exact."""
+def downsample(points: list, limit: int = LOSS_SERIES_POINTS, sig: int = 0) -> list:
+    """At most `limit` [x, y] points: each bucket becomes its mean, the newest point stays exact.
+    y is rounded to 4 decimals, or to `sig` significant digits (tiny values like a learning rate)."""
     if len(points) <= limit:
         return [list(point) for point in points]
     size = len(points) / (limit - 1)
@@ -1536,7 +1790,8 @@ def downsample(points: list, limit: int = LOSS_SERIES_POINTS) -> list:
     for index in range(limit - 1):
         bucket = points[int(index * size): max(int((index + 1) * size), int(index * size) + 1)]
         bucket = bucket or [points[-2]]
-        out.append([round(sum(p[0] for p in bucket) / len(bucket)), round(sum(p[1] for p in bucket) / len(bucket), 4)])
+        mean = sum(p[1] for p in bucket) / len(bucket)
+        out.append([round(sum(p[0] for p in bucket) / len(bucket)), float(f"{mean:.{sig}g}") if sig else round(mean, 4)])
     out.append(list(points[-1]))
     return out
 
@@ -1571,13 +1826,29 @@ def loss_series(state: dict, max_steps: int = 0, step: int | None = None, epoch:
         fallback = step / epoch
     else:
         fallback = None
-    return {"loss_series": downsample(_series_steps(state.get("loss", []), spe, max_steps, fallback), limit),
-            "eval_series": downsample(_series_steps(state.get("eval", []), spe, max_steps, fallback), limit)}
+    steps = lambda key: _series_steps(state.get(key) or [], spe, max_steps, fallback)  # noqa: E731
+    domains = state.get("domains") or {}
+    speed = []
+    for row in state.get("speed") or []:
+        x = min(row[0], max_steps) if max_steps else row[0]
+        speed.append([x, row[1], row[2]])
+    return {"loss_series": downsample(steps("loss"), limit),
+            "eval_series": downsample(steps("eval"), limit),
+            "grad_norm_series": downsample(steps("grad"), limit),
+            "lr_series": downsample(steps("lr"), limit, sig=4),
+            "eval_domain_series": {name: downsample(_series_steps(domains[name], spe, max_steps, fallback), limit)
+                                   for name in sorted(domains)[:EVAL_DOMAINS_CAP]},
+            # [[step, seconds per step, elapsed seconds or None], ...] from the tqdm bar
+            "step_time_series": downsample_rows(speed, limit)}
+
+
+EMPTY_SERIES = {"loss_series": [], "eval_series": [], "grad_norm_series": [], "lr_series": [],
+                "eval_domain_series": {}, "step_time_series": []}
 
 
 def full_loss_series(log: str, max_steps: int = 0, step: int | None = None, epoch: float | None = None) -> dict:
     if not log:
-        return {"loss_series": [], "eval_series": []}
+        return {key: (dict(value) if isinstance(value, dict) else list(value)) for key, value in EMPTY_SERIES.items()}
     with _loss_lock:
         state = update_loss_cache(Path(log), max_steps)
         return loss_series(state, max_steps, step, epoch)
@@ -6358,6 +6629,28 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def send_vendor(self, name: str) -> None:
+        """A file from vendor/, only when its exact name is in VENDOR_FILES.
+        The name is compared as given, so "../x", "a/b" or "%2e%2e" never
+        match and nothing outside vendor/ can be read."""
+        kind = VENDOR_FILES.get(name)
+        if not kind:
+            self.send_json(404, {"error": "not found"})
+            return
+        try:
+            raw = (VENDOR_DIR / name).read_bytes()
+        except OSError:
+            self.send_json(404, {"error": "not found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(raw)))
+        # Pinned versions: a week in the browser cache is fine.
+        self.send_header("Cache-Control", "public, max-age=604800")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(raw)
+
     def send_empty(self, code: int = 204) -> None:
         self.send_response(code)
         self.send_header("Content-Length", "0")
@@ -6524,6 +6817,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(403, {"error": "Only the main PC's own page lists new computers.", "pending": []})
                 return
             self.send_json(200, {"pending": pair_list()})
+            return
+        if path == "/api/telemetry":
+            raw_window = (parse_qs(urlparse(self.path).query).get("window") or [""])[0]
+            try:
+                window = int(raw_window) if raw_window else TELEMETRY_WINDOW_S
+            except ValueError:
+                window = TELEMETRY_WINDOW_S
+            self.send_json(200, TELEMETRY.view(window))
+            return
+        if path.startswith("/vendor/"):
+            self.send_vendor(path[len("/vendor/"):])
             return
         if path.startswith("/platforms/"):
             name = Path(path).name
@@ -6785,6 +7089,8 @@ def serve(mode: str) -> None:
         print(f"token id {token_id()}", flush=True)
         start_discovery()
         threading.Thread(target=helper_loop, name="neuro-helpers", daemon=True).start()
+        if os.environ.get("NEURO_TELEMETRY", "1").strip() != "0":
+            threading.Thread(target=telemetry_loop, args=(TELEMETRY,), name="neuro-telemetry", daemon=True).start()
     else:
         server = ThreadingHTTPServer(("0.0.0.0", WORKER_PORT), Handler)
         print(f"Neuro worker on port {WORKER_PORT}", flush=True)
