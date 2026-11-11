@@ -3621,6 +3621,25 @@ def is_truncated(output: object) -> bool:
     return isinstance(output, dict) and output.get("finish_reason") == "length"
 
 
+def looping_answer(text: str) -> bool:
+    """A reply stuck repeating itself, so it never becomes training data. Two signs, both strict
+    enough for code (test lines look alike but are not the same): half of all 12-word runs are
+    repeats, or the reply ends in the same 20-200 characters four times over."""
+    words = (text or "").split()
+    if len(words) >= 120:
+        grams = [tuple(words[i:i + 12]) for i in range(len(words) - 11)]
+        if 1 - len(set(grams)) / len(grams) >= 0.5:
+            return True
+    tail = (text or "").rstrip()[-900:]
+    for period in range(20, 201):
+        if len(tail) < 4 * period:
+            break
+        piece = tail[-period:]
+        if tail[-2 * period:-period] == piece and tail[-3 * period:-2 * period] == piece and tail[-4 * period:-3 * period] == piece:
+            return True
+    return False
+
+
 def check_output(kind: str, payload: dict, ok: bool, output: object) -> tuple[bool, bool | None, dict]:
     """Validate a worker's result. Returns (ok, passed, output to store)."""
     if not isinstance(output, dict):
@@ -4016,6 +4035,11 @@ class JobQueue:
                 else:
                     note = "saved; truncated, not verified"
                 job["verified"] = False
+            elif job["kind"] == "generate" and ok and looping_answer(str(output.get("text") or "")):
+                # A reply stuck repeating itself is never checked nor trained on: the model would
+                # learn the loop. It still counts as done, so the prompt is not asked again.
+                job["verified"] = False
+                note = "saved; the reply repeats itself, not verified"
             elif job["kind"] == "generate" and ok and isinstance(spec, dict):
                 try:
                     self.add(spec["kind"], verify_payload(spec, output["text"]), parent=jid)
@@ -4229,7 +4253,7 @@ class JobQueue:
                     payload = job["payload"]
                     answer = strip_thinking(texts[jid])
                     group = kept.setdefault(key, [])
-                    if answer in group or (per_prompt > 0 and len(group) >= per_prompt):
+                    if answer in group or (per_prompt > 0 and len(group) >= per_prompt) or looping_answer(answer):
                         continue
                     group.append(answer)
                     rows.append(
@@ -4276,6 +4300,8 @@ class JobQueue:
                 answer = strip_thinking(texts[jid])
                 if verdict["passed"] and self.agreement.get(jid) is not None and self.agreement[jid] < AGREEMENT_MIN:
                     continue
+                if verdict["passed"] and looping_answer(answer):
+                    continue  # never "chosen"; a loop is a fine example of what not to do
                 side = bucket["chosen" if verdict["passed"] else "rejected"]
                 if answer and all(answer != seen for _, seen in bucket["chosen"] + bucket["rejected"]):
                     side.append((jid, answer))
