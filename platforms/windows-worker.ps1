@@ -255,7 +255,9 @@ function Start-Model([string]$Server, [int]$Ngl) {
   $argLine = "-m `"$Model`" --host 127.0.0.1 --port 8080 -np $ModelSlots --kv-unified -c $ModelCtx --jinja -ngl $Ngl"
   # The whole model on the GPU: do not keep the file memory-mapped in RAM as well (it held ~3 GB of a
   # 16 GB laptop's RAM for nothing and left the worker paused on low memory).
-  if ($Ngl -ge 99) { $argLine += ' --no-mmap' }
+  # Only on NVIDIA: on a laptop without one (Vulkan on a built-in GPU, or the CPU) the "GPU" memory is the
+  # same RAM, so --no-mmap loads a second copy of the model and the start fails with out of memory.
+  if ($Ngl -ge 99 -and (Test-Nvidia)) { $argLine += ' --no-mmap' }
   try {
     $proc = Start-Process -FilePath $Server -ArgumentList $argLine -WorkingDirectory (Split-Path -Parent $Server) `
       -WindowStyle Hidden -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru -ErrorAction Stop

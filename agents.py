@@ -21,6 +21,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -126,6 +127,44 @@ LAST_STEP = "That was the last tool. Answer the task now in plain text. Do not e
 STOPS = ["<tool_response>"]
 # The model server is on this machine. A system proxy must never sit in between.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+SAMPLING_THINK = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.0}
+SAMPLING_PLAIN = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.0}
+# A reply that loops: the same chunk of text again and again. Seen as the share of repeated
+# 8-word runs, and as one line or sentence that comes back many times.
+LOOP_SHARE = 0.45
+LOOP_LINES = 6
+
+
+def looping_text(text: str) -> bool:
+    """True when a reply is mostly repetition, the classic "same sentence forever" failure."""
+    words = (text or "").split()
+    if len(words) >= 80:
+        grams = [" ".join(words[i:i + 8]) for i in range(len(words) - 7)]
+        if 1 - len(set(grams)) / len(grams) >= LOOP_SHARE:
+            return True
+    pieces = [piece.strip().lower() for piece in re.split(r"[\n.!?]+", text or "") if len(piece.strip()) >= 12]
+    if len(pieces) >= LOOP_LINES:
+        counts: dict[str, int] = {}
+        for piece in pieces:
+            counts[piece] = counts.get(piece, 0) + 1
+        if max(counts.values()) >= LOOP_LINES:
+            return True
+    return False
+
+
+def cut_loop(text: str) -> str:
+    """The reply up to where it starts to repeat itself: each line kept once, in order."""
+    kept: list[str] = []
+    seen: set[str] = set()
+    for line in (text or "").splitlines():
+        key = line.strip().lower()
+        if key and key in seen and len(key) >= 12:
+            continue
+        seen.add(key)
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 class ModelWait(RuntimeError):
@@ -584,7 +623,9 @@ def chat(
 ) -> dict:
     payload = {
         "messages": messages,
-        "temperature": 0.6 if think else 0.4,
+        # Qwen's settings for its thinking and non-thinking modes. A low temperature (we had 0.4) and no
+        # presence penalty are what make small Qwen models repeat a sentence or a plan forever.
+        **(SAMPLING_THINK if think else SAMPLING_PLAIN),
         "max_tokens": max(64, min(int(max_tokens), 4096)),
         # Thinking follows the task kind (KIND_BUDGET) or Deep mode.
         "chat_template_kwargs": {"enable_thinking": bool(think)},
@@ -1238,6 +1279,8 @@ KIND_BUDGET: dict[str, Budget] = {
     "research": Budget(True, 1200, 6, False, True, False, 2),
     "review": Budget(True, 2560, 6, False, True, False, 2),
     "code": Budget(True, 3072, 12, True, True, True, 2),
+    # Math thinks with a big budget and computes with CALC instead of doing arithmetic in its head.
+    "math": Budget(True, 4096, 6, False, False, False, 2),
 }
 TOOL_TOKENS = 700  # a routine tool turn: thinking off, a few calls or a short answer
 THINK_TOKENS = 2048  # a planning or diagnosis turn: room to think, then call
@@ -1257,6 +1300,7 @@ TOOL_SYNTAX = (
     ("WRITE", "WRITE relative/path\nthe file contents\nENDWRITE"),
     ("MKDIR", "MKDIR relative/path"),
     ("RUN", "RUN command"),
+    ("CALC", "CALC\nprint(Fraction(3, 4) * 1200)\nENDCALC"),
 )
 KIND_NOTES = {
     "quick": "Answer briefly. Use a tool only when the answer needs the repo.",
@@ -1264,9 +1308,28 @@ KIND_NOTES = {
     "review": "Find bugs and risks, with file and line for each. Do not fix them.",
     "code": "Read first, then EDIT (WRITE only for a new file), then RUN a compile or a test.",
 }
+MATH_HELP = "\n".join(
+    (
+        "You are Neuro, a careful mathematician.",
+        "- Read the problem twice. Write down what is given and what is asked.",
+        "- Work step by step and check each step, the units and the edge cases.",
+        "- Never do long arithmetic in your head. Use CALC: Python with math, Fraction, Decimal, itertools"
+        " and statistics ready (sympy too when installed). print() what you need to see.",
+        "- Check the result another way when you can: substitute it back, estimate it, or use a second method.",
+        "- If a CALC fails, fix the code. Never send the same CALC twice.",
+        "- Do not narrate the tool. A turn is one CALC, or the final answer.",
+        "Tool, alone in a turn:",
+        "CALC\nprint(Fraction(3, 4) * 1200)\nENDCALC",
+        "Results come back inside <tool_response>.",
+        "Final answer: a short solution in the language of the question, then a last line exactly"
+        " `Answer: <the final value only>`. Stop when done.",
+    )
+)
 
 
 def kind_tools(kind: str) -> frozenset[str]:
+    if kind == "math":
+        return frozenset({"CALC"})
     budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
     names = {"LIST", "GLOB", "GREP", "READ", "SESSIONS"}
     if kind in KIND_BUDGET and kind != "quick":
@@ -1297,6 +1360,7 @@ TEAM_WAITS = _env_int("NEURO_TEAM_WAITS", 4, 1, 12)  # WAIT calls per lead run
 TEAM_WALL = _env_int("NEURO_TEAM_WALL", 3600, 60, 14400)  # seconds from the first SPAWN
 TEAM_REPORT = _env_int("NEURO_TEAM_REPORT", 1500, 200, 4000)  # characters of each report in WAIT
 TEAM_POLL = 2.0
+MATH_VOTES = _env_int("NEURO_MATH_VOTES", 3, 1, 5)  # independent solutions; the majority answer wins
 TEAM_BONUS_TURNS = 4  # a lead that spawned needs turns to WAIT, verify and integrate
 TEAM_RESULT_CHARS = min(12000, (TEAM_REPORT + 200) * TEAM_MAX)
 
@@ -1311,6 +1375,8 @@ def team_roles_for(kind: str) -> list[str]:
 def tool_help(kind: str, mode: str = "solo") -> str:
     """The whole system prompt for one kind. Stable text only: it is the cached prefix of every turn.
     mode: solo (no queue job), lead (a top-level job that may SPAWN), child (a sub-agent)."""
+    if kind == "math":
+        return MATH_HELP
     allowed = kind_tools(kind)
     budget = KIND_BUDGET.get(kind) or KIND_BUDGET["quick"]
     lead = mode == "lead" and kind in TEAM_KINDS
@@ -1399,6 +1465,9 @@ def turn_budget(
         tokens = budget.max_tokens
     if think:
         tokens = max(tokens, THINK_TOKENS)
+    if kind == "math":
+        # A solution is long text, not a short tool turn; thinking needs the whole budget.
+        tokens = budget.max_tokens if think or final_turn else max(tokens, 1536)
     return think, tokens
 
 
@@ -1457,6 +1526,28 @@ RESEARCH = (
     _he("איפה", "היכן", "הסבר", "הסבירי", "הסבירו", "תסביר", "תסבירי", "הסביר", "חפש", "חפשי", "תחפש",
         "מצא", "מצאי", "תמצא", "נתח", "תנתח", "השווה", "תשווה", "תאר", "תסכם", "סכם"),
 )
+# Math: thinking with a big budget and CALC. Without this a short math question was "quick":
+# no thinking and 600 tokens, the worst setting for it.
+MATH = (
+    _en(r"calculat\w*", r"compute|computes|computing", r"solve|solves|solving", r"equations?", r"integrals?",
+        r"derivatives?", r"differentiate", r"integrate", r"probability|probabilities", r"percent\w*",
+        r"average", r"arithmetic mean", r"median", r"primes?", r"factorials?", r"factori[sz]e", r"gcd|lcm", r"sqrt",
+        r"square roots?", r"logarithms?", r"algebra\w*", r"geometr\w*", r"trigonometr\w*", r"fractions?",
+        r"ratios?", r"maths?|mathematics|mathematical", r"arithmetic", r"how much is", r"sum of", r"product of",
+        r"divisible", r"remainder", r"modulo", r"(?:to|in|into|from) (?:binary|decimal|hex(?:adecimal)?)",
+        r"two's complement", r"combinations?",
+        r"permutations?", r"expected value", r"variance", r"theorem", r"prove that"),
+    _he("חשב", "תחשב", "תחשבי", "לחשב", "חישוב", "פתור", "תפתור", "תפתרי", "לפתור", "פתרי", "משוואה", "משוואות",
+        "אחוז", "אחוזים", "הסתברות", "ממוצע", "חציון", "שברים", "שטח", "נפח", "ראשוני", "ראשוניים",
+        "נגזרת", "אינטגרל", "מתמטיקה", "מתמטי", "שורש", "עצרת", "כמה זה", "כמה יוצא",
+        "חזקה", "שארית", "קומבינטוריקה", "תוחלת", "הוכח", "תוכיח"),
+)
+# 3 * 4, 17%, 2^10, x = 5, 0x7F, 5! ... A hyphen counts only with spaces, so a date is not math.
+MATH_SIGN = re.compile(
+    r"\d\s*[+*/×÷^]\s*\(?-?\d|\d\s+-\s+\d|\d\s*%|[√∑∫π]|\b\d+!|=\s*\?|\b[xyn]\s*[=^]\s*-?\d|\d[xyn]\b"
+    r"|\b0x[0-9a-f]+\b|\b[01]{8,}\b",
+    re.IGNORECASE,
+)
 # "do not change files", "בלי לשנות" — a refused action is not a request.
 NEGATED = re.compile(
     r"\b(?:do not|don't|dont|never|without|no need to|not)\s+(?:\w+\s+){0,2}?\w+"
@@ -1474,7 +1565,7 @@ def _hit(groups: tuple[re.Pattern, ...], text: str) -> bool:
 
 
 def classify_task(prompt: str) -> str:
-    """quick | research | review | code. When unsure: research. Files or code never mean quick."""
+    """quick | research | review | code | math. When unsure: research. Files or code never mean quick."""
     text = (prompt or "").strip()
     if not text:
         return DEFAULT_KIND
@@ -1485,6 +1576,9 @@ def classify_task(prompt: str) -> str:
         return "code"
     if _hit(REVIEW, lowered) or (coded and _hit(CHECK, lowered)):
         return "review"
+    # Math words count unless the task is about code; bare signs (3 * 4, 17%) only in plain text.
+    if not _hit(CODE_NOUN, lowered) and (_hit(MATH, lowered) or (not coded and MATH_SIGN.search(text))):
+        return "math"
     if coded or _hit(RESEARCH, lowered) or _hit(CHECK, lowered):
         return "research"
     if len(text) <= 160 and text.count("\n") <= 1:
@@ -1722,6 +1816,79 @@ def tool_run(command: str, timeout: int = 20) -> str:
     return clip(shown or "exit 0", 4000)
 
 
+CALC_TIMEOUT = 15
+CALC_SYMPY = re.compile(r"\b(?:sympy|symbols?|solve|simplify|factor|expand|diff|integrate|limit|Eq|nsimplify|Rational|Matrix|oo)\b")
+# Runs before the model's code. Imports first, then an audit hook that cannot be removed: no processes,
+# no network, no file writes, no deleting. Reading is allowed (Python must import its own modules).
+CALC_PRELUDE = '''
+import math, cmath, itertools, functools, statistics, operator, os as _os, sys as _sys
+from math import *
+from fractions import Fraction
+from decimal import Decimal, getcontext
+{sympy}
+try:
+    import resource as _r
+    _r.setrlimit(_r.RLIMIT_AS, (1 << 30, 1 << 30))
+except Exception:
+    pass
+_W = _os.O_WRONLY | _os.O_RDWR | _os.O_CREAT | _os.O_APPEND | _os.O_TRUNC
+_BAD = ("subprocess.", "os.exec", "os.spawn", "os.posix_spawn", "os.fork", "socket.", "shutil.", "ctypes.",
+        "winreg.", "urllib.", "http.", "ftplib.", "smtplib.", "webbrowser.", "_winapi.", "msvcrt.")
+_BAD_EXACT = {"os.system", "os.remove", "os.unlink", "os.rename", "os.replace", "os.rmdir", "os.mkdir",
+              "os.chmod", "os.kill", "os.startfile", "os.truncate", "os.putenv", "os.link", "os.symlink",
+              "os.chdir"}
+def _guard(event, args):
+    if event in _BAD_EXACT or event.startswith(_BAD):
+        raise PermissionError("blocked in CALC: " + event)
+    if event == "open":
+        mode = args[1] if len(args) > 1 else "r"
+        flags = args[2] if len(args) > 2 else 0
+        if (isinstance(mode, str) and any(c in mode for c in "wax+")) or (isinstance(flags, int) and flags & _W):
+            raise PermissionError("blocked in CALC: writing files")
+_sys.addaudithook(_guard)
+del _guard
+'''
+
+
+def tool_calc(code: str) -> str:
+    """Python for math in a locked-down child process: exact fractions, sympy, itertools. Output only."""
+    body = "\n".join(line for line in (code or "").splitlines() if not line.strip().startswith("```")).strip()
+    if not body:
+        return "CALC needs Python lines between CALC and ENDCALC"
+    sympy = "try:\n    from sympy import *\nexcept Exception:\n    pass" if CALC_SYMPY.search(body) else ""
+    source = CALC_PRELUDE.replace("{sympy}", sympy) + "\n" + body + "\n"
+    folder = Path(tempfile.gettempdir())
+    options: dict = {}
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    else:
+        options["start_new_session"] = True
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-X", "utf8", "-"],
+            cwd=str(folder),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **options,
+        )
+    except OSError as exc:
+        return f"could not run CALC: {exc.strerror or exc}"
+    try:
+        out, err = process.communicate(source.encode("utf-8"), timeout=CALC_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            _stop_tree(process)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return f"timed out after {CALC_TIMEOUT}s: use a smaller computation or a formula"
+    shown = _decode(out or b"").strip()
+    if process.returncode:
+        lines = [line for line in _decode(err or b"").strip().splitlines() if line.strip()]
+        shown = (shown + "\n" if shown else "") + "\n".join(lines[-3:]) + f"\nexit {process.returncode}"
+    return clip(shown or "no output: print() the result", 2000)
+
+
 def clean_tool_line(line: str) -> str:
     text = line.strip().strip("`").strip()
     text = text.lstrip("-*•").strip()
@@ -1745,6 +1912,8 @@ TOOL_NAMES = {
     "spawn": "SPAWN", "spawn_agent": "SPAWN", "spawn_subagent": "SPAWN", "subagent": "SPAWN",
     "wait": "WAIT", "wait_children": "WAIT", "wait_agents": "WAIT",
     "children": "CHILDREN", "list_children": "CHILDREN", "list_agents": "CHILDREN",
+    "calc": "CALC", "calculator": "CALC", "calculate": "CALC", "python": "CALC", "run_python": "CALC",
+    "execute_python": "CALC", "python_exec": "CALC", "compute": "CALC", "code_interpreter": "CALC",
 }
 SPAWN_BODY_KEYS = ("task", "prompt", "description", "body", "content", "text", "subtask", "sub_task")
 PATH_KEYS = ("path", "file", "file_path", "filepath", "filename", "dir", "directory", "dir_path", "folder", "target")
@@ -1851,6 +2020,11 @@ def command_from(name: object, args: object) -> str:
     if command == "TODO":
         rows = _todo_rows(_pick(args, TODO_KEYS))
         return "TODO\n" + "\n".join(rows) if rows else ""
+    if command == "CALC":
+        code = _pick(args, ("code", "script", "source", "python", "expression", "expr", "input", "value", "command"))
+        if not isinstance(code, str) or not code.strip():
+            return ""
+        return "CALC\n" + code.strip("\n") + "\nENDCALC"
     if command == "WRITE":
         safe = tool_path(_first_line(_pick(args, PATH_KEYS)))
         body = next((args[key] for key in BODY_KEYS if key in args and args[key] is not None), None)
@@ -2074,6 +2248,20 @@ def text_tools(answer: str) -> list[tuple[str, str]]:
                 if (end == "ENDWRITE") if is_write else block[-1].strip().startswith(">>>>>>>"):
                     break
             text = "\n".join(block)
+            calls.append((text, text))
+            continue
+        if stripped in {"CALC", "CALC:"}:
+            block = ["CALC"]
+            index += 1
+            closed = False
+            while index < len(lines):
+                if clean_tool_line(lines[index]) == "ENDCALC":
+                    closed = True
+                    index += 1
+                    break
+                block.append(lines[index])
+                index += 1
+            text = "\n".join(block + (["ENDCALC"] if closed else []))
             calls.append((text, text))
             continue
         if stripped in {"TODO", "TODO:"}:
@@ -2552,6 +2740,13 @@ def run_tool(
         return tool_todo(command, state), []
     if command.startswith("RUN "):
         return tool_run(command[4:]), []
+    if head == "CALC":
+        if "CALC" not in kind_tools(kind):
+            return "blocked: CALC is for math tasks. Use RUN python, or answer in plain text.", []
+        lines = command.splitlines()
+        if len(lines) < 2 or clean_tool_line(lines[-1]) != "ENDCALC":
+            return "CALC needs: CALC, the Python lines, ENDCALC" + (" (the call was cut off)" if cut else ""), []
+        return tool_calc("\n".join(lines[1:-1])), []
     if command.startswith("SESSIONS"):
         return "\n".join(recent_sessions(8)) or "no saved session yet", []
     return "unknown tool", []
@@ -2573,7 +2768,7 @@ def ask_fitted(messages: list[dict], think: bool = False, max_tokens: int = 1200
 
 
 # On the last turn these still run once. Their result goes into the answer instead of being lost.
-FINAL_TOOLS = frozenset({"RUN", "READ", "GREP", "GLOB", "LIST", "SESSIONS", "WAIT", "CHILDREN"})
+FINAL_TOOLS = frozenset({"RUN", "READ", "GREP", "GLOB", "LIST", "SESSIONS", "WAIT", "CHILDREN", "CALC"})
 # A RUN that checks written work: a compiler, a test runner, or running the program.
 VERIFY_RUN = re.compile(
     r"\b(?:py_compile|compileall|pytest|unittest|tests?|tsc|mypy|ruff|flake8|pylint|lint|build|check|cargo|go"
@@ -2589,6 +2784,26 @@ LOOP_NUDGE = (
     "You sent the same call as last turn, so it did not run again; its result is above. "
     "Change approach: a different call, a smaller step, or the final answer."
 )
+REVISIT_NUDGE = (
+    "You already ran this exact call earlier and nothing has changed since, so it did not run again; "
+    "its result is in the conversation above. You are going in circles. Use what you already have: "
+    "a different call that gets new information, or the final answer."
+)
+SAME_ERROR_NUDGE = (
+    "This is the same error as before: {error}. Retrying the same kind of fix will not help. "
+    "Find the cause first: READ the code at the line the error names, or check your assumption with a small RUN."
+)
+REVISITS_STOP = 3  # repeated calls with nothing changed in between, per job
+SAME_ERROR_STOP = 3  # the same error text this many times ends the job
+
+
+def error_key(result: str) -> str:
+    """The failing line of a tool result, without numbers, so the same error matches across runs."""
+    lines = [line.strip() for line in (result or "").strip().splitlines() if line.strip()]
+    lines = [line for line in lines if not re.fullmatch(r"exit -?\d+", line)]
+    if not lines:
+        return ""
+    return re.sub(r"\d+", "#", lines[-1].lower())[:160]
 BATCH_NOTE = (
     "Only the first {n} call(s) ran. Up to 3 of LIST GLOB GREP READ SESSIONS TODO run together; "
     "EDIT, WRITE, MKDIR and RUN run alone, one per turn."
@@ -2731,6 +2946,7 @@ class AgentRun:
             self.state.secret = True
 
     def finish(self, text: str, outcome: str, answer: str = "") -> str:
+        self.answer, self.outcome = answer, outcome
         seconds = round(time.time() - self.started, 1)
         row = {
             "t": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
@@ -2811,6 +3027,11 @@ class AgentRun:
         retry_tokens = 0
         last_sig = ""
         repeats = 0
+        # Loops that are not back to back: A, B, A, B ... or the same failing fix again and again.
+        changes = 0  # files changed so far; a call may be repeated after a change
+        ran_at: dict[str, int] = {}  # call signature -> changes when it last ran
+        revisits = 0
+        errors: dict[str, int] = {}
         turn = -1
         while True:
             turn += 1
@@ -2834,6 +3055,15 @@ class AgentRun:
             # Only the visible answer is used. Thinking is never stored or sent back.
             answer = visible_answer(reply.get("content") or "")
             cut = reply.get("finish") == "length"
+            if answer and looping_text(answer):
+                # The model got stuck repeating itself. Ask again once with the other sampling;
+                # if it still loops, keep only the part before the repetition.
+                if not final_turn and fixes < budget.fixes:
+                    fixes += 1
+                    no_think = not think
+                    self.say("the reply repeated itself; asking again")
+                    continue
+                answer = cut_loop(answer)
             calls = pick_tools(answer, reply.get("tool_calls"))
             after_failure = writing = False
             if not calls:
@@ -2886,6 +3116,21 @@ class AgentRun:
                 self.add_turn(call_text, tool_response(LOOP_NUDGE), "repeated " + first_line)
                 after_failure = True
                 continue
+            # The same call again with no file changed since it ran: its result cannot be new.
+            loose = heads != ["WAIT"] and not all(head == "TODO" for head in heads)
+            if loose and ran_at.get(signature) == changes and not final_turn:
+                revisits += 1
+                if revisits >= REVISITS_STOP:
+                    note = (
+                        f"Stopped: calls that already ran came back {revisits} times with nothing changed"
+                        f" (last: {first_line}). The task is not finished."
+                    )
+                    return self.finish(compose(logs, note), "loop")
+                self.add_turn(call_text, tool_response(REVISIT_NUDGE), "revisited " + first_line)
+                after_failure = True
+                continue
+            if loose:
+                ran_at[signature] = changes
             results: list[str] = []
             limits: list[int] = []
             notes: list[str] = []
@@ -2906,12 +3151,24 @@ class AgentRun:
                 notes.append(one_line(line, 160))
                 if any(item.startswith(("wrote ", "edited ")) for item in made):
                     self.wrote, self.verified, self.passed = True, False, False
+                    changes += 1
                 elif head == "RUN" and self.wrote and not result.startswith("blocked") and VERIFY_RUN.search(command[4:]):
                     self.verified, self.passed = True, not tool_failed(result)
                 if tool_failed(result):
                     after_failure = True
                     tail = result.strip().splitlines()[-1] if result.strip() else ""
                     state.failures.append(one_line(command.splitlines()[0] + " -> " + tail, 160))
+                    key = error_key(result) if head == "RUN" else ""
+                    if key:
+                        errors[key] = errors.get(key, 0) + 1
+                        if errors[key] >= SAME_ERROR_STOP:
+                            note = (
+                                f"Stopped: the same error came back {errors[key]} times: "
+                                f"{one_line(result.strip().splitlines()[-1], 160)}. The task is not finished."
+                            )
+                            return self.finish(compose(logs, note), "loop")
+                        if errors[key] == 2:
+                            result = result.rstrip() + "\n\n" + SAME_ERROR_NUDGE.format(error=one_line(key, 120))
                 if head in {"READ", "EDIT"} or (head == "RUN" and tool_failed(result)) or result.startswith(("not written", "not edited")):
                     writing = True  # the next turn may well be an EDIT or a WRITE
                 results.append(result)
@@ -2932,14 +3189,94 @@ def run_agent(
 ) -> str:
     """One job. ask(messages, think, max_tokens) is the model call; drills pass a fake one.
     job is the queue row (id, parent_id, role, depth, pid); without it there is no team mode."""
-    job = AgentRun(prompt, ask, say, log_dir, context_chars, job, team_options)
+    make = lambda: AgentRun(prompt, ask, say, log_dir, context_chars, job, team_options)  # noqa: E731
+    first = make()
+    if first.kind == "math" and MATH_VOTES > 1:
+        return vote_math(first, make, say or _say_line)
+    return _run_one(first)
+
+
+def _run_one(run: AgentRun) -> str:
     try:
-        return job.run()
+        return run.run()
     except ModelWait:
         raise  # the job goes back to the queue; it did not finish
     except Exception as exc:
-        job.finish("", "error " + type(exc).__name__)
+        run.finish("", "error " + type(exc).__name__)
         raise
+
+
+ANSWER_LINE = re.compile(r"(?:final answer|answer|התשובה(?: הסופית)?|תשובה(?: סופית)?)\s*[:：]\s*(.+)", re.IGNORECASE)
+BOXED = re.compile(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}")
+NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?(?:/\d+)?")
+
+
+def final_value(answer: str) -> str:
+    """The final value of a math answer, normalised so equal answers compare equal:
+    `Answer: 0.5`, `Answer: 1/2` and `\\boxed{\\frac12}`... become one key. "" when there is none."""
+    text = answer or ""
+    found = ""
+    lines = ANSWER_LINE.findall(text)
+    if lines:
+        found = lines[-1]
+    else:
+        boxed = BOXED.findall(text)
+        if boxed:
+            found = boxed[-1]
+        else:
+            numbers = NUMBER.findall(text)
+            found = numbers[-1] if numbers else ""
+    found = found.strip().strip("`*$ .").replace("\\,", "").replace("\\!", "")
+    frac = re.fullmatch(r"\\d?frac\{(-?\d+)\}\{(\d+)\}", found)
+    if frac:
+        found = f"{frac.group(1)}/{frac.group(2)}"
+    plain = found.replace(",", "") if re.fullmatch(r"-?[\d,]+(?:\.\d+)?", found) else found
+    try:
+        from fractions import Fraction
+
+        if re.fullmatch(r"-?\d+(?:\.\d+)?(?:/\d+)?", plain):
+            return "n:" + str(Fraction(plain))
+    except (ValueError, ZeroDivisionError):
+        pass
+    return "t:" + re.sub(r"\s+", "", found).lower()
+
+
+def vote_math(first: AgentRun, make, say) -> str:
+    """Self-consistency: solve the problem up to MATH_VOTES times on their own and keep the answer
+    most solutions reach. Stops early once a majority agrees, so an easy problem costs 2 runs."""
+    need = MATH_VOTES // 2 + 1
+    runs: list[tuple[str, str, str]] = []  # (key, result text, answer)
+    counts: dict[str, int] = {}
+    run = first
+    for index in range(MATH_VOTES):
+        if index:
+            run = make()
+        try:
+            text = _run_one(run)
+        except ModelWait:
+            if runs:
+                break  # keep what was solved; the model went away
+            raise
+        except Exception:
+            if runs:
+                break
+            raise
+        answer = getattr(run, "answer", "") or ""
+        key = final_value(answer) if answer else ""
+        runs.append((key, text, answer))
+        if key and key != "t:":
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] >= need:
+                break
+        if MATH_VOTES - index - 1 + max(counts.values(), default=0) < need and index >= 1:
+            break  # no answer can reach a majority any more
+    if not counts:
+        return runs[0][1]
+    best = max(counts, key=lambda item: (counts[item], -next(i for i, run in enumerate(runs) if run[0] == item)))
+    text = next(run[1] for run in runs if run[0] == best)
+    note = f"(checked: {counts[best]} of {len(runs)} independent solutions reached this answer)"
+    say("math vote " + note)
+    return text + "\n" + note
 
 
 def worker_main() -> None:
@@ -3468,6 +3805,17 @@ ROUTER_CASES = (
     ("what is the address format", "quick"),
     ("קודם תגיד שלום", "quick"),
     ("word " * 60, "research"),
+    ("כמה זה 17% מ-2340?", "math"),
+    ("solve 3x + 5 = 20", "math"),
+    ("what is 2^10 * 3", "math"),
+    ("מה ההסתברות לקבל 6 פעמיים בקוביה", "math"),
+    ("convert 0x7F to decimal", "math"),
+    ("תחשב את השטח של עיגול ברדיוס 3", "math"),
+    ("write a python function that computes the average", "code"),
+    ("explain the probability code in stats.py", "research"),
+    ("what happened on 2026-11-11", "quick"),
+    ("what do you mean by that", "quick"),
+    ("analyze this binary", "research"),
 )
 
 
@@ -3528,7 +3876,7 @@ def router_drill(round_file: str, round_text: str) -> dict:
 
     missed = [(text, want, classify_task(text)) for text, want in ROUTER_CASES if classify_task(text) != want]
     checks["router"] = not missed
-    checks["router_kinds"] = set(KIND_BUDGET) == {"quick", "research", "review", "code"} and all(
+    checks["router_kinds"] = set(KIND_BUDGET) == {"quick", "research", "review", "code", "math"} and all(
         classify_task(text) in KIND_BUDGET for text, _ in ROUTER_CASES
     )
     stamped = stamp_kind("fix agents.py enqueue")
@@ -3623,10 +3971,48 @@ def router_drill(round_file: str, round_text: str) -> dict:
     out = drill_agent("[kind:quick]\nsay hello", ask=ask, say=quiet)
     checks["final_tool"] = len(seen) == 3 and LAST_STEP in seen[2]["last"] and "last tool result:" in out and round_text in out
     turns = KIND_BUDGET["research"].max_turns
-    # Alternating calls are not a loop; only the same call back to back is.
-    ask, seen = _scripted([("LIST agent-logs/drill", "LIST agent-logs")[n % 2] for n in range(turns - 1)] + ["RUN rm -rf /"])
+    # Different calls run to the last turn, where a RUN still runs once.
+    distinct = ["LIST agent-logs/drill", "LIST agent-logs", "LIST workspace", "GLOB *.md", "GREP def drill_round", "LIST ."]
+    ask, seen = _scripted(distinct[: turns - 1] + ["RUN rm -rf /"])
     out = drill_agent("[kind:research]\nsay hello", ask=ask, say=quiet)
     checks["final_tool_run"] = len(seen) == turns and out.endswith("last tool result:\nblocked") and "RUN rm -rf / -> blocked" in out
+    # A, B, A, B ... is a loop too: each revisit gets a nudge, the third one ends the job.
+    ask, seen = _scripted([("LIST agent-logs/drill", "LIST agent-logs")[n % 2] for n in range(turns)])
+    out = drill_agent("[kind:research]\nsay hello", ask=ask, say=quiet)
+    checks["loop_alternating"] = (
+        len(seen) == 5 and "already ran this exact call" in seen[3]["last"] and "Stopped: calls that already ran" in out
+    )
+    # The same error three times ends the job; the second time says to find the cause.
+    ask, seen = _scripted(["RUN python -c \"import nope_mod_a\"", "RUN python -c \"import nope_mod_a; 1\"",
+                           "RUN python -c \"import nope_mod_a; 2\"", "Done."])
+    out = drill_agent("[kind:research]\nlook into an import", ask=ask, say=quiet)
+    checks["same_error"] = "same error as before" in seen[2]["last"] and "Stopped: the same error came back 3 times" in out
+    # A reply that repeats itself is asked again, not shown.
+    looped = "I will check the file now. " * 40
+    ask, seen = _scripted([looped, "The answer is short."])
+    out = drill_agent("[kind:quick]\nsay hello", ask=ask, say=quiet)
+    checks["repetition"] = (
+        looping_text(looped) and not looping_text(" ".join(f"step{i} of the plan" for i in range(60)))
+        and out.endswith("The answer is short.") and len(seen) == 2
+    )
+    # Math: CALC computes in a locked child process, and the answer most solutions reach wins.
+    checks["calc"] = tool_calc("print(Fraction(3, 4) * 1200)") == "900" and "1024" in tool_calc("print(2**10)")
+    checks["calc_locked"] = (
+        "blocked in CALC" in tool_calc("open('calc-drill.txt', 'w').write('x')")
+        and "blocked in CALC" in tool_calc("import os\nos.system('echo hi')")
+        and "blocked in CALC" in tool_calc("import subprocess\nsubprocess.run(['cmd'])")
+    )
+    checks["math_prompt"] = agent_system("math").startswith("You are Neuro, a careful mathematician") and "CALC" in agent_system("math")
+    ask, seen = _scripted(["CALC\nprint(6 * 7)\nENDCALC", "6*7 = 42\nAnswer: 42", "Answer: 42.0"])
+    out = drill_agent("[kind:math]\nwhat is 6 * 7", ask=ask, say=quiet)
+    checks["math_vote"] = (
+        "<tool_response>\n42" in seen[1]["last"] and len(seen) == 3 and "Answer: 42" in out and "2 of 2" in out
+    )
+    checks["final_value"] = (
+        final_value("so x = 1/2\nAnswer: 0.5") == final_value("\\boxed{\\frac{1}{2}}") == "n:1/2"
+        and final_value("Answer: 1,234") == "n:1234" and final_value("התשובה: 12") == "n:12"
+    )
+    checks["calc_parse"] = native_tool('<tool_call>{"name": "python", "arguments": {"code": "print(1)"}}</tool_call>') == "CALC\nprint(1)\nENDCALC"
     # Malformed calls: one repair turn for quick, two otherwise.
     bad = '<tool_call>{"name": "read_file", "arguments": {"path": '
     ask_q, seen_q = _scripted([bad])
