@@ -1539,6 +1539,17 @@ def parse_training_log(head: str, tail: str = "", max_steps_hint: int = 0) -> di
         eval_loss = _num(_EVAL_LOSS, line)
         if eval_loss is not None:
             events.append((index, "eval", (eval_loss, _num(_EPOCH, line))))
+    # A staged runner writes every stage into one log. Only the newest run counts: an older stage
+    # with more steps made the new stage's train bar look like an eval bar (stuck on "evaluating").
+    folders = [i for i, kind, data in events if kind == "runner" and "Run folder:" in data[1]]
+    if folders:
+        boundary = folders[-1]
+        previous = folders[-2] if len(folders) > 1 else -1
+        bars = [bar for bar in bars if bar[0] > boundary]
+        # Runner lines of this stage (mix, probe, start) stay; numbers come only after its Run folder line.
+        events = [event for event in events
+                  if event[0] >= boundary or (event[1] == "runner" and event[0] > previous)]
+        info["started"] = next(data[0] for _, kind, data in events if kind == "runner")
     # The train bar has no description and the largest total (or the known
     # max_steps); an eval bar shares the log with a smaller total.
     plain = [(i, m) for i, desc, m in bars if not desc]
@@ -1683,8 +1694,9 @@ def _parse_loss_text(state: dict, text: str, max_steps_hint: int = 0, cap: int =
             continue
         runner = _RUNNER.match(line)
         if runner:
-            if runner.group(2).strip().lower().startswith("start"):
-                # A new run in the same log: its curve starts over.
+            message = runner.group(2).strip()
+            if message.lower().startswith("start") or "Run folder:" in message:
+                # A new run (or a new stage of a staged runner) in the same log: its curve starts over.
                 _new_run(state)
             continue
         spe = _num(_STEPS_PER_EPOCH, line)
