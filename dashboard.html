@@ -452,9 +452,7 @@
     #say textarea { flex: 1; min-height: 76px; resize: vertical; }
 
     @media (prefers-reduced-motion: reduce) {
-      .lab *, .gym *, .wk *, .belt *, .diamond, .meterbar i, .live i { animation: none !important; transition: none !important; }
-      .gym .lid { transform: scaleY(0); }
-      .gym .confetti { transform: translateY(120px); }
+      .wk *, .belt *, .diamond, .meterbar i, .live i { animation: none !important; transition: none !important; }
     }
     @media (max-width: 1180px) {
       .bay { grid-template-columns: 1fr; }
@@ -2493,7 +2491,7 @@ function drawGym(t, ts, progress) {
   const shown = pct < 10 ? pct.toFixed(1) : Math.floor(pct);
   const evaluating = ts.label === "Evaluating";
   const say = {
-    lift: (evaluating ? "Catching his breath during an eval, holding " : "Pressing ") + plates + (plates === 1 ? " plate" : " plates") + " a side (" + kg + " kg)" + (t.max_steps ? " · " + shown + "% done" : "") + ". One more plate every 12.5%; he sweats more as the run gets on.",
+    lift: (evaluating ? "Slow reps during an eval, pressing " : "Pressing ") + plates + (plates === 1 ? " plate" : " plates") + " a side (" + kg + " kg)" + (t.max_steps ? " · " + shown + "% done" : "") + ". One more plate every 12.5%; he sweats more as the run gets on.",
     warm: "Warming up with a stretch while the model and data load.",
     done: "All plates lifted. The training has finished!",
     error: "Ouch. The run stopped with an error and he is a bit dizzy.",
@@ -3673,11 +3671,11 @@ function startGym3d(THREE) {
     let feetZ = 0.0, feetY = null, kneePole = [V(-0.15, 0, 1), V(0.15, 0, 1)];
     let sweatRate = 0, thumbs = false, zzz = false, dizzy = false, confettiOn = false;
     if (mode === "lift") {
-      const P = 1.7 + 0.12 * plates;
+      // an eval is a lighter set: the same full reps, just slower
+      const P = (1.7 + 0.12 * plates) * (state.evaluating ? 1.6 : 1);
       const u = still ? 0.52 : (time % P) / P;
       let s = 0, press = 0, hold = 0, drive = 0;
-      if (state.evaluating) { press = 0; }
-      else if (u < 0.22) s = ease(u / 0.22);
+      if (u < 0.22) s = ease(u / 0.22);
       else if (u < 0.45) { const k = ease((u - 0.22) / 0.23); s = 1 - k; press = k; drive = 1; }
       else if (u < 0.62) { press = 1; hold = 1; }
       else press = 1 - ease((u - 0.62) / 0.38);
@@ -3940,13 +3938,15 @@ function startGym3d(THREE) {
     stats.cpuMs = stats.cpuMs * 0.95 + (performance.now() - t0) * 0.05;
   }
   function renderStill() { render(0, true); }
-  // only draw while the stage is on screen, the tab is visible and motion is welcome
+  // only draw while the stage is on screen and the tab is visible. The lifting brain is the point
+  // of this stage, so it keeps moving with reduced motion too (Windows "Animation effects" off),
+  // just at a calmer pace.
   let onScreen = false, raf = 0, last = 0;
-  const running = () => onScreen && !document.hidden && !REDUCED.matches;
+  const running = () => onScreen && !document.hidden;
   function loop(now) {
     raf = 0;
     if (!running()) return;
-    const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
+    const dt = Math.min(0.05, Math.max(0, (now - last) / 1000)) * (REDUCED.matches ? 0.6 : 1);
     last = now;
     clock += dt;
     if (!dragging) dragYaw *= Math.pow(0.35, dt);

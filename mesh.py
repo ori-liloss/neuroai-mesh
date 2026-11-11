@@ -6298,7 +6298,9 @@ def machine_busy(gpu: bool = True) -> str:
     # A generate slot only sends a request to the local model server, whose memory (weights and KV
     # cache) was allocated when it started: it needs little free RAM. A check slot starts a sandboxed
     # process that may use up to ~1 GB. Workers running a model sat paused at ~800 MB free otherwise.
-    floor = 384 if gpu else 1024
+    # A Steam Deck keeps its model in GPU-mapped (GTT) memory that Linux counts as used, so it sits
+    # near 250 MB available while generating fine: 128 MB still leaves room for the worker itself.
+    floor = 128 if gpu else 1024
     if int(ram_mib().get("free_mib") or 0) < floor:
         return "low memory"
     # NEURO_MODEL_ON_CPU=1: the local model server runs on the CPU only (llama-server -ngl 0), so a
