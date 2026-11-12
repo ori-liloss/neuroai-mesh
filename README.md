@@ -73,6 +73,7 @@ Both ports answer only loopback and private LAN addresses; Origin and Host are c
 | `seeds/coding-v2-tested.jsonl` | Coding tasks whose answers include assert tests that are run (`verify_tests`) |
 | `seeds/luau-v2-tested.jsonl` | 398 plain-Luau tasks (OOP, coroutines, algorithms, parsing, typed Luau, game logic) whose answers end in `assert` tests run by `verify_luau` |
 | `seeds/make_math_seeds.py` | Makes math tasks with answers computed in Python (`verify_math`), including the math of reverse engineering; `seeds/math-v1.jsonl` is 1200 of them |
+| `seeds/make_agent_trajectories.py` | Tool-use training data for the agents: whole agent runs where `agents.py`'s real tools (READ, EDIT, RUN, GLOB, GREP, CALC) work on a generated project, in the exact runtime format |
 | `tests/test_mesh.py` | The self-test: `python tests/test_mesh.py` (ephemeral ports on 127.0.0.1 only; never touches the real token or queue) |
 
 MIT license.

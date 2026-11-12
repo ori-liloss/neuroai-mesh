@@ -1823,6 +1823,8 @@ CALC_SYMPY = re.compile(r"\b(?:sympy|symbols?|solve|simplify|factor|expand|diff|
 CALC_PRELUDE = '''
 import math, cmath, itertools, functools, statistics, operator, os as _os, sys as _sys
 from math import *
+import builtins as _builtins
+pow = _builtins.pow  # math.pow takes 2 arguments; pow(a, e, m) needs the builtin
 from fractions import Fraction
 from decimal import Decimal, getcontext
 {sympy}
@@ -3996,7 +3998,10 @@ def router_drill(round_file: str, round_text: str) -> dict:
         and out.endswith("The answer is short.") and len(seen) == 2
     )
     # Math: CALC computes in a locked child process, and the answer most solutions reach wins.
-    checks["calc"] = tool_calc("print(Fraction(3, 4) * 1200)") == "900" and "1024" in tool_calc("print(2**10)")
+    checks["calc"] = (
+        tool_calc("print(Fraction(3, 4) * 1200)") == "900" and "1024" in tool_calc("print(2**10)")
+        and tool_calc("print(pow(5, 100, 7))") == "2" and tool_calc("print(sqrt(16))") == "4.0"
+    )
     checks["calc_locked"] = (
         "blocked in CALC" in tool_calc("open('calc-drill.txt', 'w').write('x')")
         and "blocked in CALC" in tool_calc("import os\nos.system('echo hi')")
