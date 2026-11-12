@@ -28,6 +28,7 @@ try {
 } catch {
 }
 
+$RepoRoot = Split-Path -Parent $PSScriptRoot
 $Base = 'https://developer.download.nvidia.com/compute/cuda/redist/'
 $NeuroDir = Join-Path $env:LOCALAPPDATA 'Neuro'
 $Parts = @('cuda_nvcc', 'cuda_cudart', 'cuda_cccl', 'cuda_nvrtc', 'cuda_nvtx', 'cuda_profiler_api',
@@ -199,20 +200,47 @@ if ($r.Code -ne 0 -and $r.Out -match 'unsupported Microsoft Visual Studio versio
 }
 if ($r.Code -ne 0) { Write-Host $r.Out; Fail 'nvcc could not compile the test program (output above).' }
 Set-Content -LiteralPath (Join-Path $Dest 'neuro-nvcc-flags.txt') -Value $flags -Encoding ascii
+$exeNote = ''
 if ($SkipRun) {
   $run = 'CUDA build OK (the test program was not run: -SkipRun).'
 } else {
-  $run = & $exe | Out-String
-  if ($LASTEXITCODE -ne 0 -or $run -notmatch 'CUDA OK') {
-    Write-Host $run
-    Fail 'The test program was built but did not run correctly on the GPU (output above). Is the NVIDIA driver up to date?'
+  try {
+    $run = & $exe | Out-String
+    if ($LASTEXITCODE -ne 0 -or $run -notmatch 'CUDA OK') {
+      Write-Host $run
+      Fail 'The test program was built but did not run correctly on the GPU (output above). Is the NVIDIA driver up to date?'
+    }
+  } catch {
+    if ("$($_.Exception.Message)" -notmatch 'Application Control|blocked') { throw }
+    # Windows 11 Smart App Control blocks a freshly built, unsigned program. The Neuro CUDA checks do
+    # not build programs: they compile kernels in memory with NVRTC and run them through the driver.
+    $exeNote = 'Windows Smart App Control blocks newly built programs here, so the CUDA checks run kernels in memory (NVRTC) instead.'
+    $run = ''
   }
+}
+
+# The in-memory path the Neuro CUDA checks use: NVRTC compiles a kernel and the driver runs it.
+$jitTest = Join-Path $RepoRoot 'cuda_jit.py'
+if (-not $SkipRun -and (Test-Path -LiteralPath $jitTest)) {
+  Say '      Running a kernel in memory (NVRTC + driver), the way the CUDA checks do...'
+  $pyCmd = Get-Command py.exe -ErrorAction SilentlyContinue
+  $pyArgs = @('-3')
+  if (-not $pyCmd) { $pyCmd = Get-Command python.exe -ErrorAction SilentlyContinue; $pyArgs = @() }
+  if (-not $pyCmd) { Fail 'Python was not found, so the in-memory CUDA test could not run.' }
+  $jit = & $pyCmd.Source @pyArgs -I $jitTest --cuda-path $Dest | Out-String
+  if ($LASTEXITCODE -ne 0 -or $jit -notmatch 'CUDA JIT OK') {
+    Write-Host $jit
+    Fail 'The in-memory CUDA test failed (output above). Is the NVIDIA driver up to date?'
+  }
+  if (-not $run) { $run = $jit }
+  else { $run = $run.Trim() + "`n      " + $jit.Trim() }
 }
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
 $nvccVersion = (& $nvcc --version | Select-String 'release').Line
 Write-Host ''
 Write-Host "Done. $($run.Trim())" -ForegroundColor Green
+if ($exeNote) { Write-Host "  $exeNote" }
 Write-Host "  nvcc: $nvcc"
 Write-Host "  $nvccVersion"
 Write-Host '  CUDA_PATH and PATH are set for this user; new windows find nvcc by name.'
