@@ -43,8 +43,17 @@ MODEL_CTX=$((MODEL_SLOTS * 8192))
 model_up() { curl -sf -m 2 http://127.0.0.1:8080/health >/dev/null 2>&1; }
 PID_FILE="$HOME/.neuro-llama.pid"
 
+# llama-server keeps old prompts in a RAM cache of up to 8 GB by default (--cache-ram). Every job
+# has a new prompt, so it only grew for hours until the Deck paused on low memory. Builds older than
+# the option refuse unknown flags, so it is added only when --help lists it.
+cache_args() {
+  if "$1" --help 2>&1 | grep -q -- '--cache-ram'; then echo "--cache-ram 0"; fi
+}
+
 start_model() {
-  ( cd "$(dirname "$SERVER")" && exec "$SERVER" -m "$MODEL" --host 127.0.0.1 --port 8080 -np "$MODEL_SLOTS" --kv-unified -c "$MODEL_CTX" --jinja -ngl 99 ) >>"$LOG" 2>&1 &
+  CACHE_ARGS="$(cache_args "$SERVER")"
+  # shellcheck disable=SC2086  # CACHE_ARGS is empty or two words
+  ( cd "$(dirname "$SERVER")" && exec "$SERVER" -m "$MODEL" --host 127.0.0.1 --port 8080 -np "$MODEL_SLOTS" --kv-unified -c "$MODEL_CTX" --jinja -ngl 99 $CACHE_ARGS ) >>"$LOG" 2>&1 &
   echo $! >"$PID_FILE"
 }
 

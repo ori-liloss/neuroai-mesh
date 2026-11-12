@@ -230,6 +230,16 @@ function Test-Nvidia {
   return (Test-Path -LiteralPath $alt)
 }
 
+function Test-CacheRam([string]$Server) {
+  try {
+    # Through cmd.exe: Windows PowerShell 5.1 turns native stderr into error records.
+    $help = cmd.exe /d /c "`"$Server`" --help 2>&1"
+    return [bool]($help | Select-String -SimpleMatch -Pattern '--cache-ram' -Quiet)
+  } catch {
+    return $false
+  }
+}
+
 function Show-LogTail {
   foreach ($f in @($ErrLog, $Log)) {
     if ((Test-Path -LiteralPath $f) -and (Get-Item -LiteralPath $f).Length -gt 0) {
@@ -258,6 +268,10 @@ function Start-Model([string]$Server, [int]$Ngl) {
   # Only on NVIDIA: on a laptop without one (Vulkan on a built-in GPU, or the CPU) the "GPU" memory is the
   # same RAM, so --no-mmap loads a second copy of the model and the start fails with out of memory.
   if ($Ngl -ge 99 -and (Test-Nvidia)) { $argLine += ' --no-mmap' }
+  # llama-server keeps old prompts in a RAM cache of up to 8 GB by default (--cache-ram). Every job has
+  # a new prompt, so it only grew for hours (8.4 GB on the 3050 laptop) until the machine paused or
+  # swapped. Builds older than the option refuse unknown flags, so it is added only when --help lists it.
+  if (Test-CacheRam $Server) { $argLine += ' --cache-ram 0' }
   try {
     $proc = Start-Process -FilePath $Server -ArgumentList $argLine -WorkingDirectory (Split-Path -Parent $Server) `
       -WindowStyle Hidden -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru -ErrorAction Stop

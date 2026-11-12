@@ -21,8 +21,17 @@ case "$MODEL_SLOTS" in 1|2|3|4|5|6|7|8) ;; *) MODEL_SLOTS=2 ;; esac
 MODEL_CTX=$((MODEL_SLOTS * 8192))
 case "${NEURO_MODEL:-4b}" in 9b|9B) HF_MODEL="unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL" ;; *) HF_MODEL="unsloth/Qwen3.5-4B-GGUF:UD-Q4_K_XL" ;; esac
 
+# llama-server keeps old prompts in a RAM cache of up to 8 GB by default (--cache-ram). Every job
+# has a new prompt, so it only grows and takes RAM the model needs. Builds older than the option
+# refuse unknown flags, so it is added only when --help lists it.
+cache_args() {
+  if llama-server --help 2>&1 | grep -q -- '--cache-ram'; then echo "--cache-ram 0"; fi
+}
+
 start_model() {
-  llama-server -hf "$HF_MODEL" --host 127.0.0.1 --port 8080 -np "$MODEL_SLOTS" --kv-unified -c "$MODEL_CTX" --jinja >>"$LOG" 2>&1 &
+  CACHE_ARGS="$(cache_args)"
+  # shellcheck disable=SC2086  # CACHE_ARGS is empty or two words
+  llama-server -hf "$HF_MODEL" --host 127.0.0.1 --port 8080 -np "$MODEL_SLOTS" --kv-unified -c "$MODEL_CTX" --jinja $CACHE_ARGS >>"$LOG" 2>&1 &
   echo $! >"$PID_FILE"
 }
 
