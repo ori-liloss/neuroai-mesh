@@ -230,14 +230,30 @@ function Test-Nvidia {
   return (Test-Path -LiteralPath $alt)
 }
 
-function Test-CacheRam([string]$Server) {
-  try {
-    # Through cmd.exe: Windows PowerShell 5.1 turns native stderr into error records.
-    $help = cmd.exe /d /c "`"$Server`" --help 2>&1"
-    return [bool]($help | Select-String -SimpleMatch -Pattern '--cache-ram' -Quiet)
-  } catch {
-    return $false
+# Optional llama-server flags differ between llama.cpp builds, and a build refuses a flag it does not
+# know ("error: invalid argument: --no-mmap" stopped the 3050 laptop's model). A flag is added only when
+# --help lists it, and one the server still refuses is remembered and left out on the next start.
+$script:ServerHelp = @{}
+$script:RefusedFlags = @{}
+function Test-ServerFlag([string]$Server, [string]$Flag) {
+  if ($script:RefusedFlags.ContainsKey($Flag)) { return $false }
+  if (-not $script:ServerHelp.ContainsKey($Server)) {
+    try {
+      # Through cmd.exe: Windows PowerShell 5.1 turns native stderr into error records.
+      $script:ServerHelp[$Server] = (cmd.exe /d /c "`"$Server`" --help 2>&1") -join "`n"
+    } catch {
+      $script:ServerHelp[$Server] = ''
+    }
   }
+  return [bool]([regex]::IsMatch($script:ServerHelp[$Server], '(^|[\s,])' + [regex]::Escape($Flag) + '([\s,=]|$)'))
+}
+
+# The flag a failed start refused, or ''.
+function Get-RefusedFlag {
+  if (-not (Test-Path -LiteralPath $ErrLog)) { return '' }
+  $hit = Select-String -LiteralPath $ErrLog -Pattern 'invalid argument: (--?[\w-]+)' | Select-Object -Last 1
+  if ($hit) { return $hit.Matches[0].Groups[1].Value }
+  return ''
 }
 
 function Show-LogTail {
@@ -267,11 +283,11 @@ function Start-Model([string]$Server, [int]$Ngl) {
   # 16 GB laptop's RAM for nothing and left the worker paused on low memory).
   # Only on NVIDIA: on a laptop without one (Vulkan on a built-in GPU, or the CPU) the "GPU" memory is the
   # same RAM, so --no-mmap loads a second copy of the model and the start fails with out of memory.
-  if ($Ngl -ge 99 -and (Test-Nvidia)) { $argLine += ' --no-mmap' }
+  if ($Ngl -ge 99 -and (Test-Nvidia) -and (Test-ServerFlag $Server '--no-mmap')) { $argLine += ' --no-mmap' }
   # llama-server keeps old prompts in a RAM cache of up to 8 GB by default (--cache-ram). Every job has
   # a new prompt, so it only grew for hours (8.4 GB on the 3050 laptop) until the machine paused or
-  # swapped. Builds older than the option refuse unknown flags, so it is added only when --help lists it.
-  if (Test-CacheRam $Server) { $argLine += ' --cache-ram 0' }
+  # swapped.
+  if (Test-ServerFlag $Server '--cache-ram') { $argLine += ' --cache-ram 0' }
   try {
     $proc = Start-Process -FilePath $Server -ArgumentList $argLine -WorkingDirectory (Split-Path -Parent $Server) `
       -WindowStyle Hidden -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru -ErrorAction Stop
@@ -283,6 +299,12 @@ function Start-Model([string]$Server, [int]$Ngl) {
   $waited = 0
   while (-not (Test-ModelUp)) {
     if ($proc.HasExited) {
+      $refused = Get-RefusedFlag
+      if ($refused -and ($refused -in @('--no-mmap', '--cache-ram')) -and -not $script:RefusedFlags.ContainsKey($refused)) {
+        Write-Host "      This llama.cpp build does not accept $refused. Starting again without it..."
+        $script:RefusedFlags[$refused] = $true
+        return (Start-Model $Server $Ngl)
+      }
       Write-Host "      The model stopped (exit $($proc.ExitCode))."
       Show-LogTail
       $script:LastOom = Test-OutOfMemory
