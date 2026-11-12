@@ -278,6 +278,8 @@ function Test-OutOfMemory {
 # Returns the started process when /health answers, $null otherwise. Sets $script:LastOom.
 function Start-Model([string]$Server, [int]$Ngl) {
   $script:LastOom = $false
+  $script:LastBlocked = $false
+  $script:LastExit = 0
   $argLine = "-m `"$Model`" --host 127.0.0.1 --port 8080 -np $ModelSlots --kv-unified -c $ModelCtx --jinja -ngl $Ngl"
   # The whole model on the GPU: do not keep the file memory-mapped in RAM as well (it held ~3 GB of a
   # 16 GB laptop's RAM for nothing and left the worker paused on low memory).
@@ -294,6 +296,7 @@ function Start-Model([string]$Server, [int]$Ngl) {
     $null = $proc.Handle  # keeps ExitCode readable after the process ends
   } catch {
     Write-Host "      llama-server could not be started: $($_.Exception.Message)"
+    if ("$($_.Exception.Message)" -match 'Application Control|blocked') { $script:LastBlocked = $true }
     return $null
   }
   $waited = 0
@@ -308,6 +311,7 @@ function Start-Model([string]$Server, [int]$Ngl) {
       Write-Host "      The model stopped (exit $($proc.ExitCode))."
       Show-LogTail
       $script:LastOom = Test-OutOfMemory
+      $script:LastExit = [int]$proc.ExitCode
       return $null
     }
     if ($waited -ge 240) {
@@ -392,10 +396,56 @@ public static void Release() { SetThreadExecutionState(0x80000000u); }
 }
 
 $script:LlamaProc = $null
+$script:Redownloaded = $false
+
+# Port 8080 is taken but no model answers: a model that is still loading, a hung llama-server from an
+# earlier run (its window was closed), or another program. Waits for a loading model, stops a hung
+# llama-server of ours, and names any other program. Returns $true when the port is free or a model answers.
+function Clear-ModelPort {
+  if (-not (Test-Port 8080)) { return $true }
+  Write-Host '      Port 8080 is in use but no model answers yet. Waiting up to 90 seconds (a model may be loading)...'
+  for ($i = 0; $i -lt 45; $i++) {
+    if (Test-ModelUp) { return $true }
+    if (-not (Test-Port 8080)) { return $true }
+    Start-Sleep -Seconds 2
+  }
+  $owners = @()
+  try {
+    $owners = @(Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
+  } catch {
+  }
+  foreach ($procId in $owners) {
+    $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    if (-not $p) { continue }
+    $path = ''
+    try { $path = $p.Path } catch { }
+    if ($p.ProcessName -eq 'llama-server') {
+      Write-Host "      A llama-server (pid $procId) holds port 8080 but does not answer. Stopping it..."
+      Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    } else {
+      Write-Host "      Port 8080 is used by another program: $($p.ProcessName) (pid $procId) $path"
+      Write-Host '      Close that program (or change its port), then run the worker again.'
+      return $false
+    }
+  }
+  Start-Sleep -Seconds 3
+  return (-not (Test-Port 8080)) -or (Test-ModelUp)
+}
+
+# The last start failed in a way a fresh llama.cpp download fixes: a missing DLL (0xC0000135),
+# a damaged file, or a crash on load.
+function Test-BrokenInstall([int]$ExitCode) {
+  if ($ExitCode -in @(-1073741515, -1073741701, -1073741795, -1073741819)) { return $true }
+  foreach ($f in @($ErrLog, $Log)) {
+    if ((Test-Path -LiteralPath $f) -and (Select-String -LiteralPath $f -Pattern 'cannot open shared object|LoadLibrary|failed to load .*\.dll|ggml_backend_load|is not a valid Win32' -Quiet)) { return $true }
+  }
+  return $false
+}
 
 # Returns $true when a model answers on 127.0.0.1:8080.
 function Invoke-ModelSetup {
   # -------------------------------------------------------------- 2. model
+  if (-not (Test-ModelUp) -and -not (Clear-ModelPort)) { return $false }
   if (Test-ModelUp) {
     Write-Host '[2/5] A model is already answering on 127.0.0.1:8080. Using it.'
   } else {
@@ -476,6 +526,22 @@ function Invoke-ModelSetup {
       Write-Host '      Not enough GPU memory for the whole model. Retrying with part of it on the GPU (-ngl 24)...'
       $script:LlamaNgl = 24
       $script:LlamaProc = Start-Model $server 24
+    }
+    if (-not $script:LlamaProc -and $script:LastBlocked) {
+      Write-Host '      Windows Smart App Control blocked llama-server.exe. Allow it in Windows Security'
+      Write-Host '      (App & browser control > Protection history), then run the worker again.'
+      return $false
+    }
+    if (-not $script:LlamaProc -and -not $script:LastOom -and -not $script:Redownloaded -and (Test-BrokenInstall $script:LastExit)) {
+      $script:Redownloaded = $true
+      # A damaged or incomplete llama.cpp folder: download it again once.
+      Write-Host '      The llama.cpp files look damaged or incomplete. Downloading llama.cpp again...'
+      Remove-Item -LiteralPath $LlamaDir -Recurse -Force -ErrorAction SilentlyContinue
+      if (Test-Path -LiteralPath $LlamaDir) {
+        Write-Host "      $LlamaDir could not be removed (a llama-server may still run). Close it and run again."
+        return $false
+      }
+      return (Invoke-ModelSetup)
     }
     if (-not $script:LlamaProc) {
       Write-Host 'The model could not be started. See the log above.'
