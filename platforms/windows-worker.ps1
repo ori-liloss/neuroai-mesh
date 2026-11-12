@@ -312,6 +312,9 @@ function Start-Model([string]$Server, [int]$Ngl) {
       Show-LogTail
       $script:LastOom = Test-OutOfMemory
       $script:LastExit = [int]$proc.ExitCode
+      # 0xC0E90002 (STATUS_SYSTEM_INTEGRITY_POLICY_VIOLATION): Smart App Control / WDAC refused one of
+      # llama.cpp's unsigned DLLs while llama-server loaded it (seen on the 3050 laptop).
+      if ($script:LastExit -eq -1058471934) { $script:LastBlocked = $true }
       return $null
     }
     if ($waited -ge 240) {
