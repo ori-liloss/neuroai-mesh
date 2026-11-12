@@ -6437,6 +6437,13 @@ def slot_kinds(slot: str) -> list[str]:
     return [kind for kind in worker_kinds() if (kind == "generate") == gen]
 
 
+# The most generate tokens this worker asks for. Starts at GENERATE_MAX_TOKENS and drops by 1024
+# each time the local llama-server says its context is full (a laptop whose parallel slots share
+# 16k of context cannot finish four 4096-token replies at once).
+_gen_cap = {"tokens": GENERATE_MAX_TOKENS}
+CONTEXT_FULL = re.compile(r"context size has been exceeded|exceeds the available context|context is full|n_ctx", re.IGNORECASE)
+
+
 def _slot_pause(slot: str, why: str) -> None:
     with _job_lock:
         if why:
@@ -6459,7 +6466,7 @@ def slot_once(slot: str, base: str, node: str, post=_mesh_post, run=run_job, sle
     _slot_pause(slot, busy)
     if not kinds or busy:
         return 15.0
-    body = {"node": node, "slot": slot, "kinds": kinds, "gen_max": GENERATE_MAX_TOKENS,
+    body = {"node": node, "slot": slot, "kinds": kinds, "gen_max": _gen_cap["tokens"],
             "test_langs": sorted(sandbox_status()["langs"])}
     code, job = post(base, "/jobs/next", body, 10)
     with _job_lock:
@@ -6495,6 +6502,14 @@ def slot_once(slot: str, base: str, node: str, post=_mesh_post, run=run_job, sle
             _job_held.discard(jid)
             _job_running.pop(slot, None)
     error = str(output.get("error") or "") if not ok and isinstance(output, dict) else ""
+    if gen and CONTEXT_FULL.search(error):
+        # The local model's context (shared by its parallel slots) cannot hold this long a reply:
+        # ask the main PC for shorter jobs from now on. The long ones go to computers that fit them.
+        with _job_lock:
+            before = _gen_cap["tokens"]
+            _gen_cap["tokens"] = max(LEGACY_GEN_MAX // 2, before - 1024)
+        if _gen_cap["tokens"] != before:
+            print(f"The local model ran out of context; asking for jobs up to {_gen_cap['tokens']} tokens now.", flush=True)
     if gen and error and TRANSIENT_MODEL_ERROR.search(error):
         # The model is overloaded or restarting: this slot rests, so the other slots finish and free
         # the model's memory (one fewer parallel reply), instead of failing job after job.

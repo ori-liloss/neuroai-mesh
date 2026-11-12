@@ -1451,7 +1451,8 @@ with tempfile.TemporaryDirectory() as tmp:
     gsrv.server_close()
     mesh._queue = None
 mesh_src = Path(mesh.__file__).read_text(encoding="utf-8")
-ok('"gen_max": GENERATE_MAX_TOKENS' in mesh_src, "the worker loop sends gen_max with each lease request")
+ok('"gen_max": _gen_cap["tokens"]' in mesh_src and '_gen_cap = {"tokens": GENERATE_MAX_TOKENS}' in mesh_src,
+   "the worker loop sends gen_max (starting at GENERATE_MAX_TOKENS) with each lease request")
 
 # --- luau lookup: NEURO_LUAU, then PATH, then the per-user folder -------------
 with tempfile.TemporaryDirectory() as tmp:
@@ -2523,10 +2524,22 @@ try:
     rest = mesh.slot_once("g0", "http://x", "node", post=reply,
                           run=lambda job: (False, {"error": "HTTP Error 500: context size exceeded"}), sleep=lambda s: None)
     quick = mesh.slot_once("g0", "http://x", "node", post=reply, run=lambda job: (True, {"text": "ok"}), sleep=lambda s: None)
+    asked = []
+    def asking(base, path, body, timeout):
+        if path == "/jobs/next":
+            asked.append(body["gen_max"])
+        return reply(base, path, body, timeout)
+    cap_before = mesh._gen_cap["tokens"]
+    full = lambda job: (False, {"error": "HTTP Error 500: {'code': 500, 'message': 'Context size has been exceeded.'}"})  # noqa: E731
+    mesh.slot_once("g0", "http://x", "node", post=asking, run=full, sleep=lambda s: None)
+    mesh.slot_once("g0", "http://x", "node", post=asking, run=lambda job: (True, {"text": "ok"}), sleep=lambda s: None)
 finally:
     for name, value in saved.items():
         setattr(mesh, name, value)
 ok(rest == 90.0 and quick == 1.0, f"a generate slot rests 90 s after the model could not answer ({rest}, {quick})")
+ok(cap_before == mesh.GENERATE_MAX_TOKENS and asked == [cap_before, cap_before - 1024],
+   f"a full model context lowers the tokens this worker asks for ({asked})")
+mesh._gen_cap["tokens"] = mesh.GENERATE_MAX_TOKENS
 ok(mesh.looping_answer("I will check it now. " * 60) and not mesh.looping_answer("\n".join(f"assert f({i}) == {i * i}" for i in range(40))),
    "looping_answer: a repeating reply yes, similar test lines no")
 
