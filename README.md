@@ -65,12 +65,14 @@ Both ports answer only loopback and private LAN addresses; Origin and Host are c
 | File | Role |
 | --- | --- |
 | `mesh.py` | `serve` (page and job queue, port 8780), `work` (worker, port 8781), `jobs` (queue CLI) |
-| `dashboard.html` | The page, one file, no external scripts |
+| `dashboard.html` | The page, one file (Three.js is served from `vendor/`) |
 | `agents.py` | Local coding agents (`neuro` in CMD) |
 | `side_train.py` | Small LoRA experiments on a side GPU |
 | `platforms/` | One-command workers for Mac, Linux, Steam Deck and Windows laptops |
 | `seeds/coding-v1.jsonl` | A ready set of coding prompts with verifiers |
 | `seeds/coding-v2-tested.jsonl` | Coding tasks whose answers include assert tests that are run (`verify_tests`) |
 | `seeds/luau-v2-tested.jsonl` | 398 plain-Luau tasks (OOP, coroutines, algorithms, parsing, typed Luau, game logic) whose answers end in `assert` tests run by `verify_luau` |
+| `seeds/make_math_seeds.py` | Makes math tasks with answers computed in Python (`verify_math`), including the math of reverse engineering; `seeds/math-v1.jsonl` is 1200 of them |
+| `tests/test_mesh.py` | The self-test: `python tests/test_mesh.py` (ephemeral ports on 127.0.0.1 only; never touches the real token or queue) |
 
 MIT license.

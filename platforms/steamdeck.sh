@@ -39,7 +39,8 @@ MODEL_SLOTS="${NEURO_MODEL_SLOTS:-2}"
 case "$MODEL_SLOTS" in 1|2|3|4|5|6|7|8) ;; *) MODEL_SLOTS=2 ;; esac
 MODEL_CTX=$((MODEL_SLOTS * 8192))
 
-model_up() { curl -s -m 2 http://127.0.0.1:8080/health >/dev/null 2>&1; }
+# -f: llama-server answers 503 while it is still loading, and that is not "up" yet.
+model_up() { curl -sf -m 2 http://127.0.0.1:8080/health >/dev/null 2>&1; }
 PID_FILE="$HOME/.neuro-llama.pid"
 
 start_model() {

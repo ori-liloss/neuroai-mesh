@@ -433,9 +433,12 @@ function Invoke-ModelSetup {
     }
 
     Write-Host "      Starting the model on 127.0.0.1:8080 (log: $ErrLog)..."
+    $script:LlamaServer = $server
+    $script:LlamaNgl = 99
     $script:LlamaProc = Start-Model $server 99
     if (-not $script:LlamaProc -and $script:LastOom) {
       Write-Host '      Not enough GPU memory for the whole model. Retrying with part of it on the GPU (-ngl 24)...'
+      $script:LlamaNgl = 24
       $script:LlamaProc = Start-Model $server 24
     }
     if (-not $script:LlamaProc) {
@@ -479,8 +482,36 @@ try {
   }
   Write-Host '      A pairing code (Pairing code: ### ###) appears in about 30 seconds.'
   Write-Host "      Approve it on the main PC's Neuro page. Keep the laptop plugged in. Ctrl+C stops everything."
-  & $PyExe @PyArgs -u mesh.py work
-  $exitCode = $LASTEXITCODE
+  $workerArgs = @($PyArgs) + @('-u', 'mesh.py', 'work')
+  $worker = Start-Process -FilePath $PyExe -ArgumentList $workerArgs -WorkingDirectory $RepoRoot -NoNewWindow -PassThru
+  $null = $worker.Handle  # keeps ExitCode readable after the process ends
+  # Watchdog for the model this script started: if it dies, or stops answering for 5 minutes,
+  # start it again, so the worker does not sit idle on "Connection refused".
+  $silent = 0
+  while (-not $worker.HasExited) {
+    Start-Sleep -Seconds 30
+    if ($worker.HasExited -or -not $script:LlamaProc) { continue }
+    if (Test-ModelUp) { $silent = 0; continue }
+    if (-not $script:LlamaProc.HasExited) {
+      $silent += 1
+      if ($silent -lt 10) { continue }
+      Write-Host "$(Get-Date -Format HH:mm:ss) The model stopped answering for 5 minutes. Restarting it..."
+      Stop-Process -Id $script:LlamaProc.Id -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 5
+    } else {
+      Write-Host "$(Get-Date -Format HH:mm:ss) The model stopped (exit $($script:LlamaProc.ExitCode)). Restarting it..."
+      Show-LogTail
+    }
+    $silent = 0
+    $again = Start-Model $script:LlamaServer $script:LlamaNgl
+    if ($again) {
+      $script:LlamaProc = $again
+      Write-Host '      The model is ready again.'
+    } else {
+      Write-Host '      The model did not come back. Trying again in 30 seconds.'
+    }
+  }
+  $exitCode = $worker.ExitCode
 } finally {
   if ($script:LlamaProc -and -not $script:LlamaProc.HasExited) {
     Write-Host 'Stopping the model this script started...'

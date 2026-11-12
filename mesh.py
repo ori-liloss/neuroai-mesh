@@ -3263,6 +3263,17 @@ MAX_ATTEMPTS = 3
 # verify_tests / cross_tests RUN model-written code, so they get one lease
 # retry at most (a worker that vanished) and never a second verdict.
 KIND_ATTEMPTS = {"verify_tests": 2, "cross_tests": 2}
+# A generate job that failed because the worker's model was briefly unable to answer (HTTP 500 when
+# parallel long replies filled the KV cache, a restart, a timeout) goes back to the queue instead of
+# being lost: 846 of the hardest jobs (long retries) were lost that way. At most MAX_ATTEMPTS leases.
+TRANSIENT_MODEL_ERROR = re.compile(
+    r"HTTP Error 50[0234]|HTTP 50[0234]|Connection refused|Errno 111|Errno 61|10061|RemoteDisconnected"
+    r"|timed out|TimeoutError|Connection reset|returned no text",
+    re.IGNORECASE,
+)
+# Verifiers whose answers were cut off at 2048 tokens most of the time (luau 37%, tests 22%): each
+# cut-off reply was thrown away and generated again from scratch. These start with room to finish.
+LONG_FROM_START = frozenset({"verify_luau", "verify_tests"})
 RATE_WINDOW = 3600  # seconds of finished jobs behind the rates and the ETA
 LEASE_SECONDS = {
     "generate": 900, "verify_luau": 180, "verify_python_syntax": 120, "verify_js": 180, "verify_ts": 240,
@@ -3751,6 +3762,8 @@ class JobQueue:
         self.children: dict[str, list[str]] = {}
         self.crossed: set[str] = set()
         self.agreement: dict[str, float | None] = {}
+        # Generate leases handed out per source since serve started (fair turns between seed files).
+        self.served: dict[str, int] = {}
 
     # -- file side ---------------------------------------------------------
     def _file_lock(self) -> int | None:
@@ -3978,6 +3991,10 @@ class JobQueue:
                 # One job per worker slot at a time: a worker that restarted
                 # gets the same job back instead of a second one.
                 return self._view(current)
+            # Checks go first come, first served. Generate jobs take turns by source (seed file):
+            # in plain queue order, 4800 math tasks waited a day behind 10000 others.
+            first_gen: dict[str, str] = {}
+            picked = ""
             for jid in self.order:
                 job = self.jobs[jid]
                 if job["state"] != "queued" or job["kind"] not in wanted:
@@ -3986,6 +4003,23 @@ class JobQueue:
                     continue
                 if job["kind"] in TEST_JOB_KINDS and langs is not None and job["payload"].get("lang") not in langs:
                     continue
+                if job["kind"] != "generate":
+                    picked = jid
+                    break
+                first_gen.setdefault(job_source(job["payload"]), jid)
+            if not picked and first_gen:
+                # Fewest leases so far wins; a tie goes to the source whose job is oldest (dict order).
+                source = min(first_gen, key=lambda name: self.served.get(name, 0))
+                self.served[source] = self.served.get(source, 0) + 1
+                picked = first_gen[source]
+            if picked:
+                jid = picked
+                job = self.jobs[jid]
+                payload = job["payload"]
+                spec = payload.get("verify") if isinstance(payload.get("verify"), dict) else {}
+                if (job["kind"] == "generate" and spec.get("kind") in LONG_FROM_START and allowed >= LONG_RETRY_TOKENS
+                        and int(payload.get("max_tokens") or 0) < LONG_RETRY_TOKENS):
+                    job["payload"] = {**payload, "max_tokens": LONG_RETRY_TOKENS, "long_retry": True}
                 job["state"] = "leased"
                 job["attempts"] += 1
                 job["node"] = node
@@ -4024,6 +4058,15 @@ class JobQueue:
                 self.results_path,
                 [{"id": jid, "kind": job["kind"], "parent": job["parent"], "node": node, "ok": ok, "passed": passed, "output": output, "at": int(now)}],
             )
+            if (job["kind"] == "generate" and not ok and job["attempts"] < MAX_ATTEMPTS
+                    and TRANSIENT_MODEL_ERROR.search(str(output.get("error") or ""))):
+                # The worker's model could not answer just then. Back to the queue, like an expired
+                # lease but at once; no finish event, so after a restart it is simply queued.
+                self.leases.pop(jid, None)
+                if self.by_node.get(held.get("key", node)) == jid:
+                    self.by_node.pop(held.get("key", node), None)
+                job["state"] = "queued"
+                return True, "the model could not answer; the job went back to the queue"
             event = {"op": "finish", "id": jid, "ok": ok, "passed": passed, "node": node, "at": int(now)}
             if job["kind"] == "cross_tests" and ok:
                 event["scores"] = {gid: row["agreement"] for gid, row in output["scores"].items()}
@@ -4415,6 +4458,15 @@ def job_skill(payload: dict) -> str:
     return "code" if kind in CODE_KINDS or kind == "verify_tests" else "general"
 
 
+def job_source(payload: dict) -> str:
+    """Where a generate job came from (its seed file), for fair turns between sources."""
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    source = meta.get("source")
+    if isinstance(source, str) and source.strip():
+        return source.strip()[:120]
+    return "verify:" + str((payload.get("verify") or {}).get("kind") or "none")
+
+
 def expand_samples(kind: str, raw: object) -> list[object]:
     """A generate row with "samples": N becomes N jobs that share a group id
     and differ by seed (and by a slightly warmer default temperature)."""
@@ -4680,8 +4732,13 @@ def job_generate(payload: dict) -> tuple[bool, dict]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with _DIRECT.open(request, timeout=GENERATE_TIMEOUT) as response:
-        reply = read_reply(response)
+    try:
+        with _DIRECT.open(request, timeout=GENERATE_TIMEOUT) as response:
+            reply = read_reply(response)
+    except urllib.error.HTTPError as exc:
+        # Keep llama-server's own reason ("context size exceeded", "out of memory" ...): a bare
+        # "HTTP Error 500" hid why 846 jobs failed.
+        return False, {"error": clip(f"HTTP Error {exc.code}: {error_detail(exc)}", 300)}
     choices = reply.get("choices") if isinstance(reply, dict) else None
     first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
     message = first.get("message") if isinstance(first.get("message"), dict) else {}
@@ -6437,6 +6494,12 @@ def slot_once(slot: str, base: str, node: str, post=_mesh_post, run=run_job, sle
         with _job_lock:
             _job_held.discard(jid)
             _job_running.pop(slot, None)
+    error = str(output.get("error") or "") if not ok and isinstance(output, dict) else ""
+    if gen and error and TRANSIENT_MODEL_ERROR.search(error):
+        # The model is overloaded or restarting: this slot rests, so the other slots finish and free
+        # the model's memory (one fewer parallel reply), instead of failing job after job.
+        _slot_pause(slot, "model busy, resting")
+        return 90.0
     return 1.0
 
 
