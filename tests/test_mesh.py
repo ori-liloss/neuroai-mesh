@@ -2314,6 +2314,18 @@ try:
         ok(mesh.machine_busy() == "training holds the GPU" and mesh.machine_busy(gpu=False) == "", "GPU lock pauses generate slots, not check slots")
     mesh.cpu_busy_pct = lambda: 90
     ok(mesh.machine_busy(gpu=False) == "CPU busy", "a busy CPU pauses check slots too")
+    saved_on_cpu = os.environ.pop("NEURO_MODEL_ON_CPU", None)
+    try:
+        mesh.lock_held = lambda path: False
+        ok(mesh.machine_busy() == "CPU busy", "a busy CPU pauses generate slots when the model is on a GPU")
+        os.environ["NEURO_MODEL_ON_CPU"] = "1"
+        ok(mesh.machine_busy() == "" and mesh.machine_busy(gpu=False) == "CPU busy",
+           "model on the CPU: its own load does not pause generate slots, check slots still pause")
+    finally:
+        os.environ.pop("NEURO_MODEL_ON_CPU", None)
+        if saved_on_cpu is not None:
+            os.environ["NEURO_MODEL_ON_CPU"] = saved_on_cpu
+        mesh.lock_held = lambda path: True
     mesh.cpu_busy_pct = lambda: 10
     mesh.ram_mib = lambda: {"free_mib": 500}
     ok(mesh.machine_busy(gpu=False) == "low memory", "low memory pauses check slots too")

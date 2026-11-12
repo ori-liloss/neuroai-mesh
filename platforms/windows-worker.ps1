@@ -11,9 +11,16 @@
 # Files go to %LOCALAPPDATA%\Neuro. Nothing is installed system-wide.
 # Ctrl+C stops the worker and the model this script started. If the window is closed instead,
 # the model keeps running and the next run reuses it.
+#   windows-worker.cmd -Cpu    runs the model on the processor only (no GPU), e.g. a laptop whose
+#                              built-in graphics is slower than its CPU cores
 # Windows PowerShell 5.1 compatible.
+param([switch]$Cpu)
 
 $ErrorActionPreference = 'Continue'
+if ($Cpu) {
+  # mesh.py reads this too: generate slots then ignore a busy CPU, which is the model itself.
+  $env:NEURO_MODEL_ON_CPU = '1'
+}
 $ProgressPreference = 'SilentlyContinue'
 try {
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -281,6 +288,9 @@ function Start-Model([string]$Server, [int]$Ngl) {
   $script:LastBlocked = $false
   $script:LastExit = 0
   $argLine = "-m `"$Model`" --host 127.0.0.1 --port 8080 -np $ModelSlots --kv-unified -c $ModelCtx --jinja -ngl $Ngl"
+  # CPU mode: -ngl 0 alone still lets llama.cpp send big prompt matmuls to a GPU; --device none keeps
+  # everything on the processor.
+  if ($Ngl -eq 0 -and $Cpu -and (Test-ServerFlag $Server '--device')) { $argLine += ' --device none' }
   # The whole model on the GPU: do not keep the file memory-mapped in RAM as well (it held ~3 GB of a
   # 16 GB laptop's RAM for nothing and left the worker paused on low memory).
   # Only on NVIDIA: on a laptop without one (Vulkan on a built-in GPU, or the CPU) the "GPU" memory is the
@@ -448,6 +458,12 @@ function Test-BrokenInstall([int]$ExitCode) {
 # Returns $true when a model answers on 127.0.0.1:8080.
 function Invoke-ModelSetup {
   # -------------------------------------------------------------- 2. model
+  if ($Cpu -and (Test-ModelUp) -and (Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue)) {
+    # A model left running from an earlier (GPU) run would be reused as is; CPU mode starts its own.
+    Write-Host '      CPU mode: stopping the llama-server that is already running, to start it on the processor.'
+    Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+  }
   if (-not (Test-ModelUp) -and -not (Clear-ModelPort)) { return $false }
   if (Test-ModelUp) {
     Write-Host '[2/5] A model is already answering on 127.0.0.1:8080. Using it.'
@@ -524,8 +540,9 @@ function Invoke-ModelSetup {
     Write-Host "      Starting the model on 127.0.0.1:8080 (log: $ErrLog)..."
     $script:LlamaServer = $server
     $script:LlamaNgl = 99
-    $script:LlamaProc = Start-Model $server 99
-    if (-not $script:LlamaProc -and $script:LastOom) {
+    if ($Cpu) { $script:LlamaNgl = 0; Write-Host '      CPU mode: the model runs on the processor only.' }
+    $script:LlamaProc = Start-Model $server $script:LlamaNgl
+    if (-not $script:LlamaProc -and $script:LastOom -and -not $Cpu) {
       Write-Host '      Not enough GPU memory for the whole model. Retrying with part of it on the GPU (-ngl 24)...'
       $script:LlamaNgl = 24
       $script:LlamaProc = Start-Model $server 24

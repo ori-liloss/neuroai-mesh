@@ -6387,8 +6387,12 @@ def machine_busy(gpu: bool = True) -> str:
     """Why this computer should not take another job now, or "". Asked
     before every lease. gpu=False (a check slot): the GPU lock does not
     matter, only generate pauses while training holds the GPU."""
+    # NEURO_MODEL_ON_CPU=1: the local model runs on the processor, so while it generates the CPU is
+    # busy with the very work a generate slot hands it. Only check slots (which start their own
+    # processes) pause for a busy CPU then; a generate request just waits in the model server's queue.
+    on_cpu = os.environ.get("NEURO_MODEL_ON_CPU", "").strip() == "1"
     pct = cpu_busy_pct()
-    if pct is not None and pct >= 75:
+    if pct is not None and pct >= 75 and not (gpu and on_cpu):
         return "CPU busy"
     # A generate slot only sends a request to the local model server, whose memory (weights and KV
     # cache) was allocated when it started: it needs little free RAM. A check slot starts a sandboxed
@@ -6401,7 +6405,6 @@ def machine_busy(gpu: bool = True) -> str:
     # NEURO_MODEL_ON_CPU=1: the local model server runs on the CPU only (llama-server -ngl 0), so a
     # training run on this computer's GPU does not stop it. This lets the training PC's idle CPU and
     # RAM generate data too.
-    on_cpu = os.environ.get("NEURO_MODEL_ON_CPU", "").strip() == "1"
     if gpu and not on_cpu and os.name == "nt" and lock_held(GPU_LOCK):
         return "training holds the GPU"
     return ""
