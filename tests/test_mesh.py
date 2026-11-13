@@ -2555,6 +2555,124 @@ mesh._gen_cap["tokens"] = mesh.GENERATE_MAX_TOKENS
 ok(mesh.looping_answer("I will check it now. " * 60) and not mesh.looping_answer("\n".join(f"assert f({i}) == {i * i}" for i in range(40))),
    "looping_answer: a repeating reply yes, similar test lines no")
 
+# Signals page: every number against a hand count.
+NOW = 1_800_000_450.0          # 450 s into a 900 s bucket: the last bucket is half full
+W = 21600                      # 6 h window, 900 s buckets
+def res(at, node, kind="generate", ok_=True, tokens=0, cut=False, error=""):
+    out = {"usage": {"completion_tokens": tokens}} if ok_ and kind == "generate" else {}
+    if cut:
+        out["finish_reason"] = "length"
+    if error:
+        out["error"] = error
+    return {"id": f"r{at}{node}", "kind": kind, "node": node, "ok": ok_, "output": out, "at": at}
+last = int(NOW // 900 * 900)     # start of the last (half-full) bucket
+prev = last - 900                # a full bucket
+results = [
+    res(prev + 10, "mac", tokens=3000), res(prev + 20, "mac", tokens=1500, cut=True),
+    res(prev + 30, "deck", tokens=900), res(prev + 40, "deck", ok_=False, error="HTTP Error 500: context size exceeded"),
+    res(prev + 50, "deck", ok_=False, error="bad output"), res(prev + 60, "mac", kind="verify_luau"),
+    res(last + 10, "mac", tokens=1800), res(last + 20, "mac", kind="verify_math", ok_=False),
+    res(NOW - W - 5, "mac", tokens=99999),   # before the window: never counted
+]
+kind_of = {"g1": "generate", "g2": "generate", "c1": "verify_luau", "c2": "verify_math"}
+events = [
+    {"op": "add", "id": "g9", "kind": "generate", "payload": {}, "at": prev + 5},
+    {"op": "finish", "id": "g1", "ok": True, "at": prev + 10},
+    {"op": "finish", "id": "g1", "ok": True, "at": prev + 11},       # a second finish of the same job: ignored
+    {"op": "add", "id": "c1", "kind": "verify_luau", "payload": {}, "at": prev + 12},
+    {"op": "finish", "id": "c1", "ok": True, "at": last + 5},
+    {"op": "finish", "id": "g2", "ok": False, "node": "", "at": last + 6},   # lease expired
+]
+machines = [
+    {"key": "mac", "name": "Mac", "ok": True, "caps": {"local_model": True, "free_ram_mib": 8000, "jobs": {"running": [], "slots": {"generate": {"total": 2}}}}},
+    {"key": "pi", "name": "Pi", "ok": False, "caps": {}},
+    {"key": "laptop", "name": "Laptop", "ok": True, "caps": {"local_model": False, "free_ram_mib": 300, "jobs": {"running": [], "paused": "low memory", "slots": {"generate": {"total": 0}}}}},
+]
+sig = mesh.signals_compute(results, events, kind_of, {"generate": 10, "checks": 3}, NOW, W, machines, {"running": True, "state": "running"})
+s = sig["series"]
+ok(len(s["buckets"]) == 25 and s["buckets"][-1] == last and s["covered_s"][-1] == 450.0 and s["covered_s"][-2] == 900.0,
+   f"signals: 25 buckets of 900 s, the last one covers only the 450 s so far ({len(s['buckets'])}, {s['covered_s'][-2:]})")
+first_cover = s["covered_s"][0]
+ok(abs(sum(s["covered_s"]) - W) < 1.5, f"signals: the buckets cover exactly the window ({sum(s['covered_s'])} of {W} s, first {first_cover})")
+ok(s["counts"]["gen_ok"][-2] == 3 and s["counts"]["gen_retry"][-2] == 1 and s["counts"]["gen_failed"][-2] == 1
+   and s["counts"]["gen_cut"][-2] == 1 and s["counts"]["gen_tokens"][-2] == 5400,
+   "signals: a full bucket counts 3 answers, 1 retry, 1 failure, 1 cut off, 5400 tokens")
+ok(s["gen_per_hour"][-2] == 12.0 and s["gen_per_hour"][-1] == 8.0,
+   f"signals: answers per hour divide by the seconds covered (3 in 900 s = 12/h, 1 in 450 s = 8/h; {s['gen_per_hour'][-2:]})")
+ok(s["tokens_per_s"][-2] == 6.0 and s["tokens_per_s"][-1] == 4.0, f"signals: tokens/s = 5400/900 and 1800/450 ({s['tokens_per_s'][-2:]})")
+ok(s["tokens_per_job"][-2] == 1800 and s["failed_pct"][-2] == 40.0 and s["cut_pct"][-2] == 33.3,
+   f"signals: 1800 tokens a job, 2 of 5 attempts failed (40%), 1 of 3 cut off ({s['tokens_per_job'][-2]}, {s['failed_pct'][-2]}, {s['cut_pct'][-2]})")
+ok(s["checks_per_hour"][-2] == 4.0 and s["checks_per_hour"][-1] == 8.0, f"signals: checks per hour ({s['checks_per_hour'][-2:]})")
+ok(all(mesh.TRANSIENT_MODEL_ERROR.search(e) for e in (
+       "ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host",
+       "ConnectionAbortedError: [WinError 10053] An established connection was aborted",
+       "URLError: <urlopen error [WinError 10061] No connection could be made",
+       "ConnectionResetError: [Errno 104] Connection reset by peer"))
+   and not mesh.TRANSIENT_MODEL_ERROR.search("The model returned an empty reply format"),
+   "a dropped connection to the model (Windows and Linux spellings) is a retry, not a failure")
+ok(s["silent"][-3] and s["tokens_per_s"][-3] is None and s["gen_per_hour"][-3] is None
+   and sig["series"]["node_tokens_per_s"]["mac"][-3] is None and sig["series"]["node_tokens_per_s"]["deck"][-1] == 0.0,
+   "signals: a slice where no computer finished anything has no rate (a gap), a quiet computer in a busy slice has 0")
+ok(s["open_generate"][-1] == 10 and s["open_checks"][-1] == 3, "signals: the last point of open jobs is the exact number open now")
+# Walking back over the last bucket: c1 and g2 finished in it -> one more of each was open before it.
+ok(s["open_checks"][-2] == 4 and s["open_generate"][-2] == 11,
+   f"signals: open jobs at the end of the previous bucket add back what finished after it ({s['open_generate'][-2]}, {s['open_checks'][-2]})")
+# Before the previous bucket: g9 and c1 were added in it (one fewer open earlier), g1 finished once in it.
+ok(s["open_generate"][-3] == 11 and s["open_checks"][-3] == 3,
+   f"signals: adds in a bucket mean fewer open before it; a repeated finish counts once ({s['open_generate'][-3]}, {s['open_checks'][-3]})")
+mac = next(r for r in sig["nodes"] if r["node"] == "mac")
+deck = next(r for r in sig["nodes"] if r["node"] == "deck")
+# The hour starts at NOW-3600 but the first attempt is at prev+10: 2260 s with nothing from any
+# computer (over the 900 s gap rule), so the hour counts 3600 - 2260 = 1340 s.
+counted = 3600 - ((prev + 10) - (NOW - 3600))
+ok(sig["now"]["recent_s"] == round(counted) and sig["now"]["recent_left_out_s"] == round(3600 - counted),
+   f"signals: a stretch with no attempt from any computer is left out of the hour ({sig['now']['recent_s']} counted)")
+ok(mac["gen_done"] == 3 and mac["tokens_per_job"] == 2100 and mac["tokens_per_s"] == round(6300 / counted, 2) and mac["checks"] == 2,
+   f"signals: Mac's last hour: 3 answers, 6300 tokens over the counted seconds ({mac})")
+ok(deck["gen_done"] == 1 and deck["gen_retry"] == 1 and deck["gen_failed"] == 1 and deck["failed_pct"] == 66.7,
+   f"signals: Deck's last hour counts the retry as a failed attempt ({deck})")
+ok(sig["now"]["tokens_per_s"] == round(7200 / counted, 2) and sig["now"]["tokens_per_job"] == 1800 and sig["now"]["gen_done"] == 4,
+   f"signals: the last hour across machines ({sig['now']})")
+pace = sig["now"]["paces"][0]
+ok(pace["window_s"] == 3600 and pace["done"] == 4 and pace["counted_s"] == round(counted) and pace["eta_s"] == int(10 * counted / 4),
+   f"signals: 10 open answers at 4 per {counted:.0f} counted seconds ({pace})")
+busy = [res(NOW - 3600 + i * 300, "pc", tokens=600) for i in range(12)]
+busy_sig = mesh.signals_compute(busy, [], {}, {"generate": 6}, NOW, W, [], None)
+ok(busy_sig["now"]["recent_s"] == 3600 and busy_sig["now"]["tokens_per_s"] == 2.0 and busy_sig["now"]["paces"][0]["eta_s"] == 1800,
+   f"signals: with no gap the hour is the full 3600 s (7200 tokens = 2.0 tok/s, 6 left at 12/h = 30 min) ({busy_sig['now']})")
+ok(mesh.active_seconds([100, 200, 1500, 1600], 0, 2000) == (2000 - 1300, 1300) and mesh.active_seconds([], 0, 600) == (600, 0),
+   "active_seconds: only gaps over 15 min are left out")
+titles = [x["title"] for x in sig["signals"]]
+ok(sig["signals"][0]["level"] == "bad" and "Pi does not answer" in titles and "Laptop has no model" in titles
+   and "Laptop is low on memory" in titles and "Laptop is pausing new jobs" in titles,
+   f"signals: offline, no model, low memory and paused are raised, worst first ({titles})")
+ok(not any(x["level"] == "good" for x in sig["signals"]), "signals: no 'everything is working' line next to warnings")
+calm = mesh.signals_compute([], [], {}, {"generate": 0, "checks": 0}, NOW, 3600, [], None)
+ok(calm["signals"][0]["level"] == "good" and abs(sum(calm["series"]["covered_s"]) - 3600) < 1.5
+   and any(x["title"] == "The generation queue is empty" for x in calm["signals"]),
+   f"signals: a quiet hour says everything works and that the queue is empty ({[x['title'] for x in calm['signals']]})")
+slow = [res(NOW - 3600 * 5 + i * 900 + 10, "oh", tokens=9000) for i in range(16)] + [res(last + 10, "oh", tokens=200)]
+slow_sig = mesh.signals_compute(slow, [], {}, {"generate": 5, "checks": 0}, NOW, W, [], None)
+ok(any(x["title"] == "oh is writing slowly" for x in slow_sig["signals"]),
+   f"signals: a machine far under its usual tokens/s is flagged ({[x['title'] for x in slow_sig['signals']]})")
+fails = [res(NOW - 600 + i, "bad", ok_=False, error="bad output") for i in range(3)] + [res(NOW - 500, "bad", tokens=100)]
+ok(any(x["title"] == "bad fails often" and x["level"] == "bad" for x in mesh.signals_compute(fails, [], {}, {"generate": 1}, NOW, W, [], None)["signals"]),
+   "signals: 3 of 4 failed attempts in the last hour is flagged")
+retries = [res(NOW - 600 + i, "slowpc", ok_=False, error="TimeoutError: timed out") for i in range(2)] + [res(NOW - 500 + i, "slowpc", tokens=100) for i in range(2)]
+retry_sig = mesh.signals_compute(retries, [], {}, {"generate": 1}, NOW, W, [], None)["signals"]
+ok(any(x["title"] == "slowpc often has to retry" and x["level"] == "warn" for x in retry_sig)
+   and not any(x["title"] == "slowpc fails often" for x in retry_sig),
+   f"signals: time-outs that went back to the queue are a warning, not a failure ({[x['title'] for x in retry_sig]})")
+log_path = Path(tempfile.mkdtemp()) / "log.jsonl"
+with open(log_path, "w", encoding="utf-8") as handle:
+    for i in range(5000):
+        handle.write(json.dumps({"at": 1000 + i, "pad": "x" * 400}) + "\n")
+tail = mesh.rows_since(log_path, 5900)
+ok(len(tail) == 100 and tail[0]["at"] == 5900 and tail[-1]["at"] == 5999,
+   f"rows_since: reads back only the rows at or after the time, in order ({len(tail)})")
+ok(len(mesh.rows_since(log_path, 0)) == 5000 and mesh.rows_since(log_path.with_name("missing.jsonl"), 0) == [],
+   "rows_since: the whole file when asked, nothing for a missing file")
+
 
 fake.shutdown()
 fake.server_close()

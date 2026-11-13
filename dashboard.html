@@ -429,6 +429,28 @@
     .trow .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 
+    /* ---------- signals ---------- */
+    .sig-list { display: flex; flex-direction: column; }
+    .sig { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; gap: 2px 12px; align-items: start; padding: 12px 0; border-top: 1px solid var(--line); }
+    .sig:first-child { border-top: 0; padding-top: 2px; }
+    .sig .ico { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font: 700 12px var(--display); color: #0B0B0B; margin-top: 1px; }
+    .sig b { font-weight: 600; }
+    .sig .lvl { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+    .sig .what { grid-column: 2 / -1; color: var(--ink); font-size: 13px; opacity: 0.9; }
+    .sig .rule { grid-column: 2 / -1; color: var(--faint); font-size: 12px; }
+    .sig.good .ico { background: #0CA30C; color: #FFFFFF; }
+    .sig.warn .ico { background: #FAB219; }
+    .sig.bad .ico { background: #D03B3B; color: #FFFFFF; }
+    .sig.info .ico { background: var(--raised); color: var(--ink); border: 1px solid var(--line); }
+    .t-sig .trow { grid-template-columns: minmax(120px, 1.4fr) repeat(6, minmax(64px, 0.7fr)) minmax(80px, 0.8fr); }
+    .t-sig .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; vertical-align: -1px; }
+    @media (max-width: 760px) {
+      .t-sig .trow { grid-template-columns: minmax(0, 1fr) auto; }
+      .t-sig .trow.head { display: none; }
+      .t-sig .trow .num { grid-column: 1 / -1; text-align: left; }
+      .t-sig .trow .num::before { content: attr(data-label) ": "; color: var(--faint); font-family: var(--sans); }
+    }
+
     /* ---------- models / share / chat ---------- */
     .model-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; gap: 4px 14px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
     .model-row:first-child { border-top: 0; }
@@ -515,6 +537,7 @@
         <button class="on" type="button" data-view="machines" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>Machines <span class="badge" id="nav-machines"></span></button>
         <button type="button" data-view="training"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h3l3-7 4 14 3-7h5"/></svg>Training <span class="badge" id="nav-training"></span></button>
         <button type="button" data-view="jobs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>Jobs <span class="badge" id="nav-jobs"></span></button>
+        <button type="button" data-view="signals"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l5-5 4 3 8-8"/><path d="M15 7h5v5"/></svg>Signals <span class="badge" id="nav-signals"></span></button>
         <button type="button" data-view="models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Models</button>
         <button type="button" data-view="try"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>Try</button>
         <button type="button" data-view="share"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>Share</button>
@@ -622,6 +645,102 @@
           <p class="note" id="jobs-total" style="margin-top:10px">–</p>
         </article>
         <p class="note">Add jobs on this PC with <code>python mesh.py jobs add generate-verify prompts.jsonl</code>, export with <code>python mesh.py jobs export verified.jsonl</code>.</p>
+      </section>
+
+      <section class="view" id="view-signals" hidden aria-labelledby="sig-title">
+        <div class="head">
+          <div>
+            <p class="eyebrow">Data factory &amp; training</p>
+            <h1 id="sig-title">Signals</h1>
+            <p class="lead">Exact numbers, counted from the raw job logs: <code>results.jsonl</code> has one line for every attempt a computer finished (with how many tokens its model wrote), <code>queue.jsonl</code> has every job added and every job finished. Nothing is estimated except the "empties in" time. Recomputed every 30 seconds; hover or tap a graph for the exact value of each time slice.</p>
+          </div>
+        </div>
+        <div class="section-title">
+          <div>
+            <h2>Signals right now</h2>
+            <p>Each line says what was noticed and, in grey, the exact rule that raised it.</p>
+          </div>
+          <div class="seg" role="group" aria-label="Time range" id="sig-range">
+            <button type="button" data-w="3600" aria-pressed="false">1 h</button>
+            <button type="button" data-w="21600" aria-pressed="true">6 h</button>
+            <button type="button" data-w="86400" aria-pressed="false">24 h</button>
+          </div>
+        </div>
+        <article class="card" aria-label="Signals">
+          <div class="sig-list" id="sig-list"><p class="empty">Loading the signals…</p></div>
+          <p class="note" id="sig-at"></p>
+        </article>
+        <div class="tiles">
+          <div class="tile"><p class="label"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3L4 14h7l-1 7 9-11h-7z"/></svg>Writing speed</p><b id="sig-tps">–</b><span>tokens a second, all computers, last hour</span></div>
+          <div class="tile t-teal"><p class="label"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12l5 5L20 7"/></svg>Answers written</p><b class="teal" id="sig-done">–</b><span id="sig-done-sub">last hour</span></div>
+          <div class="tile"><p class="label"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>Open jobs</p><b id="sig-open">–</b><span id="sig-open-sub">answers still to write</span></div>
+          <div class="tile t-teal"><p class="label"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>Queue empties in</p><b id="sig-eta">–</b><span id="sig-eta-sub">at the last hour's pace</span></div>
+          <div class="tile"><p class="label"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/></svg>Verified rows</p><b class="amber" id="sig-rows">–</b><span>passed a check, ready to train on</span></div>
+        </div>
+
+        <div class="section-title">
+          <div>
+            <h2>Over time</h2>
+            <p id="sig-bucket-note">Each point is one time slice. The last slice is still filling: its rate is divided by the seconds it really covers, not by the full slice.</p>
+          </div>
+        </div>
+        <div class="charts">
+          <article class="card chart-card span2" aria-label="Tokens per second by computer">
+            <div class="ch-head">
+              <div>
+                <h2><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l5-5 4 3 8-8"/></svg>Writing speed by computer</h2>
+                <div class="legend" id="sig-node-legend" style="margin-top:6px"></div>
+              </div>
+              <div class="ch-now"><small>all, last hour</small><span id="sig-tps-now">–</span></div>
+            </div>
+            <div class="chart" id="sig-ch-nodes" role="img" aria-label="Output tokens per second for each computer over time"></div>
+            <p class="explain">How many tokens each computer's model wrote per second, as answers it finished. Counted as: the output tokens its model reported for every answer that finished in the slice, divided by the slice's seconds. This is the true speed of a computer: unlike "jobs per hour" it does not drop just because the answers got longer. A line falling to zero means that computer wrote nothing in that slice.</p>
+          </article>
+          <article class="card chart-card" aria-label="Finished jobs per hour">
+            <div class="ch-head">
+              <div>
+                <h2><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2"/></svg>Finished jobs per hour</h2>
+                <div class="legend" style="margin-top:6px"><span class="key"><i style="background:#3987e5"></i>answers written</span><span class="key"><i style="background:#d95926"></i>checks run</span></div>
+              </div>
+            </div>
+            <div class="chart" id="sig-ch-jobs" role="img" aria-label="Answers written and checks run per hour over time"></div>
+            <p class="explain">Two kinds of job, kept apart because they are not comparable: writing one answer takes minutes, one check takes seconds. Answers = successful generate attempts; checks = every finished check (Luau, Python, math, tests…). Rate = count in the slice × 3600 ÷ seconds in the slice.</p>
+          </article>
+          <article class="card chart-card" aria-label="Average answer length">
+            <div class="ch-head">
+              <h2><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h13"/></svg>Average answer length</h2>
+              <div class="ch-now"><small>last hour</small><span id="sig-tpj-now">–</span></div>
+            </div>
+            <div class="chart" id="sig-ch-tpj" role="img" aria-label="Average tokens per answer over time"></div>
+            <p class="explain">Tokens in an average finished answer: all output tokens of the slice ÷ the answers that finished in it. When this rises, each answer takes longer, so fewer answers finish per hour even though the computers are just as fast. That is why the number of jobs alone can look like a slowdown.</p>
+          </article>
+          <article class="card chart-card" aria-label="Failed and cut-off answers">
+            <div class="ch-head">
+              <div>
+                <h2><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/></svg>Failed and cut-off answers</h2>
+                <div class="legend" style="margin-top:6px"><span class="key"><i style="background:#3987e5"></i>failed attempts</span><span class="key"><i style="background:#d95926"></i>cut off at the length limit</span></div>
+              </div>
+            </div>
+            <div class="chart" id="sig-ch-fail" role="img" aria-label="Share of failed and cut-off generation attempts over time"></div>
+            <p class="explain">Failed attempts = generate attempts that did not return an answer ÷ all generate attempts in the slice; this includes time-outs that went back to the queue (nothing lost, but time was). Cut off = answers the model stopped because they reached the token limit ÷ answers in the slice; a cut-off answer is retried once with more room and never trained on.</p>
+          </article>
+          <article class="card chart-card" aria-label="Open jobs over time">
+            <div class="ch-head">
+              <div>
+                <h2><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>Open jobs</h2>
+                <div class="legend" style="margin-top:6px"><span class="key"><i style="background:#3987e5"></i>answers to write</span><span class="key"><i style="background:#d95926"></i>checks waiting</span></div>
+              </div>
+            </div>
+            <div class="chart" id="sig-ch-open" role="img" aria-label="Open generate jobs and open checks over time"></div>
+            <p class="explain">Jobs queued or running at the end of each slice. The last point is the exact number open now; earlier points are walked back from it through the log: every job added after that moment was not there yet, every job finished after it was still open. A falling line is the queue being worked off; a jump up is new jobs added.</p>
+          </article>
+        </div>
+
+        <article class="card">
+          <div class="card-head"><h2>Computers in the last hour</h2><p class="note">counted from their finished attempts</p></div>
+          <div class="table t-sig" id="sig-nodes"></div>
+          <p class="explain" style="margin-top:12px">Tokens/s = output tokens of its finished answers in the last hour ÷ the seconds of that hour that count (a stretch of over 15 minutes in which no computer reported anything, like the main PC being off, is left out, because nothing could be recorded then). Avg length = those tokens ÷ its answers. Failed = attempts that ended with no answer for good. Retries = attempts where the model timed out or the connection to it dropped: those jobs went back to the queue, so nothing was lost. Last = time since it finished anything. A computer that finished nothing in this window is not listed.</p>
+        </article>
       </section>
 
       <section class="view" id="view-training" hidden aria-labelledby="train-h1">
@@ -2155,7 +2274,8 @@ function chart(host, cfg) {
     if (r.label) svg.append(svgEl("text", { class: "ref-label", x: W - R - 4, y: (y - 5).toFixed(1), "text-anchor": "end", fill: r.color || "#8D97AD" }, r.label));
   }
   series.forEach((s, i) => {
-    const d = s.pts.map(([x, y], j) => (j ? "L" : "M") + sx(x).toFixed(1) + " " + sy(y).toFixed(1)).join(" ");
+    // s.gap: points further apart than this on x start a new piece of line (no data in between).
+    const d = s.pts.map(([x, y], j) => (j && !(s.gap && x - s.pts[j - 1][0] > s.gap) ? "L" : "M") + sx(x).toFixed(1) + " " + sy(y).toFixed(1)).join(" ");
     if (s.area && s.pts.length > 1) {
       const gid = host._id + "-a" + i;
       const grad = svgEl("linearGradient", { id: gid, x1: 0, y1: 0, x2: 0, y2: 1 });
@@ -2194,7 +2314,7 @@ function chartHover(host, event) {
   if (!ref) return;
   const rx = m.sx(ref[0]);
   m.hover.append(svgEl("line", { class: "xhair", x1: rx.toFixed(1), x2: rx.toFixed(1), y1: m.T, y2: m.H - m.B }));
-  tip.replaceChildren(el("div", "tx", m.xFmt(ref[0]) + (host._cfg.xKind === "step" || !host._cfg.xKind ? " · step" : "")));
+  tip.replaceChildren(el("div", "tx", host._cfg.tipX ? host._cfg.tipX(ref[0]) : m.xFmt(ref[0]) + (host._cfg.xKind === "step" || !host._cfg.xKind ? " · step" : "")));
   for (const s of m.series) {
     const p = s.pts[nearestIndex(s.pts, ref[0])];
     if (Math.abs(m.sx(p[0]) - rx) > 36) continue;
@@ -2431,6 +2551,197 @@ document.querySelectorAll("#tele-range button").forEach((button) => {
     try { localStorage.setItem("neuro-tele-window", String(teleWindow)); } catch (error) {}
     drawTelemetry();
     refreshTelemetry();
+  };
+});
+
+// ---------- signals ----------
+// Machine colors: the validated dark categorical palette (dataviz reference, checked against the
+// #0E1422 surface: lightness band, contrast, normal-vision and color-blind separation all pass).
+// A computer keeps its color: the order is every computer that ever finished a job, by name.
+const SIG_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#9085e9"];
+const SIG_A = "#3987e5", SIG_B = "#d95926";
+let sigWindow = 21600;
+try { const saved = Number(localStorage.getItem("neuro-sig-window")); if ([3600, 21600, 86400].includes(saved)) sigWindow = saved; } catch (error) {}
+let signals = null;
+let sigBusy = false;
+function sigNodeColor(name) {
+  const order = (signals && Array.isArray(signals.all_nodes) ? signals.all_nodes : []);
+  const i = order.indexOf(name);
+  return i >= 0 && i < SIG_COLORS.length ? SIG_COLORS[i] : "#8D97AD";
+}
+function sigPoints(list, edges, covered) {
+  // One point per slice, at its middle; slices with no value (no answers in it) get no point.
+  const out = [];
+  (list || []).forEach((v, i) => {
+    if (v == null || !Number.isFinite(Number(v))) return;
+    out.push([edges[i] + (covered[i] || 0) / 2, Number(v)]);
+  });
+  return out;
+}
+function sigSliceLabel(edges, size) {
+  return (x) => {
+    let start = edges[0];
+    for (const e of edges) if (e <= x) start = e;
+    const end = Math.min(start + size, Date.now() / 1000);
+    return fmtClock(start) + "–" + fmtClock(end) + (end - start < size - 1 ? " (so far)" : "");
+  };
+}
+function sigLevelLabel(level) {
+  return { good: "OK", warn: "Warning", bad: "Problem", info: "Note" }[level] || "Note";
+}
+function drawSignals() {
+  document.querySelectorAll("#sig-range button").forEach((b) => b.setAttribute("aria-pressed", Number(b.dataset.w) === sigWindow ? "true" : "false"));
+  const box = document.getElementById("sig-list");
+  const sg = signals;
+  if (!sg || sg.error || !sg.series) {
+    box.replaceChildren(el("p", "empty", sg && sg.missing ? "This page needs the dashboard server to restart with this version." : sg && sg.error ? String(sg.error) : "Loading the signals…"));
+    return;
+  }
+  // Signal lines: icon + level word + title, then what and the rule (never color alone).
+  box.replaceChildren();
+  const icons = { good: "✓", warn: "!", bad: "×", info: "i" };
+  for (const s of sg.signals || []) {
+    const row = el("div", "sig " + (s.level || "info"));
+    const ico = el("span", "ico", icons[s.level] || "i");
+    ico.setAttribute("aria-hidden", "true");
+    row.append(ico, el("b", "", s.title || ""), el("span", "lvl", sigLevelLabel(s.level)), el("span", "what", s.detail || ""), el("span", "rule", "Rule: " + (s.rule || "")));
+    box.append(row);
+  }
+  const worst = (sg.signals || []).filter((s) => s.level === "bad" || s.level === "warn").length;
+  text("nav-signals", worst ? String(worst) : "");
+  text("sig-at", "Computed at " + fmtClock(sg.at) + " from " + num((sg.series.counts.gen_ok || []).reduce((a, b) => a + b, 0) + (sg.series.counts.gen_failed || []).reduce((a, b) => a + b, 0) + (sg.series.counts.gen_retry || []).reduce((a, b) => a + b, 0) + (sg.series.counts.checks_ok || []).reduce((a, b) => a + b, 0) + (sg.series.counts.checks_failed || []).reduce((a, b) => a + b, 0)) + " finished attempts in the last " + fmtSpan(sg.window_s) + ".");
+
+  // Tiles: the last hour.
+  const nw = sg.now || {};
+  text("sig-tps", nw.tokens_per_s != null ? Number(nw.tokens_per_s).toFixed(1) : "–");
+  text("sig-done", nw.gen_done != null ? num(nw.gen_done) : "–");
+  text("sig-done-sub", "last hour" + (nw.tokens_per_job ? " · " + num(nw.tokens_per_job) + " tokens each on average" : "") + (nw.checks ? " · plus " + num(nw.checks) + " checks" : ""));
+  text("sig-open", nw.open_generate != null ? num(nw.open_generate) : "–");
+  text("sig-open-sub", "answers still to write" + (nw.open_checks ? " · " + num(nw.open_checks) + " checks waiting" : ""));
+  const paces = Array.isArray(nw.paces) ? nw.paces : [];
+  const p1 = paces[0], p3 = paces[1];
+  text("sig-eta", !nw.open_generate ? "empty" : p1 && p1.eta_s != null ? duration(p1.eta_s) : "no pace yet");
+  text("sig-eta-sub", !nw.open_generate ? "no answers left to write" :
+    (p1 ? "at the last hour's pace (" + num(p1.per_hour) + " answers/h)" : "") + (p3 && p3.window_s > (p1 ? p1.window_s : 0) ? (p3.eta_s != null ? " · at the " + fmtSpan(p3.window_s) + " pace (" + num(p3.per_hour) + "/h): " + duration(p3.eta_s) : "") : "") + ". Estimate: assumes the pace stays the same.");
+  const leftOut = Number(nw.recent_left_out_s || 0);
+  if (leftOut > 0) {
+    const at = document.getElementById("sig-at");
+    at.textContent += " Left out of the last hour's rates: " + fmtSpan(leftOut) + " in which no computer reported anything (the main PC was off or restarting).";
+  }
+  text("sig-rows", sg.verified_rows != null ? num(sg.verified_rows) : "–");
+  text("sig-tps-now", nw.tokens_per_s != null ? Number(nw.tokens_per_s).toFixed(1) + " tok/s" : "–");
+  text("sig-tpj-now", nw.tokens_per_job ? num(nw.tokens_per_job) + " tokens" : "–");
+
+  // Charts.
+  const s = sg.series;
+  const edges = s.buckets || [], covered = s.covered_s || [];
+  const size = s.bucket_s || 900;
+  text("sig-bucket-note", "Each point is one slice of " + fmtSpan(size) + ". The last slice is still filling: its rate is divided by the seconds it really covers so far, not by the full slice.");
+  const base = { xKind: "time", tipX: sigSliceLabel(edges, size), xMin: edges.length ? edges[0] : null, xMax: Date.now() / 1000, height: 220 };
+  const names = Object.keys(s.node_tokens_per_s || {}).sort();
+  const legend = document.getElementById("sig-node-legend");
+  legend.replaceChildren();
+  for (const name of names) {
+    const key = el("span", "key");
+    const sw = el("i");
+    sw.style.background = sigNodeColor(name);
+    key.append(sw, document.createTextNode(name));
+    legend.append(key);
+  }
+  const tokFmt = (v) => v.toFixed(v >= 10 ? 0 : 1);
+  chart(document.getElementById("sig-ch-nodes"), Object.assign({}, base, {
+    unit: "tokens / second", yMin: 0, yFmt: tokFmt, height: 250,
+    empty: "No answers finished in this window yet.",
+    series: names.map((name) => ({ name, color: sigNodeColor(name), pts: sigPoints(s.node_tokens_per_s[name], edges, covered), width: 2, dots: true, gap: size * 1.6, fmt: (v) => v.toFixed(1) + " tok/s" })),
+  }));
+  const perHour = (v) => (v >= 100 ? Math.round(v) : v.toFixed(1)) + "/h";
+  chart(document.getElementById("sig-ch-jobs"), Object.assign({}, base, {
+    unit: "per hour", yMin: 0, yFmt: (v) => shortNum(Math.round(v)),
+    empty: "No finished jobs in this window yet.",
+    series: [
+      { name: "answers written", color: SIG_A, pts: sigPoints(s.gen_per_hour, edges, covered), width: 2, dots: true, gap: size * 1.6, fmt: perHour },
+      { name: "checks run", color: SIG_B, pts: sigPoints(s.checks_per_hour, edges, covered), width: 2, dots: true, gap: size * 1.6, fmt: perHour },
+    ],
+  }));
+  chart(document.getElementById("sig-ch-tpj"), Object.assign({}, base, {
+    unit: "tokens per answer", yMin: 0, yFmt: (v) => shortNum(Math.round(v)),
+    empty: "No answers finished in this window yet.",
+    series: [{ name: "average answer", color: SIG_A, pts: sigPoints(s.tokens_per_job, edges, covered), width: 2, dots: true, gap: size * 1.6, fmt: (v) => num(Math.round(v)) + " tokens" }],
+  }));
+  const pct = (v) => Math.round(v) + "%";
+  chart(document.getElementById("sig-ch-fail"), Object.assign({}, base, {
+    unit: "% of attempts", yMin: 0, yMax: 100, yFmt: pct,
+    empty: "No generate attempts in this window yet.",
+    series: [
+      { name: "failed attempts", color: SIG_A, pts: sigPoints(s.failed_pct, edges, covered), width: 2, dots: true, gap: size * 1.6, fmt: (v) => v.toFixed(1) + "%" },
+      { name: "cut off", color: SIG_B, pts: sigPoints(s.cut_pct, edges, covered), width: 2, dots: true, gap: size * 1.6, fmt: (v) => v.toFixed(1) + "%" },
+    ],
+  }));
+  // Open jobs are a level at the END of each slice: plotted at the slice's end.
+  const atEnd = (list) => (list || []).map((v, i) => [edges[i] + (covered[i] || 0), Number(v)]).filter((p) => Number.isFinite(p[1]));
+  chart(document.getElementById("sig-ch-open"), Object.assign({}, base, {
+    unit: "open jobs", yMin: 0, yFmt: (v) => shortNum(Math.round(v)), tipX: (x) => "at " + fmtClock(x),
+    empty: "No jobs in the queue.",
+    series: [
+      { name: "answers to write", color: SIG_A, pts: atEnd(s.open_generate), width: 2, last: true, fmt: (v) => num(Math.round(v)) },
+      { name: "checks waiting", color: SIG_B, pts: atEnd(s.open_checks), width: 2, last: true, fmt: (v) => num(Math.round(v)) },
+    ],
+  }));
+
+  // The table: the last hour per computer (also the accessible view of the speed graph).
+  const table = document.getElementById("sig-nodes");
+  table.replaceChildren();
+  const head = el("div", "trow head");
+  ["Computer", "Tokens/s", "Answers", "Avg length", "Failed", "Retries", "Checks", "Last"].forEach((h, i) => head.append(el("span", i ? "num" : "", h)));
+  table.append(head);
+  const rows = (sg.nodes || []).slice().sort((a, b) => (b.tokens_per_s || 0) - (a.tokens_per_s || 0) || a.node.localeCompare(b.node));
+  if (!rows.length) table.append(el("p", "empty", "No computer finished anything in this window."));
+  for (const r of rows) {
+    const row = el("div", "trow");
+    const name = el("span", "name");
+    const sw = el("i", "swatch");
+    sw.style.background = sigNodeColor(r.node);
+    name.append(sw, document.createTextNode(r.node));
+    const cell = (label, value) => { const c = el("span", "num", value); c.dataset.label = label; return c; };
+    row.append(
+      name,
+      cell("Tokens/s", Number(r.tokens_per_s || 0).toFixed(1)),
+      cell("Answers", num(r.gen_done)),
+      cell("Avg length", r.tokens_per_job ? num(r.tokens_per_job) : "–"),
+      cell("Failed", num(r.gen_failed)),
+      cell("Retries", num(r.gen_retry)),
+      cell("Checks", num(r.checks) + (r.checks_failed ? " (" + num(r.checks_failed) + " failed)" : "")),
+      cell("Last", r.last_s == null ? "–" : r.last_s < 90 ? r.last_s + " s ago" : fmtSpan(r.last_s) + " ago"),
+    );
+    table.append(row);
+  }
+}
+async function refreshSignals() {
+  if (sigBusy) return;
+  sigBusy = true;
+  try {
+    const response = await fetch("/api/signals?window=" + sigWindow, { cache: "no-store" });
+    if (response.status === 404) signals = { missing: true };
+    else if (response.ok) {
+      const body = await readJsonLimited(response, 2000000);
+      signals = body && typeof body === "object" && body.series ? body : { error: "The signals reply was not readable." };
+    } else {
+      const body = await response.json().catch(() => null);
+      signals = signals && signals.series ? signals : { error: (body && body.error) || "The signals could not be read." };
+    }
+  } catch (error) {
+    signals = signals && signals.series ? signals : { error: "The signals could not be read." };
+  } finally {
+    sigBusy = false;
+  }
+  drawSignals();
+}
+document.querySelectorAll("#sig-range button").forEach((button) => {
+  button.onclick = () => {
+    sigWindow = Number(button.dataset.w) || 21600;
+    try { localStorage.setItem("neuro-sig-window", String(sigWindow)); } catch (error) {}
+    drawSignals();
+    refreshSignals();
   };
 });
 
@@ -2882,7 +3193,7 @@ function drawShare(list) {
 let currentView = "machines";
 function show(view) {
   currentView = view;
-  for (const name of ["machines", "models", "try", "share", "training", "jobs"]) document.getElementById("view-" + name).hidden = name !== view;
+  for (const name of ["machines", "models", "try", "share", "training", "jobs", "signals"]) document.getElementById("view-" + name).hidden = name !== view;
   document.querySelectorAll("nav button").forEach((button) => {
     const on = button.dataset.view === view;
     button.classList.toggle("on", on);
@@ -2894,6 +3205,10 @@ function show(view) {
   if (view === "training") {
     document.querySelectorAll("#view-training .chart").forEach((host) => { if (host._pending) chart(host, host._pending); });
     refreshTelemetry();
+  }
+  if (view === "signals") {
+    document.querySelectorAll("#view-signals .chart").forEach((host) => { if (host._pending) chart(host, host._pending); });
+    refreshSignals();
   }
 }
 document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => show(button.dataset.view); });
@@ -3079,6 +3394,12 @@ setInterval(() => {
   if (currentView === "training" && !document.hidden) refreshTelemetry();
 }, 15000);
 if (currentView === "training") refreshTelemetry();
+// Signals: the server recomputes at most every 20 s; the page asks every 30 s while it is shown.
+setInterval(() => {
+  if (signals && signals.missing) return;
+  if (currentView === "signals" && !document.hidden) refreshSignals();
+}, 30000);
+if (currentView === "signals") refreshSignals();
 // Pairing requests. Only the page open on the main PC itself gets the list
 // (the server answers 403 elsewhere), so the card stays hidden on other
 // computers. Everything is rendered with textContent.

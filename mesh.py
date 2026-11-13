@@ -3268,7 +3268,9 @@ KIND_ATTEMPTS = {"verify_tests": 2, "cross_tests": 2}
 # being lost: 846 of the hardest jobs (long retries) were lost that way. At most MAX_ATTEMPTS leases.
 TRANSIENT_MODEL_ERROR = re.compile(
     r"HTTP Error 50[0234]|HTTP 50[0234]|Connection refused|Errno 111|Errno 61|10061|RemoteDisconnected"
-    r"|timed out|TimeoutError|Connection reset|returned no text",
+    # Windows names a dropped connection ConnectionResetError / ConnectionAbortedError (WinError
+    # 10054 / 10053) with no space: such jobs were failed for good instead of going back to the queue.
+    r"|timed out|TimeoutError|Connection reset|ConnectionReset|ConnectionAborted|10054|10053|Errno 104|returned no text",
     re.IGNORECASE,
 )
 # Verifiers whose answers were cut off at 2048 tokens most of the time (luau 37%, tests 22%): each
@@ -4432,6 +4434,358 @@ def queue_rate(kinds: dict, coming: dict, hour: dict) -> dict:
         "stalled": stalled,
         "by_kind": by_kind,
     }
+
+
+# ---------------------------------------------------------------- signals page
+# Exact numbers for the dashboard's Signals page, counted from the raw logs:
+# results.jsonl has one row per finished attempt (also a generation that failed and went back to the
+# queue, which never gets a finish event), with the model's token counts; queue.jsonl has every add
+# and every final finish. Window -> bucket width in seconds.
+SIGNAL_WINDOWS = {3600: 150, 21600: 900, 86400: 3600}
+SIGNAL_RECENT = 3600          # "now" numbers: the last hour
+SIGNAL_SLOW_SHARE = 0.5       # a machine writing under half its usual tokens/s is "slow"
+SIGNAL_STALL_S = 1800         # no finished job for 30 min while holding jobs is "stalled"
+SIGNAL_FAIL_SHARE = 0.25      # a quarter of a machine's attempts failing in the last hour
+SIGNAL_LOW_RAM_MIB = 512
+SIGNAL_GAP_S = 900            # no attempt from ANY computer for 15 min: the main PC was off or down
+_signals_cache: dict = {}
+
+
+def active_seconds(times: list[float], start: float, now: float) -> tuple[float, float]:
+    """(seconds from start to now that count, seconds left out). A stretch of over SIGNAL_GAP_S with no
+    finished attempt from any computer (including the stretch before the first one) is left out: the
+    main PC was off, so nothing could be recorded, and counting it would make every rate look lower."""
+    points = [start, *sorted(t for t in times if start <= t <= now)]
+    left_out = sum(b - a for a, b in zip(points, points[1:]) if b - a > SIGNAL_GAP_S)
+    return max(1.0, (now - start) - left_out), left_out
+
+
+def rows_since(path: Path, since: float, limit_bytes: int = 160 * 1024 * 1024) -> list[dict]:
+    """The JSON rows of an append-only log whose "at" is >= since, read backwards from the end so a
+    big log costs only its recent part. Rows are appended in time order (a few seconds out of order
+    at most when two writers race), so reading stops 2 minutes before `since`."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    found: list[dict] = []
+    with open(path, "rb") as handle:
+        pos, carry, read, stop = size, b"", 0, False
+        while pos > 0 and not stop and read < limit_bytes:
+            step = min(1 << 20, pos)
+            pos -= step
+            handle.seek(pos)
+            block = handle.read(step) + carry
+            read += step
+            lines = block.split(b"\n")
+            carry = lines[0] if pos > 0 else b""
+            for raw in reversed(lines[1:] if pos > 0 else lines):
+                if not raw.strip():
+                    continue
+                try:
+                    row = json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    continue
+                at = row.get("at") if isinstance(row, dict) else None
+                if not isinstance(at, (int, float)) or isinstance(at, bool):
+                    continue
+                if at < since - 120:
+                    stop = True
+                    break
+                found.append(row)
+    found.reverse()
+    return [row for row in found if row["at"] >= since]
+
+
+def _median(values: list[float]) -> float | None:
+    values = sorted(values)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def signals_compute(results: list[dict], events: list[dict], kind_of: dict[str, str], open_now: dict[str, int],
+                    now: float, window: int, machines: list[dict] | None = None,
+                    training: dict | None = None) -> dict:
+    """Everything the Signals page draws, from raw rows. Pure, so it is tested against hand counts.
+
+    results: results.jsonl rows in the window. events: queue.jsonl rows in the window.
+    kind_of: job id -> kind for every known job (finish events carry no kind).
+    open_now: {"generate": queued+leased, "checks": queued+leased of every other kind} right now.
+    machines: the computers the page knows ({"key", "name", "ok", "seen_s", "caps"}).
+    A bucket's rate divides by the seconds it really covers (the last one is still filling)."""
+    bucket = SIGNAL_WINDOWS.get(window) or SIGNAL_WINDOWS[21600]
+    start = int((now - window) // bucket * bucket)
+    edges = list(range(start, int(now), bucket))
+    nb = len(edges)
+    covered = [min(bucket, now - edge) - max(0, (now - window) - edge) for edge in edges]
+    covered = [max(1.0, float(c)) for c in covered]
+
+    def slot(at: float) -> int | None:
+        index = int((at - start) // bucket)
+        return index if 0 <= index < nb and at >= now - window else None
+
+    zero = lambda: [0] * nb  # noqa: E731
+    gen_ok, gen_failed, gen_retry, gen_cut, gen_tokens = zero(), zero(), zero(), zero(), zero()
+    chk_ok, chk_failed = zero(), zero()
+    nodes: dict[str, dict] = {}
+    recent_from = now - SIGNAL_RECENT
+    for row in results:
+        at = row.get("at")
+        index = slot(at)
+        if index is None:
+            continue
+        node = str(row.get("node") or "") or "unknown"
+        kind = str(row.get("kind") or "")
+        output = row.get("output") if isinstance(row.get("output"), dict) else {}
+        n = nodes.setdefault(node, {"tokens": zero(), "gen": zero(), "recent": {
+            "gen_ok": 0, "gen_failed": 0, "gen_retry": 0, "tokens": 0, "checks": 0, "checks_failed": 0},
+            "last_at": None})
+        n["last_at"] = at if n["last_at"] is None else max(n["last_at"], at)
+        recent = at >= recent_from
+        if kind == "generate":
+            if row.get("ok"):
+                usage = output.get("usage") if isinstance(output.get("usage"), dict) else {}
+                tokens = usage.get("completion_tokens")
+                tokens = int(tokens) if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0 else 0
+                gen_ok[index] += 1
+                gen_tokens[index] += tokens
+                n["tokens"][index] += tokens
+                n["gen"][index] += 1
+                if is_truncated(output):
+                    gen_cut[index] += 1
+                if recent:
+                    n["recent"]["gen_ok"] += 1
+                    n["recent"]["tokens"] += tokens
+            elif TRANSIENT_MODEL_ERROR.search(str(output.get("error") or "")):
+                gen_retry[index] += 1
+                if recent:
+                    n["recent"]["gen_retry"] += 1
+            else:
+                gen_failed[index] += 1
+                if recent:
+                    n["recent"]["gen_failed"] += 1
+        else:
+            (chk_ok if row.get("ok") else chk_failed)[index] += 1
+            if recent:
+                n["recent"]["checks"] += 1
+                if not row.get("ok"):
+                    n["recent"]["checks_failed"] += 1
+
+    # Open jobs over time, walked back from the exact number open now: an add after a moment means
+    # one fewer open then, a final finish after it means one more. Only the first finish of a job
+    # counts (later ones are ignored by the queue too); a job added and finished inside the window
+    # is counted both ways.
+    adds_gen, adds_chk, fin_gen, fin_chk = zero(), zero(), zero(), zero()
+    finished_ids: set[str] = set()
+    added_ids: set[str] = set()
+    for event in events:
+        index = slot(event.get("at"))
+        jid = str(event.get("id") or "")
+        if index is None or not jid:
+            continue
+        if event.get("op") == "add":
+            if jid in added_ids or event.get("kind") not in JOB_KINDS:
+                continue
+            added_ids.add(jid)
+            (adds_gen if event["kind"] == "generate" else adds_chk)[index] += 1
+        elif event.get("op") == "finish":
+            if jid in finished_ids or jid not in kind_of:
+                continue
+            finished_ids.add(jid)
+            (fin_gen if kind_of[jid] == "generate" else fin_chk)[index] += 1
+    open_gen, open_chk = [0] * nb, [0] * nb
+    g, c = int(open_now.get("generate") or 0), int(open_now.get("checks") or 0)
+    for index in range(nb - 1, -1, -1):
+        open_gen[index], open_chk[index] = g, c          # open at the end of this bucket
+        g += fin_gen[index] - adds_gen[index]
+        c += fin_chk[index] - adds_chk[index]
+
+    attempts = [gen_ok[i] + gen_failed[i] + gen_retry[i] for i in range(nb)]
+    # A slice in which no computer finished anything at all has no rate (None, drawn as a gap), not a
+    # rate of zero: usually the main PC was off and nothing could be recorded.
+    silent = [attempts[i] + chk_ok[i] + chk_failed[i] == 0 for i in range(nb)]
+    per_hour = lambda counts: [None if silent[i] else round(counts[i] * 3600 / covered[i], 1) for i in range(nb)]  # noqa: E731
+    series = {
+        "buckets": edges,
+        "bucket_s": bucket,
+        "covered_s": [round(c, 1) for c in covered],
+        "silent": silent,
+        "gen_per_hour": per_hour(gen_ok),
+        "checks_per_hour": per_hour([chk_ok[i] + chk_failed[i] for i in range(nb)]),
+        "tokens_per_s": [None if silent[i] else round(gen_tokens[i] / covered[i], 2) for i in range(nb)],
+        "tokens_per_job": [round(gen_tokens[i] / gen_ok[i]) if gen_ok[i] else None for i in range(nb)],
+        "failed_pct": [round(100 * (gen_failed[i] + gen_retry[i]) / attempts[i], 1) if attempts[i] else None for i in range(nb)],
+        "cut_pct": [round(100 * gen_cut[i] / gen_ok[i], 1) if gen_ok[i] else None for i in range(nb)],
+        "open_generate": open_gen,
+        "open_checks": open_chk,
+        "counts": {"gen_ok": gen_ok, "gen_failed": gen_failed, "gen_retry": gen_retry, "gen_cut": gen_cut,
+                   "gen_tokens": gen_tokens, "checks_ok": chk_ok, "checks_failed": chk_failed},
+    }
+
+    # Per machine: tokens per second per bucket, and the last hour in numbers. The last hour's rates
+    # divide by the time something could be recorded (see active_seconds).
+    all_times = [row["at"] for row in results if isinstance(row.get("at"), (int, float))]
+    recent_s, recent_gap = active_seconds(all_times, now - min(SIGNAL_RECENT, window), now)
+    node_rows, node_series = [], {}
+    for name in sorted(nodes):
+        n = nodes[name]
+        node_series[name] = [None if silent[i] else round(n["tokens"][i] / covered[i], 2) for i in range(nb)]
+        r = n["recent"]
+        attempts_r = r["gen_ok"] + r["gen_failed"] + r["gen_retry"]
+        node_rows.append({
+            "node": name,
+            "tokens_per_s": round(r["tokens"] / recent_s, 2),
+            "gen_done": r["gen_ok"],
+            "tokens_per_job": round(r["tokens"] / r["gen_ok"]) if r["gen_ok"] else None,
+            "gen_failed": r["gen_failed"],
+            "gen_retry": r["gen_retry"],
+            "failed_pct": round(100 * (r["gen_failed"] + r["gen_retry"]) / attempts_r, 1) if attempts_r else None,
+            "checks": r["checks"],
+            "checks_failed": r["checks_failed"],
+            "last_s": int(now - n["last_at"]) if n["last_at"] is not None else None,
+        })
+    series["node_tokens_per_s"] = node_series
+
+    # The queue's time to empty at two paces: the last hour, and the last 3 hours (or the window).
+    def gen_done_since(seconds: float) -> int:
+        cut_from = now - seconds
+        return sum(1 for row in results if row.get("kind") == "generate" and row.get("ok") and row.get("at", 0) >= cut_from)
+
+    left = int(open_now.get("generate") or 0)
+    paces = []
+    for seconds in sorted({min(3600, window), min(10800, window)}):
+        done = gen_done_since(seconds)
+        counted, gap = active_seconds(all_times, now - seconds, now)
+        paces.append({"window_s": seconds, "counted_s": round(counted), "left_out_s": round(gap), "done": done,
+                      "per_hour": round(done * 3600 / counted, 1),
+                      "eta_s": int(left * counted / done) if done and left else (0 if not left else None)})
+    recent_tokens = sum(n["recent"]["tokens"] for n in nodes.values())
+    recent_done = sum(n["recent"]["gen_ok"] for n in nodes.values())
+    now_block = {
+        "tokens_per_s": round(recent_tokens / recent_s, 2),
+        "gen_done": recent_done,
+        "tokens_per_job": round(recent_tokens / recent_done) if recent_done else None,
+        "checks": sum(r["checks"] for r in node_rows),
+        "open_generate": left,
+        "open_checks": int(open_now.get("checks") or 0),
+        "paces": paces,
+        "recent_s": round(recent_s),
+        "recent_left_out_s": round(recent_gap),
+    }
+
+    # Signals: one line each, worst first, with the rule that raised it.
+    signals = []
+    def add(level: str, title: str, detail: str, rule: str) -> None:
+        signals.append({"level": level, "title": title, "detail": detail, "rule": rule})
+
+    by_key = {r["node"]: r for r in node_rows}
+    for machine in machines or []:
+        key, name = str(machine.get("key") or ""), str(machine.get("name") or machine.get("key") or "")
+        caps = machine.get("caps") if isinstance(machine.get("caps"), dict) else {}
+        jobs = caps.get("jobs") if isinstance(caps.get("jobs"), dict) else {}
+        row = by_key.get(key)
+        if not machine.get("ok"):
+            add("bad", f"{name} does not answer", "It is not reachable on the network, so it takes no jobs.",
+                "The main PC asks every computer every 10 seconds; this one did not reply.")
+            continue
+        slots = (jobs.get("slots") or {}).get("generate") if isinstance(jobs.get("slots"), dict) else None
+        if caps.get("local_model") is False and isinstance(slots, dict) and not slots.get("total") and not machine.get("main"):
+            add("warn", f"{name} has no model", "It is connected but cannot write answers; it only runs checks.",
+                "The computer reports no model answering on its model port.")
+        running = jobs.get("running") if isinstance(jobs.get("running"), list) else []
+        if running and row and row["last_s"] is not None and row["last_s"] > SIGNAL_STALL_S:
+            add("warn", f"{name} may be stuck", f"It holds {len(running)} job(s) but finished none in {row['last_s'] // 60} minutes.",
+                f"Holding jobs with no finished attempt for over {SIGNAL_STALL_S // 60} minutes.")
+        free = caps.get("free_ram_mib")
+        if isinstance(free, (int, float)) and not isinstance(free, bool) and free < SIGNAL_LOW_RAM_MIB:
+            add("warn", f"{name} is low on memory", f"{int(free)} MB free. It may pause or slow down.",
+                f"Free memory under {SIGNAL_LOW_RAM_MIB} MB.")
+        paused = str(jobs.get("paused") or "")
+        if paused and paused != "CPU busy":
+            add("info", f"{name} is pausing new jobs", f"Reason it gives: {paused}.",
+                "The computer says why it does not take more jobs right now.")
+    for name, values in node_series.items():
+        row = by_key[name]
+        # Silent slices (None: nothing recorded from anyone) count neither as usual nor as current.
+        usual = _median([v for v in values[:-2] if v is not None and v > 0])
+        recent_idx = [i for i in range(nb) if edges[i] >= now - 1800 and values[i] is not None]
+        current = (sum(values[i] * covered[i] for i in recent_idx) / max(1.0, sum(covered[i] for i in recent_idx))) if recent_idx else None
+        if (usual and usual >= 1 and current is not None and len([v for v in values if v is not None and v > 0]) >= 4
+                and current < usual * SIGNAL_SLOW_SHARE):
+            add("warn", f"{name} is writing slowly", f"{current:.1f} tokens/s in the last 30 minutes; usually {usual:.1f}.",
+                f"Under {int(SIGNAL_SLOW_SHARE * 100)}% of its median tokens per second in this window.")
+        attempts_r = row["gen_done"] + row["gen_failed"] + row["gen_retry"]
+        if attempts_r >= 4 and row["gen_failed"] >= SIGNAL_FAIL_SHARE * attempts_r:
+            add("bad", f"{name} fails often", f"{row['gen_failed']} of its {attempts_r} generation attempts in the last hour failed for good.",
+                f"At least {int(SIGNAL_FAIL_SHARE * 100)}% of 4 or more attempts in the last hour failed (not counting retries).")
+        elif attempts_r >= 4 and row["gen_retry"] >= SIGNAL_FAIL_SHARE * attempts_r:
+            add("warn", f"{name} often has to retry", f"{row['gen_retry']} of its {attempts_r} attempts in the last hour timed out or lost the "
+                "connection to its model. Those jobs went back to the queue, so nothing was lost, but time was.",
+                f"At least {int(SIGNAL_FAIL_SHARE * 100)}% of 4 or more attempts were retries (time-out, refused or reset connection).")
+    if left == 0:
+        add("info", "The generation queue is empty", "No machine has answers to write. Add jobs to keep them busy.",
+            "No generate job is queued or running.")
+    elif paces and paces[0]["eta_s"] is not None and paces[0]["eta_s"] < 7200:
+        add("info", "The queue empties soon", f"About {paces[0]['eta_s'] // 60} minutes left at the last hour's pace.",
+            "Open generate jobs divided by the generate jobs finished in the last hour.")
+    if training is not None:
+        if not training.get("running") and training.get("state") not in {"finished", "done"}:
+            add("warn", "Training is not running", str(training.get("reason") or "No trainer is running on the main PC."),
+                "The main PC sees no training process and the run is not marked finished.")
+        steps = [p for p in training.get("step_time_series") or [] if isinstance(p, list) and len(p) >= 2
+                 and isinstance(p[1], (int, float)) and p[1] > 0]
+        if len(steps) >= 20:
+            median_all = _median([float(p[1]) for p in steps])
+            median_last = _median([float(p[1]) for p in steps[-5:]])
+            if median_all and median_last and median_last > median_all * 1.5:
+                add("warn", "Training slowed down", f"{median_last:.1f} s per step lately; usually {median_all:.1f} s.",
+                    "The median of the last 5 steps is over 1.5 times the run's median.")
+    order = {"bad": 0, "warn": 1, "info": 2}
+    signals.sort(key=lambda s: order.get(s["level"], 3))
+    if not any(s["level"] in {"bad", "warn"} for s in signals):
+        signals.insert(0, {"level": "good", "title": "Everything is working", "detail": "No machine is down, stuck, slow or failing.",
+                           "rule": "None of the warning rules below matched."})
+    return {"window_s": window, "at": int(now), "series": series, "nodes": node_rows, "now": now_block, "signals": signals}
+
+
+def signals_view(window: int) -> dict:
+    """The Signals page data, cached for 20 seconds per window (the logs are read from their end)."""
+    window = window if window in SIGNAL_WINDOWS else 21600
+    now = time.time()
+    cached = _signals_cache.get(window)
+    if cached and now - cached[0] < 20:
+        return cached[1]
+    queue = job_queue()
+    summary = queue.summary(now)
+    with queue.lock:
+        kind_of = {jid: job["kind"] for jid, job in queue.jobs.items()}
+    open_now = {"generate": 0, "checks": 0}
+    for kind, row in (summary.get("kinds") or {}).items():
+        open_now["generate" if kind == "generate" else "checks"] += int(row.get("queued") or 0) + int(row.get("leased") or 0)
+    since = now - window - SIGNAL_WINDOWS.get(window, 900)
+    results = rows_since(queue.results_path, since)
+    events = rows_since(queue.queue_path, since)
+    with _found_lock:
+        found = [dict(item) for item in _found]
+    machines = []
+    for item in found:
+        status = item.get("status") if isinstance(item.get("status"), dict) else {}
+        name = str(status.get("name") or item.get("url") or "")
+        machines.append({"key": machine_key({"name": name, "os": str(status.get("os") or "")})[0] if status.get("name") else name,
+                         "name": name.removesuffix(".local"), "ok": bool(item.get("ok")), "seen_s": item.get("seen_s"),
+                         "caps": status.get("caps") if isinstance(status.get("caps"), dict) else {}})
+    try:
+        training = training_view()
+    except Exception:  # the page must get an answer; training has its own page for errors
+        training = None
+    body = signals_compute(results, events, kind_of, open_now, now, window, machines, training)
+    body["verified_rows"] = summary.get("verified_rows")
+    # Every computer that ever finished a job, by name: the page gives each a fixed color from this.
+    body["all_nodes"] = sorted({*(summary.get("nodes") or {}).keys(), *(r["node"] for r in body["nodes"])})
+    _signals_cache[window] = (now, body)
+    return body
 
 
 def _write_jsonl_atomic(out: Path, rows: list[dict]) -> None:
@@ -6918,6 +7272,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/jobs":
             self.send_json(200, job_queue().summary())
+            return
+        if path == "/api/signals":
+            try:
+                window = int((parse_qs(urlparse(self.path).query).get("window") or ["21600"])[0])
+            except ValueError:
+                window = 21600
+            try:
+                body = signals_view(window)
+            except Exception as exc:  # the page must get an answer, not a dropped socket
+                print(f"signals failed: {type(exc).__name__}: {exc}", flush=True)
+                self.send_json(500, {"error": "The signals could not be computed. The page keeps the last ones."})
+                return
+            self.send_json(200, body)
             return
         if path == "/api/agents":
             try:
