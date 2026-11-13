@@ -49,29 +49,11 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-if model_up; then
-  echo "[1/2] A model is already answering on 127.0.0.1:8080. Using it."
-else
-  command -v llama-server >/dev/null 2>&1 || { echo "llama-server was not found. Run: brew install llama.cpp"; exit 1; }
-  echo "[1/2] Starting the model on 127.0.0.1:8080 (first time downloads ~2.9 GB; log: $LOG)..."
-  : >"$LOG"
-  start_model
-  LLAMA_PID=$(cat "$PID_FILE")
-  waited=0
-  until model_up; do
-    if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-      echo "The model stopped. Last lines of $LOG:"
-      tail -n 15 "$LOG"
-      exit 1
-    fi
-    waited=$((waited + 2))
-    [ "$waited" -le 900 ] || { echo "The model did not start in 15 minutes. See $LOG"; exit 1; }
-    sleep 2
-  done
-  echo "      The model is ready."
-
-  # Watchdog: if the model process dies, or stops answering for 5 minutes, start it again, so the
-  # worker does not sit idle on "Connection refused".
+# Watchdog: if the model process dies, or stops answering for 5 minutes, start it again, so the
+# worker does not sit idle on "Connection refused". It runs also when an already running model was
+# reused: that model belongs to an earlier window, and closing that window stops it (the Mac sat
+# without a model for hours that way).
+start_watchdog() {
   (
     trap - EXIT INT TERM
     silent=0
@@ -94,6 +76,30 @@ else
     done
   ) &
   WATCH_PID=$!
+}
+
+if model_up; then
+  echo "[1/2] A model is already answering on 127.0.0.1:8080. Using it."
+  command -v llama-server >/dev/null 2>&1 && start_watchdog
+else
+  command -v llama-server >/dev/null 2>&1 || { echo "llama-server was not found. Run: brew install llama.cpp"; exit 1; }
+  echo "[1/2] Starting the model on 127.0.0.1:8080 (first time downloads ~2.9 GB; log: $LOG)..."
+  : >"$LOG"
+  start_model
+  LLAMA_PID=$(cat "$PID_FILE")
+  waited=0
+  until model_up; do
+    if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+      echo "The model stopped. Last lines of $LOG:"
+      tail -n 15 "$LOG"
+      exit 1
+    fi
+    waited=$((waited + 2))
+    [ "$waited" -le 900 ] || { echo "The model did not start in 15 minutes. See $LOG"; exit 1; }
+    sleep 2
+  done
+  echo "      The model is ready."
+  start_watchdog
 fi
 
 echo "[2/2] Starting the Neuro worker (it stays awake while running)."

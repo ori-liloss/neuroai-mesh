@@ -71,10 +71,44 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+find_server() { find "$LLAMA_DIR" -name llama-server -type f 2>/dev/null | head -1; }
+
+# Watchdog: the worker cannot generate without the model, and nothing else restarts it. If the
+# model process dies, or stops answering for 5 minutes, start it again. Hours of "Connection
+# refused" with the worker idle are what this prevents. It runs also when an already running model
+# was reused: that model belongs to an earlier window, and closing that window stops it.
+start_watchdog() {
+  (
+    trap - EXIT INT TERM
+    silent=0
+    while sleep 30; do
+      if model_up; then silent=0; continue; fi
+      pid=$(cat "$PID_FILE" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        silent=$((silent + 1))
+        [ "$silent" -ge 10 ] || continue
+        echo "$(date '+%H:%M:%S') The model stopped answering for 5 minutes. Restarting it..."
+        kill "$pid" 2>/dev/null || true
+        sleep 5
+      else
+        echo "$(date '+%H:%M:%S') The model stopped. Last lines of $LOG:"
+        tail -n 5 "$LOG"
+        echo "$(date '+%H:%M:%S') Restarting the model..."
+      fi
+      silent=0
+      start_model
+    done
+  ) &
+  WATCH_PID=$!
+}
+
 if model_up; then
   echo "[1/4] A model is already answering on 127.0.0.1:8080. Using it."
+  SERVER=$(find_server)
+  if [ -n "$SERVER" ] && [ -s "$MODEL" ]; then
+    start_watchdog
+  fi
 else
-  find_server() { find "$LLAMA_DIR" -name llama-server -type f 2>/dev/null | head -1; }
   SERVER=$(find_server)
   if [ -z "$SERVER" ]; then
     echo "[1/4] Downloading llama.cpp (Vulkan build)..."
@@ -119,32 +153,7 @@ else
     sleep 2
   done
   echo "      The model is ready."
-
-  # Watchdog: the worker cannot generate without the model, and nothing else restarts it. If the
-  # model process dies, or stops answering for 5 minutes, start it again. Hours of "Connection
-  # refused" with the worker idle are what this prevents.
-  (
-    trap - EXIT INT TERM
-    silent=0
-    while sleep 30; do
-      if model_up; then silent=0; continue; fi
-      pid=$(cat "$PID_FILE" 2>/dev/null || true)
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        silent=$((silent + 1))
-        [ "$silent" -ge 10 ] || continue
-        echo "$(date '+%H:%M:%S') The model stopped answering for 5 minutes. Restarting it..."
-        kill "$pid" 2>/dev/null || true
-        sleep 5
-      else
-        echo "$(date '+%H:%M:%S') The model stopped. Last lines of $LOG:"
-        tail -n 5 "$LOG"
-        echo "$(date '+%H:%M:%S') Restarting the model..."
-      fi
-      silent=0
-      start_model
-    done
-  ) &
-  WATCH_PID=$!
+  start_watchdog
 fi
 
 # A "Neuro Worker" icon on the Desktop (Desktop mode), so next time is one double-click.
