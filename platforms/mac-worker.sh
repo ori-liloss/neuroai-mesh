@@ -6,6 +6,10 @@
 # (~6 GB, slower but passes the tests more often) with NEURO_MODEL=9b.
 # If a model already answers on 127.0.0.1:8080 it is used as is. Ctrl+C stops the worker and
 # the model this script started. The Mac stays awake while it runs.
+# Neuro Router on the main PC reaches the model through platforms/lan_relay.py: it listens on this
+# Mac's private LAN address (port 8080, home LAN peers only) and passes traffic to 127.0.0.1:8080,
+# where the model itself stays. NEURO_MODEL_LAN=0 turns the relay off; NEURO_MODEL_HOST picks the
+# address when the Mac has several.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 [ -f mesh.py ] || { echo "mesh.py was not found next to this script."; exit 1; }
@@ -35,11 +39,25 @@ start_model() {
   echo $! >"$PID_FILE"
 }
 
+# This Mac's private LAN address (10/8, 172.16/12, 192.168/16), or nothing.
+lan_ip() {
+  for ip in "${NEURO_MODEL_HOST:-}" "$(ipconfig getifaddr en0 2>/dev/null || true)" "$(ipconfig getifaddr en1 2>/dev/null || true)"; do
+    case "$ip" in
+      10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) echo "$ip"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 LLAMA_PID=""
 WATCH_PID=""
+RELAY_PID=""
 cleanup() {
   if [ -n "$WATCH_PID" ]; then
     kill "$WATCH_PID" 2>/dev/null || true
+  fi
+  if [ -n "$RELAY_PID" ]; then
+    kill "$RELAY_PID" 2>/dev/null || true
   fi
   if [ -n "$LLAMA_PID" ]; then
     kill "$(cat "$PID_FILE" 2>/dev/null || echo "$LLAMA_PID")" 2>/dev/null || true
@@ -100,6 +118,16 @@ else
   done
   echo "      The model is ready."
   start_watchdog
+fi
+
+if [ "${NEURO_MODEL_LAN:-1}" != "0" ]; then
+  if LAN_IP=$(lan_ip); then
+    python3 platforms/lan_relay.py --listen "$LAN_IP" --port 8080 --target 127.0.0.1:8080 &
+    RELAY_PID=$!
+    echo "      Neuro Router can use this model at http://$LAN_IP:8080 (home LAN only)."
+  else
+    echo "      No private LAN address found: the model stays on this Mac only (set NEURO_MODEL_HOST)."
+  fi
 fi
 
 echo "[2/2] Starting the Neuro worker (it stays awake while running)."
