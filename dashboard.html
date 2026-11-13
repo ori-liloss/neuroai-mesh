@@ -429,6 +429,22 @@
     .trow .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 
+    /* ---------- brain ---------- */
+    .brain-card { display: flex; flex-direction: column; gap: 12px; padding: 18px; background: radial-gradient(120% 90% at 50% 0%, rgba(144, 133, 233, 0.08), transparent 60%), var(--surface); }
+    .brain-bar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; }
+    .brain-stages { display: flex; flex-wrap: wrap; gap: 6px; }
+    .brain-stages button { font: 600 12px var(--mono); color: var(--muted); background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; cursor: pointer; }
+    .brain-stages button[aria-pressed="true"] { color: var(--ink); border-color: #9085e9; box-shadow: 0 0 0 1px #9085e9 inset; }
+    .brain-stages button:disabled { opacity: 0.4; cursor: default; }
+    .brain-stages button small { color: var(--teal); font-weight: 600; margin-left: 4px; }
+    .brain-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--muted); align-items: center; }
+    .brain-legend .key { display: inline-flex; align-items: center; gap: 6px; }
+    .brain-legend .key i { width: 14px; height: 3px; border-radius: 2px; }
+    .brain-legend .key i.dot { width: 8px; height: 8px; border-radius: 50%; }
+    .brain-wrap { position: relative; width: 100%; border-radius: 12px; overflow: hidden; background: #070A12; border: 1px solid rgba(144, 133, 233, 0.18); }
+    .brain-wrap canvas { display: block; width: 100%; cursor: crosshair; }
+    .brain-wrap .tip { position: absolute; pointer-events: none; }
+
     /* ---------- signals ---------- */
     .sig-list { display: flex; flex-direction: column; }
     .sig { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; gap: 2px 12px; align-items: start; padding: 12px 0; border-top: 1px solid var(--line); }
@@ -538,6 +554,7 @@
         <button type="button" data-view="training"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h3l3-7 4 14 3-7h5"/></svg>Training <span class="badge" id="nav-training"></span></button>
         <button type="button" data-view="jobs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>Jobs <span class="badge" id="nav-jobs"></span></button>
         <button type="button" data-view="signals"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l5-5 4 3 8-8"/><path d="M15 7h5v5"/></svg>Signals <span class="badge" id="nav-signals"></span></button>
+        <button type="button" data-view="brain"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="7" r="2"/><circle cx="19" cy="17" r="2"/><path d="M7 6.6l3.2 4.4M7 17.4l3.2-4.4M13.9 11.3L17 8M13.9 12.7L17 16"/></svg>Brain</button>
         <button type="button" data-view="models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Models</button>
         <button type="button" data-view="try"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>Try</button>
         <button type="button" data-view="share"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>Share</button>
@@ -739,8 +756,66 @@
         <article class="card">
           <div class="card-head"><h2>Computers in the last hour</h2><p class="note">counted from their finished attempts</p></div>
           <div class="table t-sig" id="sig-nodes"></div>
-          <p class="explain" style="margin-top:12px">Tokens/s = output tokens of its finished answers in the last hour ÷ the seconds of that hour that count (a stretch of over 15 minutes in which no computer reported anything, like the main PC being off, is left out, because nothing could be recorded then). Avg length = those tokens ÷ its answers. Failed = attempts that ended with no answer for good. Retries = attempts where the model timed out or the connection to it dropped: those jobs went back to the queue, so nothing was lost. Last = time since it finished anything. A computer that finished nothing in this window is not listed.</p>
+          <p class="explain" style="margin-top:12px" id="sig-table-explain">Tokens/s = output tokens of its finished answers in the last hour ÷ the seconds of that hour that count (a stretch of over 15 minutes in which no computer reported anything, like the main PC being off, is left out, because nothing could be recorded then). Avg length = those tokens ÷ its answers. Failed = attempts that ended with no answer for good. Retries = attempts where the model timed out or the connection to it dropped: those jobs went back to the queue, so nothing was lost. Last = time since it finished anything. A computer that finished nothing in this window is not listed.</p>
         </article>
+      </section>
+
+      <section class="view" id="view-brain" hidden aria-labelledby="brain-title">
+        <div class="head">
+          <div>
+            <p class="eyebrow">Inside the model &amp; the cluster</p>
+            <h1 id="brain-title">Brain</h1>
+            <p class="lead">Two real pictures. <b>Model brain</b>: the 32 layers of our model, drawn from the training files themselves, lit where training changed it. <b>Network brain</b>: the computers, the jobs and the checks, with the real flow of work of the last 15 minutes running through it. Hover or tap anything for its exact number.</p>
+          </div>
+        </div>
+        <div class="section-title">
+          <div class="seg" role="group" aria-label="Which brain" id="brain-tabs">
+            <button type="button" data-b="model" aria-pressed="true">Model brain</button>
+            <button type="button" data-b="network" aria-pressed="false">Network brain</button>
+          </div>
+        </div>
+
+        <div id="brain-model">
+          <article class="card brain-card" aria-label="Model brain">
+            <div class="brain-bar">
+              <div class="brain-stages" id="brain-stages" role="group" aria-label="Training stage"></div>
+              <div class="seg" role="group" aria-label="What to show" id="brain-mode">
+                <button type="button" data-m="stage" aria-pressed="true">What this stage changed</button>
+                <button type="button" data-m="total" aria-pressed="false">Total since the original</button>
+              </div>
+            </div>
+            <div class="brain-legend">
+              <span class="key"><i style="background:#9085e9"></i>DeltaNet layer (fast linear attention, 24 of 32)</span>
+              <span class="key"><i style="background:#d95926"></i>full attention layer (every 4th)</span>
+              <span class="key"><i class="dot" style="background:#EEF2FA"></i>brighter = changed more</span>
+              <span class="faint small" id="brain-scale"></span>
+            </div>
+            <div class="brain-wrap"><canvas id="brain-canvas" aria-label="The model's 32 layers, lit by how much training changed each part" role="img"></canvas><div class="tip" id="brain-tip" hidden></div></div>
+            <p class="note" id="brain-note">Loading…</p>
+            <p class="explain">Each column is one layer of the model, left to right in the order a word passes through them. Its 32 dots are 32 slices of the model's 4,096-number "residual stream" (128 numbers each): a dot's brightness is how much this training changed what the layer writes into that slice (dim = the smallest changes, bright = the largest; the two ends are printed above the picture). The lines are the residual stream itself, carrying each slice from one layer to the next; a line glows when the layers on both ends changed in that slice. Computed exactly from the adapter files (each change is two small matrices B·A, measured as the Frobenius norm ‖ΔW‖), so nothing here is a guess. Click a column to open that layer.</p>
+          </article>
+
+          <article class="card brain-card" aria-label="One layer up close" id="brain-detail-card">
+            <div class="ch-head">
+              <div>
+                <h2 id="brain-detail-title">Layer –</h2>
+                <p class="note" id="brain-detail-sub">Click a column above.</p>
+              </div>
+              <div class="ch-now"><small>change in this layer</small><span id="brain-detail-now">–</span></div>
+            </div>
+            <div class="brain-wrap"><canvas id="brain-detail" aria-label="The selected layer's attention and MLP, with the connections training changed" role="img"></canvas><div class="tip" id="brain-detail-tip" hidden></div></div>
+            <p class="explain">Left, attention: the stream's 32 slices feed the attention projections (q, k, v; on DeltaNet layers qkv and its gates z, a, b); the attention output goes back into the stream. Right, the MLP: 4,096 stream numbers → 12,288 neurons (32 groups of 384) → back to the stream. Every line is a real block of the change matrix ΔW between two groups: its brightness is that block's ‖ΔW‖, so the bright web is exactly where this stage rewired the layer. Each of the four maps is scaled to its own largest block (the output matrices change much less than the input ones), so compare lines within a map, and use the numbers on hover across maps.</p>
+          </article>
+        </div>
+
+        <div id="brain-network" hidden>
+          <article class="card brain-card" aria-label="Network brain">
+            <div class="brain-legend" id="net-legend"></div>
+            <div class="brain-wrap"><canvas id="net-canvas" aria-label="Computers, jobs and checks, with the flow of the last 15 minutes" role="img"></canvas><div class="tip" id="net-tip" hidden></div></div>
+            <p class="note" id="net-note">Loading…</p>
+            <p class="explain">Inputs on the left are the computers, each with its writing speed over the last hours (the small curve, from the Signals data) and now (tokens per second). In the middle are the kinds of job; on the right, where checked answers end up. A line's thickness and the number of moving dots are the real count of finished attempts over it in the last 15 minutes; a red line is attempts that failed. Lines with no work in that time are not drawn.</p>
+          </article>
+        </div>
       </section>
 
       <section class="view" id="view-training" hidden aria-labelledby="train-h1">
@@ -2735,6 +2810,7 @@ async function refreshSignals() {
     sigBusy = false;
   }
   drawSignals();
+  if (typeof drawBrainControls === "function" && currentView === "brain") drawBrainControls();
 }
 document.querySelectorAll("#sig-range button").forEach((button) => {
   button.onclick = () => {
@@ -2744,6 +2820,570 @@ document.querySelectorAll("#sig-range button").forEach((button) => {
     refreshSignals();
   };
 });
+
+// ---------- brain ----------
+// Two glowing views drawn on canvas with additive blending. Every brightness and thickness is a real
+// number: the model view from brain_scan.py (adapter files), the network view from /api/signals.
+// Colors: violet = DeltaNet layers / attention, orange = full attention layers / MLP (validated pair).
+const B_DELTA = "#9085e9", B_ATTN = "#d95926", B_GOOD = "#0CA30C", B_BAD = "#D03B3B", B_INK = "#EEF2FA";
+let brainTab = "model";
+try { if (localStorage.getItem("neuro-brain-tab") === "network") brainTab = "network"; } catch (error) {}
+let brain = null, brainStage = "", brainMode = "stage", brainLayer = 0, brainDetail = null, brainBusy = false;
+let brainHover = null, netHover = null, detailHover = null;
+const brainAnim = { pulses: [], last: 0, raf: 0, netDots: [] };
+function rgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + Math.max(0, Math.min(1, a)).toFixed(3) + ")";
+}
+function fitCanvas(canvas, height) {
+  const w = Math.max(320, Math.round(canvas.parentElement.clientWidth || 0));
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  if (canvas._w !== w || canvas._h !== height || canvas._dpr !== dpr) {
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(height * dpr);
+    canvas.style.height = height + "px";
+    canvas._w = w; canvas._h = height; canvas._dpr = dpr; canvas._static = null;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h: height, dpr };
+}
+function offscreen(canvas) {
+  const off = document.createElement("canvas");
+  off.width = canvas.width; off.height = canvas.height;
+  const ctx = off.getContext("2d");
+  ctx.setTransform(canvas._dpr, 0, 0, canvas._dpr, 0, 0);
+  return { off, ctx };
+}
+function fmtChange(v) { const n = Number(v); return Number.isFinite(n) ? (n >= 10 ? n.toFixed(1) : n >= 0.1 ? n.toFixed(3) : n.toExponential(2)) : "–"; }
+function showTip(tip, wrap, x, y, title, rows) {
+  tip.replaceChildren(el("div", "tx", title));
+  for (const [k, v, color] of rows) {
+    const r = el("div", "tr"); const s = el("span");
+    if (color) { const i = el("i"); i.style.background = color; s.append(i); }
+    s.append(document.createTextNode(k)); r.append(s, el("b", "", v)); tip.append(r);
+  }
+  tip.hidden = false;
+  const tw = tip.offsetWidth || 180, th = tip.offsetHeight || 60, W = wrap.clientWidth, H = wrap.clientHeight;
+  tip.style.left = Math.max(4, Math.min(W - tw - 4, x + 14)) + "px";
+  tip.style.top = Math.max(4, Math.min(H - th - 4, y + 14)) + "px";
+}
+
+// ----- model brain: overview -----
+function brainLayout(w, h) {
+  const left = 64, right = 56, top = 36, bottom = 22;
+  const n = 32;
+  const xs = Array.from({ length: n }, (_, i) => left + (i * (w - left - right)) / (n - 1));
+  const ys = Array.from({ length: 32 }, (_, g) => top + (g * (h - top - bottom)) / 31);
+  return { left, right, top, bottom, xs, ys, xin: 22, xout: w - 20 };
+}
+function drawBrainStatic(canvas, w, h) {
+  const layers = (brain && brain.layers) || [];
+  const { off, ctx } = offscreen(canvas);
+  canvas._static = off;
+  ctx.fillStyle = "#070A12"; ctx.fillRect(0, 0, w, h);
+  if (!layers.length) return;
+  const L = brainLayout(w, h);
+  // Contrast: brightness runs from the 10th percentile (dark) to the largest value (bright), so the
+  // real differences between slices show; the legend prints both ends.
+  const all = layers.flatMap((x) => (x.nodes || []).map(Number)).filter(Number.isFinite).sort((a, b) => a - b);
+  const vmax = Math.max(1e-12, all[all.length - 1] || 0), vlo = all.length ? all[Math.floor(all.length * 0.05)] : 0;
+  canvas._vmax = vmax; canvas._vlo = vlo;
+  const val = (l, g) => Math.pow(Math.max(0, Math.min(1, (Number((layers[l] && layers[l].nodes || [])[g] || 0) - vlo) / Math.max(1e-12, vmax - vlo))), 0.85);
+  canvas._val = val;
+  ctx.globalCompositeOperation = "lighter";
+  // input -> first layer and last layer -> output: faint
+  for (let g = 0; g < 32; g++) {
+    ctx.strokeStyle = rgba(B_INK, 0.05 + 0.25 * val(0, g)); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(L.xin, L.ys[g]); ctx.lineTo(L.xs[0], L.ys[g]); ctx.stroke();
+    ctx.strokeStyle = rgba(B_INK, 0.05 + 0.25 * val(layers.length - 1, g));
+    ctx.beginPath(); ctx.moveTo(L.xs[L.xs.length - 1], L.ys[g]); ctx.lineTo(L.xout, L.ys[g]); ctx.stroke();
+  }
+  // the residual stream between layers: slice g of layer l to slice g of layer l+1
+  for (let l = 0; l < layers.length - 1; l++) {
+    const color = layers[l].type === "attention" ? B_ATTN : B_DELTA;
+    for (let g = 0; g < 32; g++) {
+      const s = Math.sqrt(val(l, g) * val(l + 1, g));
+      if (s < 0.01) continue;
+      ctx.strokeStyle = rgba(color, 0.04 + 0.55 * s); ctx.lineWidth = 0.6 + 1.6 * s;
+      const x0 = L.xs[l], x1 = L.xs[l + 1], y = L.ys[g], bend = (g % 2 ? 1 : -1) * 3 * s;
+      ctx.beginPath(); ctx.moveTo(x0, y); ctx.quadraticCurveTo((x0 + x1) / 2, y + bend, x1, y); ctx.stroke();
+    }
+  }
+  // nodes with a soft glow
+  for (let l = 0; l < layers.length; l++) {
+    const color = layers[l].type === "attention" ? B_ATTN : B_DELTA;
+    for (let g = 0; g < 32; g++) {
+      const v = val(l, g), x = L.xs[l], y = L.ys[g];
+      const r = 1.4 + 3.2 * Math.sqrt(v);
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, r * 3.2);
+      grad.addColorStop(0, rgba(color, 0.55 * v + 0.08)); grad.addColorStop(1, rgba(color, 0));
+      ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(x, y, r * 3.2, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = rgba("#FFFFFF", 0.25 + 0.75 * v); ctx.beginPath(); ctx.arc(x, y, r * 0.55, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  ctx.globalCompositeOperation = "source-over";
+  // labels
+  ctx.font = "600 10px " + getComputedStyle(document.body).getPropertyValue("--mono");
+  ctx.textAlign = "center";
+  for (let l = 0; l < layers.length; l++) {
+    const t = layers[l];
+    ctx.fillStyle = l + 1 === brainLayer ? B_INK : t.type === "attention" ? B_ATTN : rgba(B_DELTA, 0.95);
+    ctx.fillText(String(t.layer), L.xs[l], 14);
+    ctx.fillStyle = rgba(B_INK, 0.35); ctx.fillText(t.type === "attention" ? "A" : "Δ", L.xs[l], 26);
+    if (l + 1 === brainLayer) { ctx.strokeStyle = rgba(B_INK, 0.35); ctx.setLineDash([3, 4]); ctx.strokeRect(L.xs[l] - 9, 32, 18, h - 50); ctx.setLineDash([]); }
+  }
+  ctx.fillStyle = rgba(B_INK, 0.5); ctx.textAlign = "left"; ctx.fillText("in", 6, h - 6);
+  ctx.textAlign = "right"; ctx.fillText("out", w - 6, h - 6);
+}
+function spawnPulse(layers) {
+  // A pulse rides one slice of the stream from layer to layer; slices that changed more get more.
+  const weights = [];
+  let total = 0;
+  for (let g = 0; g < 32; g++) {
+    let s = 0; for (const t of layers) s += Number((t.nodes || [])[g] || 0);
+    total += s; weights.push(total);
+  }
+  const pick = Math.random() * total;
+  let g = weights.findIndex((v) => v >= pick); if (g < 0) g = 0;
+  // Start anywhere along the stream, so the pulses do not travel as one wave.
+  return { g, l: Math.floor(Math.random() * Math.max(1, layers.length - 1)), t: Math.random() };
+}
+function drawBrainFrame(dt) {
+  const canvas = document.getElementById("brain-canvas");
+  if (!canvas) return;
+  const { ctx, w, h } = fitCanvas(canvas, Math.max(380, Math.min(560, Math.round(canvas.parentElement.clientWidth * 0.42))));
+  const layers = (brain && brain.layers) || [];
+  if (!canvas._static) drawBrainStatic(canvas, w, h);
+  ctx.drawImage(canvas._static, 0, 0, w, h);
+  if (!layers.length) {
+    ctx.fillStyle = rgba(B_INK, 0.6); ctx.font = "13px " + getComputedStyle(document.body).getPropertyValue("--sans"); ctx.textAlign = "center";
+    ctx.fillText(brain && brain.available === false ? String(brain.reason || "No training data.") : brain && brain.scanning ? "Measuring the adapter files… (about 10 seconds a stage)" : "Loading…", w / 2, h / 2);
+    return;
+  }
+  const L = brainLayout(w, h);
+  const val = canvas._val || (() => 0.5);
+  while (brainAnim.pulses.length < 140) brainAnim.pulses.push(spawnPulse(layers));
+  ctx.globalCompositeOperation = "lighter";
+  for (const p of brainAnim.pulses) {
+    const a = val(p.l, p.g);
+    p.t += dt * (0.8 + 2.2 * a);
+    while (p.t >= 1) { p.t -= 1; p.l += 1; }
+    if (p.l >= layers.length - 1) { Object.assign(p, spawnPulse(layers)); continue; }
+    const x = L.xs[p.l] + (L.xs[p.l + 1] - L.xs[p.l]) * p.t, y = L.ys[p.g];
+    const color = layers[p.l].type === "attention" ? B_ATTN : B_DELTA;
+    const grad = ctx.createRadialGradient(x, y, 0, x, y, 7);
+    grad.addColorStop(0, rgba("#FFFFFF", 0.35 + 0.6 * a)); grad.addColorStop(0.4, rgba(color, 0.4 + 0.5 * a)); grad.addColorStop(1, rgba(color, 0));
+    ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalCompositeOperation = "source-over";
+  if (brainHover) {
+    const x = L.xs[brainHover.l], y = L.ys[brainHover.g];
+    ctx.strokeStyle = B_INK; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, 8, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+function brainPointer(event, click) {
+  const canvas = document.getElementById("brain-canvas"), tip = document.getElementById("brain-tip");
+  const layers = (brain && brain.layers) || [];
+  if (!layers.length || !canvas._w) return;
+  const box = canvas.getBoundingClientRect();
+  const x = event.clientX - box.left, y = event.clientY - box.top;
+  const L = brainLayout(canvas._w, canvas._h);
+  let l = 0; for (let i = 1; i < L.xs.length; i++) if (Math.abs(L.xs[i] - x) < Math.abs(L.xs[l] - x)) l = i;
+  let g = 0; for (let i = 1; i < 32; i++) if (Math.abs(L.ys[i] - y) < Math.abs(L.ys[g] - y)) g = i;
+  if (Math.abs(L.xs[l] - x) > 14 || l >= layers.length) { brainHover = null; tip.hidden = true; return; }
+  if (click) { openBrainLayer(layers[l].layer); return; }
+  brainHover = { l, g };
+  const t = layers[l];
+  showTip(tip, canvas.parentElement, x, y, "Layer " + t.layer + " · " + (t.type === "attention" ? "full attention" : "DeltaNet"), [
+    ["slice " + (g + 1) + " (stream numbers " + g * 128 + "–" + (g * 128 + 127) + ")", fmtChange((t.nodes || [])[g]), t.type === "attention" ? B_ATTN : B_DELTA],
+    ["reads changed in this slice", fmtChange((t.reads || [])[g])],
+    ["attention change, whole layer", fmtChange(t.attn)],
+    ["MLP change, whole layer", fmtChange(t.mlp)],
+    ["click to open this layer", ""],
+  ]);
+}
+
+// ----- model brain: one layer up close -----
+function detailCols(w) {
+  return { rin: 0.05 * w, proj: 0.22 * w, heads: 0.31 * w, rmid: 0.46 * w, rin2: 0.56 * w, neur: 0.76 * w, rout: 0.95 * w };
+}
+function drawDetailStatic(canvas, w, h) {
+  const { off, ctx } = offscreen(canvas);
+  canvas._static = off;
+  ctx.fillStyle = "#070A12"; ctx.fillRect(0, 0, w, h);
+  const d = brainDetail;
+  const mono = getComputedStyle(document.body).getPropertyValue("--mono");
+  if (!d) {
+    ctx.fillStyle = rgba(B_INK, 0.6); ctx.font = "13px " + getComputedStyle(document.body).getPropertyValue("--sans"); ctx.textAlign = "center";
+    ctx.fillText(brainLayer ? "Loading layer " + brainLayer + "…" : "Click a column in the picture above to open that layer.", w / 2, h / 2);
+    return;
+  }
+  const C = detailCols(w), top = 64, bottom = 20;
+  const ys = Array.from({ length: 32 }, (_, g) => top + (g * (h - top - bottom)) / 31);
+  canvas._ys = ys;
+  const maps = { attn_in: d.attn_in || [], attn_out: d.attn_out || [], mlp_in: d.mlp_in || [], mlp_out: d.mlp_out || [] };
+  // Contrast: a line's brightness runs from the 30th percentile of all blocks (invisible) to the
+  // largest block (bright). Over a thousand lines add up, so without this everything washes out white.
+  // Each of the four maps has its own scale: the output matrices change far less than the input ones,
+  // and on one shared scale their lines would vanish. The explanation under the picture says so.
+  const scaleOf = (map) => {
+    const v = map.map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+    const hi = Math.max(1e-12, v[v.length - 1] || 0), lo = v.length ? v[Math.floor(v.length * 0.3)] : 0;
+    return (x) => Math.pow(Math.max(0, Math.min(1, (Number(x || 0) - lo) / Math.max(1e-12, hi - lo))), 1.8);
+  };
+  const scales = { attn_in: scaleOf(maps.attn_in), attn_out: scaleOf(maps.attn_out), mlp_in: scaleOf(maps.mlp_in), mlp_out: scaleOf(maps.mlp_out) };
+  let norm = scales.attn_in;
+  // panels like the reference: a box with a title and the size of each column
+  const panel = (x, title, sub, color) => {
+    ctx.strokeStyle = rgba(color, 0.35); ctx.lineWidth = 1; ctx.fillStyle = rgba(color, 0.05);
+    ctx.beginPath(); ctx.roundRect(x - 34, 6, 68, h - 12, 8); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = rgba(B_INK, 0.85); ctx.font = "600 10px " + mono; ctx.textAlign = "center"; ctx.fillText(title, x, 22);
+    ctx.fillStyle = rgba(B_INK, 0.45); ctx.font = "9.5px " + mono; ctx.fillText(sub, x, 36);
+  };
+  const attnColor = d.type === "attention" ? B_ATTN : B_DELTA;
+  panel(C.rin, "stream in", "4,096 → 32", B_INK);
+  panel(C.proj, "attention in", (d.attn_in_labels && d.attn_in_labels.length ? [...new Set(d.attn_in_labels)].join(" ") : "q k v"), attnColor);
+  panel(C.heads, "attention out", "heads → 32", attnColor);
+  panel(C.rmid, "stream", "4,096 → 32", B_INK);
+  panel(C.rin2, "stream", "4,096 → 32", B_INK);
+  panel(C.neur, "MLP neurons", "12,288 → 32", B_ATTN);
+  panel(C.rout, "stream out", "4,096 → 32", B_INK);
+  ctx.fillStyle = rgba(B_INK, 0.35); ctx.font = "9.5px " + mono; ctx.textAlign = "center";
+  ctx.save(); ctx.translate((C.proj + C.heads) / 2, h / 2); ctx.rotate(-Math.PI / 2); ctx.fillText("attention mixes the words here", 0, 3); ctx.restore();
+  ctx.globalCompositeOperation = "lighter";
+  // map[row][col] is stored flat: rows x 32 columns
+  const lines = (map, x0, x1, color) => {
+    const rows = Math.round(map.length / 32);
+    for (let r = 0; r < rows; r++) for (let c = 0; c < 32; c++) {
+      const v = norm(map[r * 32 + c]);
+      if (v < 0.02) continue;
+      ctx.strokeStyle = rgba(color, 0.04 + 0.42 * v); ctx.lineWidth = 0.5 + 1.2 * v;
+      const y0 = ys[c], y1 = ys[Math.min(31, Math.round((r * 31) / Math.max(1, rows - 1)))];
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.bezierCurveTo(x0 + (x1 - x0) * 0.45, y0, x0 + (x1 - x0) * 0.55, y1, x1, y1); ctx.stroke();
+    }
+  };
+  norm = scales.attn_in; lines(maps.attn_in, C.rin, C.proj, attnColor);      // stream groups (cols) -> projection groups (rows)
+  norm = scales.attn_out; lines(maps.attn_out, C.heads, C.rmid, attnColor);   // head groups (cols) -> stream groups (rows)
+  norm = scales.mlp_in; lines(maps.mlp_in, C.rin2, C.neur, B_ATTN);         // stream (cols) -> neurons (rows)
+  // mlp_out: neurons (cols) -> stream (rows): rows are the stream here
+  norm = scales.mlp_out;
+  (function () {
+    const map = maps.mlp_out;
+    for (let r = 0; r < 32; r++) for (let c = 0; c < 32; c++) {
+      const v = norm(map[r * 32 + c]);
+      if (v < 0.02) continue;
+      ctx.strokeStyle = rgba(B_ATTN, 0.04 + 0.42 * v); ctx.lineWidth = 0.5 + 1.2 * v;
+      const x0 = C.neur, x1 = C.rout, y0 = ys[c], y1 = ys[r];
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.bezierCurveTo(x0 + (x1 - x0) * 0.45, y0, x0 + (x1 - x0) * 0.55, y1, x1, y1); ctx.stroke();
+    }
+  })();
+  // nodes: brightness = the change of every line that touches them
+  const sumsOf = (map, axis) => {
+    const rows = Math.round(map.length / 32), out = new Array(axis === "row" ? rows : 32).fill(0);
+    for (let r = 0; r < rows; r++) for (let c = 0; c < 32; c++) out[axis === "row" ? r : c] += Number(map[r * 32 + c] || 0);
+    return out;
+  };
+  const sums = {
+    rin: sumsOf(maps.attn_in, "col"), proj: sumsOf(maps.attn_in, "row"), heads: sumsOf(maps.attn_out, "col"),
+    rmid: sumsOf(maps.attn_out, "row"), rin2: sumsOf(maps.mlp_in, "col"), neur: sumsOf(maps.mlp_in, "row").map((v, i) => v + sumsOf(maps.mlp_out, "col")[i]),
+    rout: sumsOf(maps.mlp_out, "row"),
+  };
+  canvas._sums = sums;
+  const smax = Math.max(1e-12, ...Object.values(sums).flat());
+  for (const [key, list] of Object.entries(sums)) {
+    const color = key === "neur" ? B_ATTN : key === "proj" || key === "heads" ? attnColor : B_INK;
+    list.forEach((s, i) => {
+      const v = s / smax, x = C[key], y = ys[Math.min(31, Math.round((i * 31) / Math.max(1, list.length - 1)))];
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, 8);
+      grad.addColorStop(0, rgba(color, 0.2 + 0.7 * v)); grad.addColorStop(1, rgba(color, 0));
+      ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(x, y, 8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = rgba("#FFFFFF", 0.3 + 0.7 * v); ctx.beginPath(); ctx.arc(x, y, 1.6 + 1.6 * v, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+  ctx.globalCompositeOperation = "source-over";
+  // the projection groups' names, like the reference's neuron labels
+  ctx.font = "9px " + mono; ctx.textAlign = "right"; ctx.fillStyle = rgba(B_INK, 0.55);
+  (d.attn_in_labels || []).forEach((lab, i, arr) => { if (i === 0 || arr[i - 1] !== lab) ctx.fillText(lab, C.proj - 8, ys[Math.round((i * 31) / Math.max(1, arr.length - 1))] + 3); });
+}
+function drawDetailFrame() {
+  const canvas = document.getElementById("brain-detail");
+  if (!canvas) return;
+  const { ctx, w, h } = fitCanvas(canvas, 460);
+  if (!canvas._static) drawDetailStatic(canvas, w, h);
+  ctx.drawImage(canvas._static, 0, 0, w, h);
+  if (detailHover && canvas._ys) {
+    const C = detailCols(w);
+    ctx.strokeStyle = B_INK; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(C[detailHover.key], detailHover.y, 9, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+function detailPointer(event) {
+  const canvas = document.getElementById("brain-detail"), tip = document.getElementById("brain-detail-tip");
+  if (!brainDetail || !canvas._sums || !canvas._ys) return;
+  const box = canvas.getBoundingClientRect(), x = event.clientX - box.left, y = event.clientY - box.top;
+  const C = detailCols(canvas._w);
+  let key = null; for (const k of Object.keys(C)) if (Math.abs(C[k] - x) < 16 && (!key || Math.abs(C[k] - x) < Math.abs(C[key] - x))) key = k;
+  if (!key) { detailHover = null; tip.hidden = true; return; }
+  const list = canvas._sums[key], ys = canvas._ys;
+  let i = 0, best = 1e9;
+  list.forEach((_, j) => { const yy = ys[Math.min(31, Math.round((j * 31) / Math.max(1, list.length - 1)))]; if (Math.abs(yy - y) < best) { best = Math.abs(yy - y); i = j; } });
+  const yy = ys[Math.min(31, Math.round((i * 31) / Math.max(1, list.length - 1)))];
+  detailHover = { key, y: yy };
+  const names = { rin: "stream in", proj: "attention projection", heads: "attention output (heads)", rmid: "stream after attention", rin2: "stream before the MLP", neur: "MLP neurons", rout: "stream out" };
+  const size = key === "neur" ? 384 : 128;
+  const label = key === "proj" && brainDetail.attn_in_labels ? " · " + brainDetail.attn_in_labels[i] : "";
+  showTip(tip, canvas.parentElement, x, y, "Layer " + brainDetail.layer + " · " + names[key] + label, [
+    ["group " + (i + 1) + (key === "proj" ? "" : " (" + (i * size) + "–" + (i * size + size - 1) + ")"), ""],
+    ["change of all its lines", fmtChange(list[i])],
+  ]);
+}
+async function openBrainLayer(layer) {
+  brainLayer = layer; brainDetail = null;
+  const canvas = document.getElementById("brain-detail"); canvas._static = null;
+  const over = document.getElementById("brain-canvas"); over._static = null;
+  text("brain-detail-title", "Layer " + layer);
+  text("brain-detail-sub", "Loading…");
+  try {
+    const response = await fetch("/api/brain?stage=" + encodeURIComponent(brainStage) + "&mode=" + brainMode + "&layer=" + layer, { cache: "no-store" });
+    const body = response.ok ? await readJsonLimited(response, 3000000) : null;
+    brainDetail = body && body.detail ? body.detail : null;
+  } catch (error) { brainDetail = null; }
+  canvas._static = null;
+  const d = brainDetail;
+  if (d) {
+    text("brain-detail-title", "Layer " + d.layer + " · " + (d.type === "attention" ? "full attention" : "DeltaNet (linear attention)"));
+    text("brain-detail-sub", (brainMode === "stage" ? "What " + brainStage + " changed in it" : "Total change since the original model, up to " + brainStage) + " · attention " + fmtChange(d.attn) + " · MLP " + fmtChange(d.mlp));
+    text("brain-detail-now", fmtChange(Math.sqrt(d.attn * d.attn + d.mlp * d.mlp)));
+  } else text("brain-detail-sub", "This layer could not be read.");
+}
+
+// ----- network brain -----
+function netModel() {
+  const sg = signals;
+  if (!sg || !sg.flows) return null;
+  const nodesNow = new Map((sg.nodes || []).map((r) => [r.node, r]));
+  const machines = (sg.all_nodes || []).filter((n) => nodesNow.has(n) || (sg.flows.machine_kind || []).some((c) => c.node === n));
+  const kindSet = new Set(["generate"]);
+  for (const c of sg.flows.machine_kind || []) kindSet.add(c.kind);
+  for (const [k, v] of Object.entries(sg.kinds_open || {})) if (v > 0) kindSet.add(k);
+  const kinds = [...kindSet].sort((a, b) => (a === "generate" ? -1 : b === "generate" ? 1 : a.localeCompare(b)));
+  const edges = [];
+  for (const c of sg.flows.machine_kind || []) {
+    if (c.ok) edges.push({ from: "m:" + c.node, to: "k:" + c.kind, n: c.ok, color: sigNodeColor(c.node), what: "finished" });
+    if (c.failed) edges.push({ from: "m:" + c.node, to: "k:" + c.kind, n: c.failed, color: B_BAD, what: "failed" });
+  }
+  for (const k of kinds) {
+    if (k === "generate") continue;
+    const ran = (sg.flows.machine_kind || []).filter((c) => c.kind === k).reduce((s, c) => s + c.ok + c.failed, 0);
+    if (ran) edges.push({ from: "k:generate", to: "k:" + k, n: ran, color: B_INK, what: "answers checked" });
+  }
+  for (const o of sg.flows.kind_outcome || []) {
+    if (o.training) edges.push({ from: "k:" + o.kind, to: "o:training", n: o.training, color: B_GOOD, what: "passed" });
+    if (o.rejected) edges.push({ from: "k:" + o.kind, to: "o:rejected", n: o.rejected, color: B_BAD, what: "rejected" });
+  }
+  return { machines, kinds, edges, nodesNow };
+}
+function netLayout(w, h, model) {
+  const pos = {};
+  const place = (ids, x, top, bottom) => ids.forEach((id, i) => { pos[id] = { x, y: ids.length === 1 ? (top + bottom) / 2 : top + (i * (bottom - top)) / (ids.length - 1) }; });
+  place(model.machines.map((m) => "m:" + m), Math.max(230, 0.28 * w), 70, h - 50);
+  // generate sits on its own in the middle column; the checks fan out to its right
+  pos["k:generate"] = { x: 0.5 * w, y: h / 2 };
+  place(model.kinds.filter((k) => k !== "generate").map((k) => "k:" + k), 0.68 * w, 50, h - 40);
+  place(["o:training", "o:rejected"], 0.84 * w, h * 0.32, h * 0.68);
+  return pos;
+}
+function drawNetFrame(dt) {
+  const canvas = document.getElementById("net-canvas");
+  if (!canvas) return;
+  const { ctx, w, h } = fitCanvas(canvas, 480);
+  ctx.fillStyle = "#070A12"; ctx.fillRect(0, 0, w, h);
+  const model = netModel();
+  const sans = getComputedStyle(document.body).getPropertyValue("--sans"), mono = getComputedStyle(document.body).getPropertyValue("--mono");
+  if (!model) {
+    ctx.fillStyle = rgba(B_INK, 0.6); ctx.font = "13px " + sans; ctx.textAlign = "center";
+    ctx.fillText(signals && signals.missing ? "This view needs the dashboard server to restart with this version." : "Loading the flow…", w / 2, h / 2);
+    return;
+  }
+  const pos = netLayout(w, h, model);
+  canvas._pos = pos; canvas._model = model;
+  const nmax = Math.max(1, ...model.edges.map((e) => e.n));
+  const curve = (a, b, t) => {
+    const mx = (a.x + b.x) / 2, u = 1 - t;
+    const x = u * u * u * a.x + 3 * u * u * t * mx + 3 * u * t * t * mx + t * t * t * b.x;
+    const y = u * u * u * a.y + 3 * u * u * t * a.y + 3 * u * t * t * b.y + t * t * t * b.y;
+    return [x, y];
+  };
+  ctx.globalCompositeOperation = "lighter";
+  for (const e of model.edges) {
+    const a = pos[e.from], b = pos[e.to];
+    if (!a || !b) continue;
+    const s = Math.sqrt(e.n / nmax);
+    ctx.strokeStyle = rgba(e.color, 0.18 + 0.5 * s); ctx.lineWidth = 1 + 6 * s;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.bezierCurveTo((a.x + b.x) / 2, a.y, (a.x + b.x) / 2, b.y, b.x, b.y); ctx.stroke();
+    // moving dots: as many as the attempts (up to 24), all at the same speed
+    e.key = e.from + ">" + e.to + ">" + e.what;
+    const count = Math.min(24, e.n);
+    for (let i = 0; i < count; i++) {
+      const t = ((performance.now() / 2600) + i / count + (e.key.length % 7) / 7) % 1;
+      const [x, y] = curve(a, b, t);
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, 5);
+      grad.addColorStop(0, rgba("#FFFFFF", 0.8)); grad.addColorStop(0.5, rgba(e.color, 0.6)); grad.addColorStop(1, rgba(e.color, 0));
+      ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  ctx.globalCompositeOperation = "source-over";
+  const sg = signals;
+  const series = (sg.series && sg.series.node_tokens_per_s) || {};
+  const node = (id, label, sub, color, value) => {
+    const p = pos[id]; if (!p) return;
+    const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 16);
+    grad.addColorStop(0, rgba(color, 0.7)); grad.addColorStop(1, rgba(color, 0));
+    ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(p.x, p.y, 16, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#070A12"; ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(p.x, p.y, 6.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    // generate sits where many lines cross: its label goes under it, on a dark plate
+    const under = id === "k:generate";
+    ctx.font = "600 11px " + mono; ctx.textAlign = under ? "center" : id.startsWith("m:") ? "right" : "left";
+    const tx = under ? p.x : id.startsWith("m:") ? p.x - 16 : p.x + 14, ty = under ? p.y + 26 : p.y - 2;
+    if (under) {
+      const wd = Math.max(ctx.measureText(label).width, ctx.measureText(sub).width) + 14;
+      ctx.fillStyle = "rgba(7,10,18,0.85)"; ctx.beginPath(); ctx.roundRect(tx - wd / 2, ty - 13, wd, 31, 6); ctx.fill();
+    }
+    ctx.fillStyle = B_INK; ctx.fillText(label, tx, ty);
+    ctx.font = "10px " + mono; ctx.fillStyle = rgba(B_INK, 0.55); ctx.fillText(sub, tx, ty + 14);
+  };
+  for (const m of model.machines) {
+    const r = model.nodesNow.get(m);
+    node("m:" + m, m, r ? Number(r.tokens_per_s || 0).toFixed(1) + " tok/s now" : "no answers lately", sigNodeColor(m));
+    // the machine's speed curve over the window, like the inputs' curves in the reference
+    const vals = (series[m] || []).map(Number).filter((v) => Number.isFinite(v));
+    const p = pos["m:" + m];
+    if (vals.length > 1 && p) {
+      const vmax = Math.max(1, ...vals), sw = 70, sh = 20, sx = p.x - 16 - 120 - sw - 8, sy = p.y - sh / 2;
+      ctx.strokeStyle = rgba(sigNodeColor(m), 0.9); ctx.lineWidth = 1.4; ctx.beginPath();
+      vals.forEach((v, i) => { const x = sx + (i * sw) / (vals.length - 1), y = sy + sh - (v / vmax) * sh; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.stroke();
+    }
+  }
+  const open = sg.kinds_open || {};
+  node("k:generate", "write answers", num(open.generate || 0) + " waiting", B_DELTA);
+  for (const k of model.kinds) if (k !== "generate") node("k:" + k, k.replace(/^verify_/, "check ").replace("_", " "), num(open[k] || 0) + " waiting", B_ATTN);
+  const rejectedTotal = Object.values(sg.checked_total || {}).reduce((s, v) => s + (v.rejected || 0), 0);
+  node("o:training", "training data", num(sg.verified_rows || 0) + " rows ready", B_GOOD);
+  node("o:rejected", "rejected", num(rejectedTotal) + " so far", B_BAD);
+  ctx.font = "600 10px " + mono; ctx.fillStyle = rgba(B_INK, 0.4); ctx.textAlign = "center";
+  ctx.fillText("COMPUTERS", pos[Object.keys(pos)[0]] ? Math.max(230, 0.28 * w) - 60 : 100, 22);
+  ctx.fillText("JOBS", 0.5 * w, 22); ctx.fillText("CHECKS", 0.68 * w, 22); ctx.fillText("RESULT", 0.84 * w, 22);
+  if (netHover && pos[netHover]) { const p = pos[netHover]; ctx.strokeStyle = B_INK; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(p.x, p.y, 11, 0, Math.PI * 2); ctx.stroke(); }
+}
+function netPointer(event) {
+  const canvas = document.getElementById("net-canvas"), tip = document.getElementById("net-tip");
+  const pos = canvas._pos, model = canvas._model;
+  if (!pos || !model) return;
+  const box = canvas.getBoundingClientRect(), x = event.clientX - box.left, y = event.clientY - box.top;
+  let best = null, bd = 18;
+  for (const [id, p] of Object.entries(pos)) { const d = Math.hypot(p.x - x, p.y - y); if (d < bd) { bd = d; best = id; } }
+  netHover = best;
+  if (!best) { tip.hidden = true; return; }
+  const ins = model.edges.filter((e) => e.to === best), outs = model.edges.filter((e) => e.from === best);
+  const rows = [];
+  if (best.startsWith("m:")) {
+    const r = model.nodesNow.get(best.slice(2));
+    if (r) rows.push(["tokens/s, last hour", Number(r.tokens_per_s || 0).toFixed(1)], ["answers, last hour", num(r.gen_done)], ["avg answer length", r.tokens_per_job ? num(r.tokens_per_job) + " tokens" : "–"], ["failed / retries", num(r.gen_failed) + " / " + num(r.gen_retry)]);
+  }
+  for (const e of outs) rows.push(["→ " + e.to.slice(2) + " (" + e.what + ")", num(e.n), e.color]);
+  for (const e of ins) rows.push(["← " + e.from.slice(2) + " (" + e.what + ")", num(e.n), e.color]);
+  showTip(tip, canvas.parentElement, x, y, best.slice(2) + " · last 15 minutes", rows.length ? rows : [["no work in the last 15 minutes", ""]]);
+}
+
+// ----- data, controls and the animation loop -----
+function drawBrainControls() {
+  document.querySelectorAll("#brain-tabs button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.b === brainTab ? "true" : "false"));
+  document.getElementById("brain-model").hidden = brainTab !== "model";
+  document.getElementById("brain-network").hidden = brainTab !== "network";
+  document.querySelectorAll("#brain-mode button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === brainMode ? "true" : "false"));
+  const box = document.getElementById("brain-stages");
+  box.replaceChildren();
+  for (const s of (brain && brain.stages) || []) {
+    const b = el("button", "", s.name);
+    b.type = "button";
+    b.disabled = !s.has;
+    b.setAttribute("aria-pressed", s.name === brainStage ? "true" : "false");
+    if (s.step != null) b.append(el("small", "", "live · step " + num(s.step)));
+    b.title = s.has ? (s.previous ? "Changes compared with " + s.previous : "The first stage: compared with the original model") : "Not trained yet";
+    b.onclick = () => { brainStage = s.name; refreshBrain(true); };
+    box.append(b);
+  }
+  const sg = brain && brain.layers;
+  if (sg && sg.length) {
+    const total = Math.sqrt(sg.reduce((s, t) => s + t.attn * t.attn + t.mlp * t.mlp, 0));
+    const top = sg.slice().sort((a, b) => (b.attn ** 2 + b.mlp ** 2) - (a.attn ** 2 + a.mlp ** 2)).slice(0, 3).map((t) => t.layer);
+    const st = (brain.stages || []).find((s) => s.name === brainStage) || {};
+    text("brain-note", (brainMode === "stage" ? brainStage + " changed the model by " + fmtChange(total) + (st.previous ? " (compared with " + st.previous + ")" : " (the first stage, compared with the original)") : "Total change since the original model, up to " + brainStage + ": " + fmtChange(total)) +
+      " · most in layers " + top.join(", ") + (st.step != null ? " · still training: drawn from checkpoint step " + num(st.step) + ", refreshed when a newer one is saved" : "") + (brain.scanning ? " · measuring newer files now…" : ""));
+    const canvas = document.getElementById("brain-canvas");
+    text("brain-scale", canvas._vmax ? "dim ≤ " + fmtChange(canvas._vlo) + " · brightest = " + fmtChange(canvas._vmax) + " ‖ΔW‖ per slice" : "");
+  } else text("brain-note", brain && brain.available === false ? String(brain.reason || "") : brain && brain.scanning ? "Measuring the adapter files…" : "Loading…");
+  const legend = document.getElementById("net-legend");
+  legend.replaceChildren();
+  for (const n of (signals && signals.all_nodes) || []) {
+    const k = el("span", "key"), i = el("i"); i.style.background = sigNodeColor(n); k.append(i, document.createTextNode(n)); legend.append(k);
+  }
+  for (const [label, color] of [["failed / rejected", B_BAD], ["passed → training", B_GOOD]]) {
+    const k = el("span", "key"), i = el("i"); i.style.background = color; k.append(i, document.createTextNode(label)); legend.append(k);
+  }
+  if (signals && signals.flows) {
+    const f = signals.flows, att = (f.machine_kind || []).reduce((s, c) => s + c.ok + c.failed, 0);
+    text("net-note", num(att) + " finished attempts in the last 15 minutes · updated " + fmtClock(signals.at));
+  }
+}
+async function refreshBrain(force) {
+  if (brainBusy) return;
+  brainBusy = true;
+  try {
+    const response = await fetch("/api/brain?stage=" + encodeURIComponent(brainStage) + "&mode=" + brainMode, { cache: "no-store" });
+    if (response.status === 404) brain = { available: false, reason: "This view needs the dashboard server to restart with this version." };
+    else if (response.ok) brain = await readJsonLimited(response, 3000000);
+  } catch (error) {
+    brain = brain || { available: false, reason: "The brain data could not be read." };
+  } finally { brainBusy = false; }
+  if (brain && brain.stage) brainStage = brain.stage;
+  const canvas = document.getElementById("brain-canvas"); if (canvas) canvas._static = null;
+  brainAnim.pulses = [];
+  if (!brainLayer && brain && brain.layers && brain.layers.length) {
+    const best = brain.layers.slice().sort((a, b) => (b.attn ** 2 + b.mlp ** 2) - (a.attn ** 2 + a.mlp ** 2))[0];
+    brainLayer = best.layer;
+  }
+  if (brainLayer && (force || !brainDetail)) openBrainLayer(brainLayer);
+  drawBrainControls();
+}
+function brainLoop(now) {
+  brainAnim.raf = 0;
+  if (currentView !== "brain" || document.hidden) return;
+  const dt = brainAnim.last ? Math.min(0.1, (now - brainAnim.last) / 1000) : 0;
+  brainAnim.last = now;
+  if (brainTab === "model") { drawBrainFrame(dt); drawDetailFrame(); } else drawNetFrame(dt);
+  brainAnim.raf = requestAnimationFrame(brainLoop);
+}
+function startBrain() {
+  brainAnim.last = 0;
+  if (!brainAnim.raf) brainAnim.raf = requestAnimationFrame(brainLoop);
+}
+document.querySelectorAll("#brain-tabs button").forEach((button) => {
+  button.onclick = () => { brainTab = button.dataset.b; try { localStorage.setItem("neuro-brain-tab", brainTab); } catch (error) {} drawBrainControls(); if (brainTab === "network") refreshSignals(); };
+});
+document.querySelectorAll("#brain-mode button").forEach((button) => {
+  button.onclick = () => { brainMode = button.dataset.m; brainDetail = null; refreshBrain(true); };
+});
+(function wireBrainPointers() {
+  const over = document.getElementById("brain-canvas"), det = document.getElementById("brain-detail"), net = document.getElementById("net-canvas");
+  over.addEventListener("pointermove", (e) => brainPointer(e, false));
+  over.addEventListener("click", (e) => brainPointer(e, true));
+  over.addEventListener("pointerleave", () => { brainHover = null; document.getElementById("brain-tip").hidden = true; });
+  det.addEventListener("pointermove", detailPointer);
+  det.addEventListener("pointerleave", () => { detailHover = null; document.getElementById("brain-detail-tip").hidden = true; });
+  net.addEventListener("pointermove", netPointer);
+  net.addEventListener("pointerleave", () => { netHover = null; document.getElementById("net-tip").hidden = true; });
+})();
 
 // ---------- the Neuro Lab stage ----------
 // 1 plate a side at the start, one more every 12.5 %, 8 near the end; the bar
@@ -3193,7 +3833,7 @@ function drawShare(list) {
 let currentView = "machines";
 function show(view) {
   currentView = view;
-  for (const name of ["machines", "models", "try", "share", "training", "jobs", "signals"]) document.getElementById("view-" + name).hidden = name !== view;
+  for (const name of ["machines", "models", "try", "share", "training", "jobs", "signals", "brain"]) document.getElementById("view-" + name).hidden = name !== view;
   document.querySelectorAll("nav button").forEach((button) => {
     const on = button.dataset.view === view;
     button.classList.toggle("on", on);
@@ -3209,6 +3849,12 @@ function show(view) {
   if (view === "signals") {
     document.querySelectorAll("#view-signals .chart").forEach((host) => { if (host._pending) chart(host, host._pending); });
     refreshSignals();
+  }
+  if (view === "brain") {
+    drawBrainControls();
+    refreshBrain(false);
+    refreshSignals();
+    startBrain();
   }
 }
 document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => show(button.dataset.view); });
@@ -3397,9 +4043,13 @@ if (currentView === "training") refreshTelemetry();
 // Signals: the server recomputes at most every 20 s; the page asks every 30 s while it is shown.
 setInterval(() => {
   if (signals && signals.missing) return;
-  if (currentView === "signals" && !document.hidden) refreshSignals();
+  if ((currentView === "signals" || (currentView === "brain" && brainTab === "network")) && !document.hidden) refreshSignals();
 }, 30000);
 if (currentView === "signals") refreshSignals();
+// The model brain changes only when a stage saves a newer adapter or checkpoint (every ~2.5 h).
+setInterval(() => { if (currentView === "brain" && brainTab === "model" && !document.hidden) refreshBrain(false); }, 120000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden && currentView === "brain") startBrain(); });
+window.addEventListener("resize", () => { for (const id of ["brain-canvas", "brain-detail"]) { const c = document.getElementById(id); if (c) c._static = null; } });
 // Pairing requests. Only the page open on the main PC itself gets the list
 // (the server answers 403 elsewhere), so the card stays hidden on other
 // computers. Everything is rendered with textContent.

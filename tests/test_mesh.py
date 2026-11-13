@@ -2647,6 +2647,15 @@ ok(sig["signals"][0]["level"] == "bad" and "Pi does not answer" in titles and "L
    and "Laptop is low on memory" in titles and "Laptop is pausing new jobs" in titles,
    f"signals: offline, no model, low memory and paused are raised, worst first ({titles})")
 ok(not any(x["level"] == "good" for x in sig["signals"]), "signals: no 'everything is working' line next to warnings")
+flow_rows = [res(NOW - 100, "mac", tokens=500), res(NOW - 90, "mac", ok_=False, error="bad"),
+             dict(res(NOW - 80, "deck", kind="verify_luau"), passed=True), dict(res(NOW - 70, "deck", kind="verify_luau"), passed=False),
+             dict(res(NOW - 60, "deck", kind="verify_math", ok_=False), passed=None), res(NOW - 2000, "mac", tokens=9)]
+fl = mesh.signals_compute(flow_rows, [], {}, {"generate": 1}, NOW, W, [], None)["flows"]
+ok(fl["window_s"] == 900 and {(c["node"], c["kind"], c["ok"], c["failed"]) for c in fl["machine_kind"]}
+   == {("mac", "generate", 1, 1), ("deck", "verify_luau", 2, 0), ("deck", "verify_math", 0, 1)},
+   f"flows: the last 15 minutes per computer and kind, ok and not ok ({fl['machine_kind']})")
+ok({(o["kind"], o["training"], o["rejected"]) for o in fl["kind_outcome"]} == {("verify_luau", 1, 1), ("verify_math", 0, 1)},
+   f"flows: only a check that ran and passed goes to training ({fl['kind_outcome']})")
 calm = mesh.signals_compute([], [], {}, {"generate": 0, "checks": 0}, NOW, 3600, [], None)
 ok(calm["signals"][0]["level"] == "good" and abs(sum(calm["series"]["covered_s"]) - 3600) < 1.5
    and any(x["title"] == "The generation queue is empty" for x in calm["signals"]),

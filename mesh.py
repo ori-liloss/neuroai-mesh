@@ -4448,6 +4448,7 @@ SIGNAL_STALL_S = 1800         # no finished job for 30 min while holding jobs is
 SIGNAL_FAIL_SHARE = 0.25      # a quarter of a machine's attempts failing in the last hour
 SIGNAL_LOW_RAM_MIB = 512
 SIGNAL_GAP_S = 900            # no attempt from ANY computer for 15 min: the main PC was off or down
+SIGNAL_FLOW_S = 900           # the network brain view draws the last 15 minutes of flow
 _signals_cache: dict = {}
 
 
@@ -4742,12 +4743,36 @@ def signals_compute(results: list[dict], events: list[dict], kind_of: dict[str, 
             if median_all and median_last and median_last > median_all * 1.5:
                 add("warn", "Training slowed down", f"{median_last:.1f} s per step lately; usually {median_all:.1f} s.",
                     "The median of the last 5 steps is over 1.5 times the run's median.")
+    # Flows for the network brain view: who did what in the last SIGNAL_FLOW_S, and where checked
+    # answers went. machine -> job kind: finished attempts (ok / not ok); answers -> check kind: checks
+    # run (each check consumed one written answer); check kind -> training / rejected: the verdicts.
+    flow_from = now - SIGNAL_FLOW_S
+    machine_kind: dict[tuple[str, str], list[int]] = {}
+    outcome: dict[str, list[int]] = {}
+    for row in results:
+        if row.get("at", 0) < flow_from:
+            continue
+        node = str(row.get("node") or "") or "unknown"
+        kind = str(row.get("kind") or "")
+        cell = machine_kind.setdefault((node, kind), [0, 0])
+        cell[0 if row.get("ok") else 1] += 1
+        if kind in VERIFY_KINDS:
+            # Only a check that ran and passed lets its answer into training.
+            verdict = outcome.setdefault(kind, [0, 0])
+            verdict[0 if (row.get("ok") and row.get("passed") is True) else 1] += 1
+    flows = {
+        "window_s": SIGNAL_FLOW_S,
+        "machine_kind": [{"node": n, "kind": k, "ok": v[0], "failed": v[1]} for (n, k), v in sorted(machine_kind.items())],
+        "kind_outcome": [{"kind": k, "training": v[0], "rejected": v[1]} for k, v in sorted(outcome.items())],
+    }
+
     order = {"bad": 0, "warn": 1, "info": 2}
     signals.sort(key=lambda s: order.get(s["level"], 3))
     if not any(s["level"] in {"bad", "warn"} for s in signals):
         signals.insert(0, {"level": "good", "title": "Everything is working", "detail": "No machine is down, stuck, slow or failing.",
                            "rule": "None of the warning rules below matched."})
-    return {"window_s": window, "at": int(now), "series": series, "nodes": node_rows, "now": now_block, "signals": signals}
+    return {"window_s": window, "at": int(now), "series": series, "nodes": node_rows, "now": now_block, "signals": signals,
+            "flows": flows}
 
 
 def signals_view(window: int) -> dict:
@@ -4782,10 +4807,130 @@ def signals_view(window: int) -> dict:
         training = None
     body = signals_compute(results, events, kind_of, open_now, now, window, machines, training)
     body["verified_rows"] = summary.get("verified_rows")
+    kinds = summary.get("kinds") or {}
+    body["kinds_open"] = {kind: int(row.get("queued") or 0) + int(row.get("leased") or 0) for kind, row in kinds.items()}
+    body["checked_total"] = {kind: {"passed": int(row.get("passed") or 0),
+                                    "rejected": int(row.get("done") or 0) + int(row.get("failed") or 0) - int(row.get("passed") or 0)}
+                             for kind, row in kinds.items() if kind in VERIFY_KINDS}
     # Every computer that ever finished a job, by name: the page gives each a fixed color from this.
     body["all_nodes"] = sorted({*(summary.get("nodes") or {}).keys(), *(r["node"] for r in body["nodes"])})
     _signals_cache[window] = (now, body)
     return body
+
+
+# ---------------------------------------------------------------- brain page
+# brain_scan.py measures, from the LoRA adapter files, how much each stage changed every layer of the
+# model. It needs numpy and safetensors, so the server runs it as its own low-priority process (CPU
+# only, never the GPU) when a stage has a newer adapter or checkpoint than its saved scan.
+BRAIN_DIR = Path(__file__).resolve().parent / "brain"
+BRAIN_SCRIPT = Path(__file__).resolve().parent / "brain_scan.py"
+_brain_lock = threading.Lock()
+_brain: dict = {"proc": None, "checked": 0.0, "files": {}}
+
+
+def _brain_paths() -> tuple[Path, Path] | None:
+    """(runs folder, training-plan.json) from the training run the page follows, or None."""
+    try:
+        run_dir = str(training_view().get("run_dir") or "")
+    except Exception:
+        return None
+    if not run_dir:
+        return None
+    runs = Path(run_dir).parent
+    plan = runs.parent / "training-plan.json"
+    return (runs, plan) if runs.is_dir() and plan.is_file() else None
+
+
+def _brain_stage(name: str) -> dict | None:
+    """A stage's saved scan, parsed once per file change."""
+    path = BRAIN_DIR / f"{name}.json"
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return None
+    cached = _brain["files"].get(name)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    _brain["files"][name] = (stamp, body)
+    return body
+
+
+def _brain_rescan(runs: Path, plan: Path, now: float) -> bool:
+    """Start brain_scan.py when no scan runs and a stage's adapter or checkpoint is newer than its
+    saved scan (checked at most every 2 minutes). Returns True while a scan runs."""
+    proc = _brain["proc"]
+    if proc is not None and proc.poll() is None:
+        return True
+    if now - _brain["checked"] < 120:
+        return False
+    _brain["checked"] = now
+    try:
+        names = [str(s.get("name")) for s in json.loads(plan.read_text(encoding="utf-8")).get("stages", [])]
+    except (OSError, ValueError):
+        return False
+    stale = False
+    for name in names:
+        run = runs / f"neuro-{name}"
+        files = [run / "adapter" / "adapter_model.safetensors", *run.glob("checkpoint-*/adapter_model.safetensors")]
+        stamps = [f.stat().st_mtime for f in files if f.exists()]
+        if not stamps:
+            break
+        saved = _brain_stage(name)
+        if saved is None or max(stamps) > float(saved.get("source_mtime") or 0) + 1:
+            stale = True
+            break
+    if not stale or not BRAIN_SCRIPT.exists():
+        return False
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
+    flags = 0x00004000 | 0x08000000 if os.name == "nt" else 0   # below-normal priority, no window
+    try:
+        _brain["proc"] = subprocess.Popen(
+            [sys.executable, "-I", str(BRAIN_SCRIPT), "--runs", str(runs), "--plan", str(plan), "--out", str(BRAIN_DIR)],
+            cwd=str(BRAIN_SCRIPT.parent), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+    except OSError:
+        return False
+    return True
+
+
+def brain_view(stage: str = "", mode: str = "stage", layer: int = 0) -> dict:
+    """The Brain page: every stage that has a scan, and one stage's layers (or one layer's maps)."""
+    mode = mode if mode in {"stage", "total"} else "stage"
+    paths = _brain_paths()
+    if paths is None:
+        return {"available": False, "reason": "No training run with a training-plan.json was found on this PC."}
+    runs, plan = paths
+    with _brain_lock:
+        scanning = _brain_rescan(runs, plan, time.time())
+        try:
+            names = [str(s.get("name")) for s in json.loads(plan.read_text(encoding="utf-8")).get("stages", [])]
+        except (OSError, ValueError):
+            names = []
+        stages = []
+        for name in names:
+            saved = _brain_stage(name)
+            stages.append({"name": name, "has": saved is not None,
+                           "step": saved.get("step") if saved else None,
+                           "scanned_at": saved.get("scanned_at") if saved else None,
+                           "previous": Path(saved["previous"]).parent.name.removeprefix("neuro-") if saved and saved.get("previous") else None})
+        ready = [s["name"] for s in stages if s["has"]]
+        pick = stage if stage in ready else (ready[-1] if ready else "")
+        body = {"available": True, "scanning": scanning, "stages": stages, "stage": pick, "mode": mode}
+        saved = _brain_stage(pick) if pick else None
+        if saved is None:
+            return body
+        data = (saved.get("modes") or {}).get(mode) or {}
+        layers = data.get("layers") or []
+        body["groups"] = data.get("groups")
+        if layer:
+            hit = next((x for x in layers if x.get("layer") == layer), None)
+            body["detail"] = hit
+            return body
+        body["layers"] = [{k: x.get(k) for k in ("layer", "type", "attn", "mlp", "modules", "nodes", "reads")} for x in layers]
+        return body
 
 
 def _write_jsonl_atomic(out: Path, rows: list[dict]) -> None:
@@ -7272,6 +7417,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/jobs":
             self.send_json(200, job_queue().summary())
+            return
+        if path == "/api/brain":
+            query = parse_qs(urlparse(self.path).query)
+            stage = str((query.get("stage") or [""])[0])[:30]
+            mode = str((query.get("mode") or ["stage"])[0])[:10]
+            try:
+                layer = int((query.get("layer") or ["0"])[0])
+            except ValueError:
+                layer = 0
+            try:
+                body = brain_view(stage if re.fullmatch(r"[a-z0-9-]{0,30}", stage) else "", mode, layer)
+            except Exception as exc:  # the page must get an answer, not a dropped socket
+                print(f"brain failed: {type(exc).__name__}: {exc}", flush=True)
+                self.send_json(500, {"error": "The brain data could not be read."})
+                return
+            self.send_json(200, body)
             return
         if path == "/api/signals":
             try:

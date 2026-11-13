@@ -17,3 +17,4 @@ cluster.token.tmp-*
 mesh_url.txt
 mesh_url.txt.tmp-*
 training.json
+brain/
